@@ -6,6 +6,7 @@ type Photo = {
   year: string;
   category?: string;
   tags?: string[];
+  description?: string;
 };
 
 function Lightbox({ photo, onClose, onPrev, onNext }: { photo: Photo; onClose: () => void; onPrev: () => void; onNext: () => void }) {
@@ -19,6 +20,7 @@ function Lightbox({ photo, onClose, onPrev, onNext }: { photo: Photo; onClose: (
           <span className="lightbox-location">{photo.date}</span>
           {photo.category && <span className="lightbox-category">{photo.category}</span>}
         </div>
+        {photo.description && <p className="lightbox-description">{photo.description}</p>}
       </div>
       <button className="lightbox-next" onClick={(e) => { e.stopPropagation(); onNext(); }}>›</button>
     </div>
