@@ -4,6 +4,8 @@ type Photo = {
   filename: string;
   date: string;
   year: string;
+  category?: string;
+  tags?: string[];
 };
 
 function Lightbox({ photo, onClose, onPrev, onNext }: { photo: Photo; onClose: () => void; onPrev: () => void; onNext: () => void }) {
@@ -15,6 +17,7 @@ function Lightbox({ photo, onClose, onPrev, onNext }: { photo: Photo; onClose: (
         <img src={`/photos/${photo.filename}`} alt={photo.date} className="lightbox-img" />
         <div className="lightbox-info">
           <span className="lightbox-location">{photo.date}</span>
+          {photo.category && <span className="lightbox-category">{photo.category}</span>}
         </div>
       </div>
       <button className="lightbox-next" onClick={(e) => { e.stopPropagation(); onNext(); }}>›</button>
@@ -23,11 +26,11 @@ function Lightbox({ photo, onClose, onPrev, onNext }: { photo: Photo; onClose: (
 }
 
 export default function Gallery({ photos }: { photos: Photo[] }) {
-  const years = ["All", ...Array.from(new Set(photos.map((p) => p.year))).sort((a, b) => b.localeCompare(a))];
-  const [activeYear, setActiveYear] = useState("All");
+  const categories = ["All", ...Array.from(new Set(photos.filter(p => p.category).map((p) => p.category!))).sort()];
+  const [activeCategory, setActiveCategory] = useState("All");
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
-  const filtered = activeYear === "All" ? photos : photos.filter((p) => p.year === activeYear);
+  const filtered = activeCategory === "All" ? photos : photos.filter((p) => p.category === activeCategory);
 
   const openLightbox = useCallback((index: number) => setLightboxIndex(index), []);
   const closeLightbox = useCallback(() => setLightboxIndex(null), []);
@@ -37,13 +40,13 @@ export default function Gallery({ photos }: { photos: Photo[] }) {
   return (
     <>
       <nav className="filter-bar">
-        {years.map((year) => (
+        {categories.map((cat) => (
           <button
-            key={year}
-            className={`filter-btn ${activeYear === year ? "active" : ""}`}
-            onClick={() => setActiveYear(year)}
+            key={cat}
+            className={`filter-btn ${activeCategory === cat ? "active" : ""}`}
+            onClick={() => setActiveCategory(cat)}
           >
-            {year}
+            {cat}
           </button>
         ))}
       </nav>
@@ -54,6 +57,7 @@ export default function Gallery({ photos }: { photos: Photo[] }) {
             <img src={`/photos/${photo.filename}`} alt={photo.date} loading="lazy" />
             <div className="photo-overlay">
               <span className="photo-location">{photo.date}</span>
+              {photo.category && <span className="photo-tag">{photo.category}</span>}
             </div>
           </div>
         ))}
