@@ -1,5 +1,15 @@
 [
   {
+    "filename": "test_new_photo.jpg",
+    "date": "test_new_photo",
+    "year": "Unknown",
+    "category": "風景",
+    "tags": [
+      "grass",
+      "rural"
+    ]
+  },
+  {
     "filename": "2025.11.21.jpg",
     "date": "2025.11.21",
     "year": "2025",
