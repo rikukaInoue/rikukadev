@@ -1,0 +1,189 @@
+---
+import { getCollection } from 'astro:content';
+
+const posts = (await getCollection('blog'))
+  .sort((a, b) => b.data.date.getTime() - a.data.date.getTime());
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Blog — rikuka.dev</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      :root {
+        --bg: #0a0a0a;
+        --surface: #111;
+        --border: #222;
+        --text: #f0f0f0;
+        --muted: #888;
+        --accent: #e8ff00;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Inter', sans-serif;
+        font-weight: 300;
+      }
+
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1.2rem 2.5rem;
+        background: rgba(10,10,10,0.85);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .logo {
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--accent);
+        text-decoration: none;
+      }
+
+      .header-nav {
+        display: flex;
+        gap: 1.5rem;
+      }
+
+      .nav-link {
+        font-size: 0.85rem;
+        color: var(--muted);
+        text-decoration: none;
+        letter-spacing: 0.06em;
+        transition: color 0.2s;
+      }
+
+      .nav-link:hover {
+        color: var(--text);
+      }
+
+      .nav-link.active {
+        color: var(--accent);
+      }
+
+      .posts {
+        max-width: 700px;
+        padding: 3rem 2.5rem 4rem;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .post-card {
+        display: block;
+        padding: 1.5rem 0;
+        border-bottom: 1px solid var(--border);
+        text-decoration: none;
+        color: inherit;
+      }
+
+      .post-card:first-child {
+        border-top: 1px solid var(--border);
+      }
+
+      .post-card:hover .post-title {
+        color: var(--accent);
+      }
+
+      .post-date {
+        font-size: 0.75rem;
+        color: var(--muted);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 0.4rem;
+      }
+
+      .post-title {
+        font-size: 1.15rem;
+        font-weight: 400;
+        line-height: 1.4;
+        transition: color 0.2s;
+      }
+
+      .post-excerpt {
+        margin-top: 0.4rem;
+        font-size: 0.9rem;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .post-tags {
+        display: flex;
+        gap: 0.4rem;
+        margin-top: 0.6rem;
+        flex-wrap: wrap;
+      }
+
+      .tag {
+        font-size: 0.7rem;
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        letter-spacing: 0.04em;
+      }
+
+      .empty-state {
+        padding: 3rem 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      footer {
+        border-top: 1px solid var(--border);
+        padding: 2rem 2.5rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="/" class="logo">rikuka.dev</a>
+      <nav class="header-nav">
+        <a href="/blog" class="nav-link active">Blog</a>
+        <a href="/works" class="nav-link">Works</a>
+      </nav>
+    </header>
+
+    <section class="posts">
+      {posts.length === 0 ? (
+        <p class="empty-state">記事はまだありません。</p>
+      ) : (
+        posts.map((post) => (
+          <a href={`/blog/${post.id}`} class="post-card">
+            <div class="post-date">
+              {post.data.date.toLocaleDateString('en-US', {
+                year: 'numeric', month: 'short', day: 'numeric'
+              })}
+            </div>
+            <div class="post-title">{post.data.title}</div>
+            <div class="post-excerpt">{post.data.description}</div>
+            <div class="post-tags">
+              {post.data.tags.map((tag) => (
+                <span class="tag">{tag}</span>
+              ))}
+            </div>
+          </a>
+        ))
+      )}
+    </section>
+
+    <footer>&copy; rikuka.dev &mdash; All rights reserved</footer>
+  </body>
+</html>

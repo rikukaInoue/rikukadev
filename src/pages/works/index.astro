@@ -1,0 +1,319 @@
+---
+import Gallery from "../../components/Gallery";
+import photoData from "../../data/photo-data.json";
+
+const photos = photoData;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>rikuka.dev — Photography</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      :root {
+        --bg: #0a0a0a;
+        --surface: #111;
+        --border: #222;
+        --text: #f0f0f0;
+        --muted: #888;
+        --accent: #e8ff00;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Inter', sans-serif;
+        font-weight: 300;
+      }
+
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1.2rem 2.5rem;
+        background: rgba(10,10,10,0.85);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .logo {
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--accent);
+        text-decoration: none;
+      }
+
+      .header-nav {
+        display: flex;
+        gap: 1.5rem;
+      }
+
+      .nav-link {
+        font-size: 0.85rem;
+        color: var(--muted);
+        text-decoration: none;
+        letter-spacing: 0.06em;
+        transition: color 0.2s;
+      }
+
+      .nav-link:hover {
+        color: var(--text);
+      }
+
+      .nav-link.active {
+        color: var(--accent);
+      }
+
+      .hero {
+        padding: 6rem 2.5rem 3rem;
+        max-width: 700px;
+      }
+
+      .hero h1 {
+        font-size: clamp(2.5rem, 6vw, 5rem);
+        font-weight: 300;
+        line-height: 1.1;
+        letter-spacing: -0.02em;
+      }
+
+      .hero h1 em {
+        font-style: normal;
+        color: var(--accent);
+      }
+
+      .hero p {
+        margin-top: 1.2rem;
+        color: var(--muted);
+        font-size: 1rem;
+        line-height: 1.7;
+      }
+
+      :global(.filter-bar) {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        padding: 0 2.5rem 2rem;
+      }
+
+      :global(.filter-btn) {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--muted);
+        padding: 0.4rem 1rem;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        font-family: inherit;
+        cursor: pointer;
+        transition: all 0.2s;
+        letter-spacing: 0.04em;
+      }
+
+      :global(.filter-btn:hover) {
+        border-color: var(--text);
+        color: var(--text);
+      }
+
+      :global(.filter-btn.active) {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #000;
+        font-weight: 600;
+      }
+
+      :global(.masonry) {
+        columns: 3 300px;
+        gap: 0.75rem;
+        padding: 0 2.5rem 4rem;
+      }
+
+      :global(.photo-card) {
+        break-inside: avoid;
+        position: relative;
+        overflow: hidden;
+        border-radius: 6px;
+        cursor: zoom-in;
+        margin-bottom: 0.75rem;
+        background: var(--surface);
+      }
+
+      :global(.photo-card img) {
+        width: 100%;
+        display: block;
+        transition: transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      }
+
+      :global(.photo-card:hover img) {
+        transform: scale(1.04);
+      }
+
+      :global(.photo-overlay) {
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 50%);
+        opacity: 0;
+        transition: opacity 0.3s;
+        display: flex;
+        align-items: flex-end;
+        padding: 1rem;
+      }
+
+      :global(.photo-card:hover .photo-overlay) {
+        opacity: 1;
+      }
+
+      :global(.photo-location) {
+        font-size: 0.8rem;
+        color: #fff;
+        letter-spacing: 0.04em;
+      }
+
+      :global(.photo-tag) {
+        font-size: 0.7rem;
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        margin-left: auto;
+      }
+
+      :global(.lightbox-overlay) {
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.95);
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        animation: fadeIn 0.2s ease;
+      }
+
+      @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+
+      :global(.lightbox-content) {
+        max-width: 90vw;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+
+      :global(.lightbox-img) {
+        max-width: 90vw;
+        max-height: 80vh;
+        object-fit: contain;
+        border-radius: 4px;
+        display: block;
+      }
+
+      :global(.lightbox-info) {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 0.5rem;
+      }
+
+      :global(.lightbox-location) {
+        font-size: 0.9rem;
+        color: #ccc;
+      }
+
+      :global(.lightbox-description) {
+        font-size: 0.85rem;
+        color: var(--muted);
+        text-align: center;
+        padding: 0 0.5rem;
+        line-height: 1.6;
+      }
+
+      :global(.lightbox-category) {
+        font-size: 0.75rem;
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        letter-spacing: 0.06em;
+      }
+
+      :global(.lightbox-close),
+      :global(.lightbox-prev),
+      :global(.lightbox-next) {
+        position: fixed;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.1);
+        color: #fff;
+        cursor: pointer;
+        border-radius: 50%;
+        font-family: inherit;
+        transition: background 0.2s;
+      }
+
+      :global(.lightbox-close) {
+        top: 1.5rem;
+        right: 1.5rem;
+        width: 2.5rem;
+        height: 2.5rem;
+        font-size: 1rem;
+      }
+
+      :global(.lightbox-prev),
+      :global(.lightbox-next) {
+        top: 50%;
+        transform: translateY(-50%);
+        width: 3rem;
+        height: 3rem;
+        font-size: 1.8rem;
+        line-height: 1;
+      }
+
+      :global(.lightbox-prev) { left: 1.5rem; }
+      :global(.lightbox-next) { right: 1.5rem; }
+
+      :global(.lightbox-close:hover),
+      :global(.lightbox-prev:hover),
+      :global(.lightbox-next:hover) {
+        background: rgba(255,255,255,0.12);
+      }
+
+      footer {
+        border-top: 1px solid var(--border);
+        padding: 2rem 2.5rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="/" class="logo">rikuka.dev</a>
+      <nav class="header-nav">
+        <a href="/" class="nav-link">Blog</a>
+        <a href="/works" class="nav-link active">Works</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <h1>Moments <br /><em>in light</em></h1>
+      <p>A curated collection of landscapes from around the world.</p>
+    </section>
+
+    <Gallery client:load photos={photos} />
+
+    <footer>© rikuka.dev — All rights reserved</footer>
+  </body>
+</html>
