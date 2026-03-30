@@ -1,0 +1,517 @@
+---
+title: "Amazon Verified Permissions でマルチプロダクトの認可基盤を設計する"
+date: 2026-03-30
+tags: ["AVP", "Cedar", "認可", "AWS", "マルチプロダクト"]
+description: "複数プロダクトにまたがる認可基盤を Amazon Verified Permissions (AVP) + Cedar で設計する。Namespace 分離、ポリシーテンプレート、管理委譲、Dry Run まで含めたフル構成の設計を解説します。"
+---
+
+## 認証と認可は別の問題
+
+[前回の記事](/blog/rellf-auth-oidc-provider)で、独自 OIDC Provider を構築して認証（Authentication）を解決しました。ユーザーが**誰であるか**は分かるようになった。
+
+次は認可（Authorization）。ユーザーが**何をできるか**を制御する仕組みです。
+
+認証基盤に認可ロジックを混ぜると、プロダクトが増えるたびに認証サービスが肥大化します。認証と認可は分離すべき — というのが今回の出発点です。
+
+```
+rellf-auth  → 認証。「この人は誰か」を証明する。OIDC Provider。
+rellf-authz → 認可。「この人は何ができるか」を判定する。AVP。
+```
+
+## なぜ Amazon Verified Permissions (AVP) か
+
+認可の実装パターンはいくつかあります。
+
+| パターン | 概要 | 課題 |
+|---|---|---|
+| コード内に if 文 | `if user.role == "admin"` | スケールしない。プロダクトごとにバラバラ |
+| RBAC テーブル | DB にロール・権限を持つ | スキーマ設計が各プロダクトで分散 |
+| OPA (Open Policy Agent) | Rego 言語でポリシー記述 | 自前運用。学習コスト高 |
+| **AVP (Cedar)** | **マネージドサービス + Cedar 言語** | **AWS ネイティブ。運用コスト低** |
+
+AVP を選ぶ理由:
+
+- **マネージド** — Policy Store の可用性を AWS が担保。自分で Raft クラスタを運用しなくていい
+- **Cedar 言語** — 読みやすい宣言的ポリシー。if 文の山と違って監査しやすい
+- **スキーマ検証** — ポリシーの型チェックをしてくれる。壊れたポリシーはそもそもデプロイできない
+- **IAM 統合** — Lambda から SDK 一発で `IsAuthorized` を呼べる
+
+## Cedar ポリシーの基本
+
+Cedar は **「誰が」「何を」「何に対して」できるか** を宣言する言語です。
+
+```cedar
+permit (
+    principal,          // 誰が
+    action,             // 何を
+    resource            // 何に対して
+) when {
+    // 条件（省略可）
+};
+```
+
+`permit` は許可、`forbid` は拒否。`forbid` は常に `permit` に優先します。デフォルトは全拒否（ホワイトリスト方式）。
+
+## マルチプロダクトのスキーマ設計
+
+### Namespace で分離する
+
+AVP では 1 つの Policy Store 内で **Namespace** を使ってプロダクトを分離します。
+
+```
+Policy Store: rellf
+  ├── Common::     共通エンティティ（User, Role）
+  ├── Site::       Web サイト
+  └── Studio::     制作管理ツール
+```
+
+Policy Store を分けるパターンもありますが、マルチプロダクトでは共有する方が横断的な権限管理がしやすいです。「admin は全プロダクトで何でもできる」を 1 つのポリシーで書けます。
+
+### エンティティ設計
+
+```
+Common::User
+  ├── email: String
+  ├── groups: Set<String>
+  └── memberOf: [Common::Role]
+
+Common::Role
+  （"admin", "site:editor", "studio:member" など）
+
+Site::Article
+  ├── author: Common::User
+  ├── status: String ("draft" | "published")
+  └── memberOf: [Site::Category]
+
+Site::Category
+  （"blog", "news" など）
+
+Studio::Project
+  └── owner: Common::User
+
+Studio::Task
+  ├── assignee: Common::User
+  └── memberOf: [Studio::Project]
+```
+
+ポイントは **`Common::User` を全 Namespace から参照する**こと。ユーザーは 1 つ、リソースはプロダクトごとに定義します。
+
+### ロールの命名規則
+
+```
+admin              → グローバル管理者（全プロダクト）
+site:editor        → Site の編集者
+site:viewer        → Site の閲覧者
+studio:member      → Studio のメンバー
+studio:manager     → Studio のプロジェクト管理者
+```
+
+`プロダクト名:ロール名` の接頭辞でスコープを明示します。rellf-auth の JWT `groups` クレームにこの値が入り、AVP の `Common::Role` にマッピングされます。
+
+## ポリシーの具体例
+
+### グローバル管理者
+
+```cedar
+// admin は全て許可
+permit (
+    principal in Common::Role::"admin",
+    action,
+    resource
+);
+```
+
+1 行で全プロダクトの全操作を許可。Namespace をまたいで効きます。
+
+### プロダクト固有のロール
+
+```cedar
+// Site の editor は記事を編集・公開できる
+permit (
+    principal in Common::Role::"site:editor",
+    action in [Site::Action::"editArticle", Site::Action::"publishArticle"],
+    resource
+);
+
+// Site の viewer は閲覧のみ
+permit (
+    principal in Common::Role::"site:viewer",
+    action == Site::Action::"viewArticle",
+    resource
+);
+```
+
+### リソースオーナーシップ
+
+```cedar
+// タスクの担当者は自分のタスクを編集できる
+permit (
+    principal,
+    action == Studio::Action::"editTask",
+    resource
+) when {
+    resource.assignee == principal
+};
+```
+
+ロールに関係なく、リソースの属性で判定する ABAC（属性ベースアクセス制御）パターン。
+
+### 条件付きアクセス
+
+```cedar
+// 公開済み記事は誰でも閲覧可能
+permit (
+    principal,
+    action == Site::Action::"viewArticle",
+    resource
+) when {
+    resource.status == "published"
+};
+
+// 下書きは著者だけ
+permit (
+    principal,
+    action == Site::Action::"viewArticle",
+    resource
+) when {
+    resource.status == "draft" && resource.author == principal
+};
+```
+
+同じアクションでもリソースの状態によって判定が変わります。これを if 文で書くとすぐカオスになるけど、Cedar なら宣言的に整理できます。
+
+### 明示的な拒否
+
+```cedar
+// 無効化されたユーザーは全て拒否（permit より優先）
+forbid (
+    principal,
+    action,
+    resource
+) when {
+    principal.disabled == true
+};
+```
+
+`forbid` は `permit` より常に強い。どれだけ `permit` があっても、1 つの `forbid` に引っかかれば拒否されます。
+
+## ポリシー管理の委譲
+
+ここからが本題。
+
+認可基盤を作っても、全ポリシーを認可基盤チームが管理するのは現実的じゃない。「Site に新しいロールを追加したい」「Studio のタスク権限を変えたい」 — これはプロダクトの運用者が一番よく知っていることです。
+
+### 問題: Cedar を直接書かせるのは危険
+
+- 構文ミスで認可が壊れる
+- `forbid` の影響範囲を把握しきれない
+- 他の Namespace のポリシーを誤って変更する
+
+### 解決: Policy Template + Namespace スコープ
+
+AVP の **Policy Template** は、ポリシーのひな型を定義して、パラメータだけ埋める仕組みです。
+
+```cedar
+// テンプレート: 認可基盤チームが用意
+permit (
+    principal in ?principal,
+    action in ?actions,
+    resource in ?resource
+);
+```
+
+プロダクト管理者はテンプレートを選んで、パラメータを埋めるだけ。
+
+```
+テンプレート: "ロールにアクション群を許可"
+  ?principal = Common::Role::"site:reviewer"
+  ?actions   = [Site::Action::"viewArticle"]
+  ?resource  = Site::Category::"blog"
+```
+
+Cedar の構文を知らなくても、ドロップダウンで選択するだけでポリシーを作れます。
+
+## 管理 API の設計
+
+プロダクト管理者がポリシーを管理するための API を rellf-authz が提供します。
+
+### エンドポイント
+
+```
+POST   /api/policies                  ポリシー作成
+GET    /api/policies                  ポリシー一覧（Namespace フィルタ）
+GET    /api/policies/:id              ポリシー詳細
+PUT    /api/policies/:id              ポリシー更新
+DELETE /api/policies/:id              ポリシー削除
+POST   /api/policies/test             Dry Run（適用せず判定テスト）
+
+GET    /api/templates                 テンプレート一覧
+GET    /api/schema                    スキーマ取得（フォーム生成用）
+GET    /api/audit-log                 監査ログ
+```
+
+### Namespace スコープ制御
+
+API の認可自体も AVP で管理します。自己参照的ですが理にかなっています。
+
+```cedar
+// Site の管理者は Site:: のポリシーだけ CRUD できる
+permit (
+    principal in Common::Role::"site:admin",
+    action in [
+        Authz::Action::"createPolicy",
+        Authz::Action::"updatePolicy",
+        Authz::Action::"deletePolicy",
+        Authz::Action::"listPolicies"
+    ],
+    resource == Authz::Namespace::"Site"
+);
+
+// 認可基盤の管理者は全 Namespace 触れる
+permit (
+    principal in Common::Role::"admin",
+    action,
+    resource
+);
+```
+
+Site の管理者が `Studio::` のポリシーを変更しようとしても AVP が拒否します。
+
+### リクエスト例
+
+```json
+POST /api/policies
+Authorization: Bearer <rellf-auth の JWT>
+
+{
+  "namespace": "Site",
+  "template_id": "role-action-permit",
+  "parameters": {
+    "principal": "Common::Role::\"site:reviewer\"",
+    "actions": ["Site::Action::\"viewArticle\""],
+    "resource": "Site::Category::\"blog\""
+  },
+  "description": "レビュアーはブログ記事を閲覧できる"
+}
+```
+
+API 側でやること:
+
+1. JWT から `sub` と `groups` を取得
+2. AVP に `IsAuthorized(principal, Authz::Action::"createPolicy", Authz::Namespace::"Site")` を問い合わせ
+3. 許可されたら AVP の `CreatePolicy` API を呼ぶ
+4. 監査ログを記録
+
+## Dry Run（テスト実行）
+
+ポリシー変更で「全員アクセス不能」になるのを防ぐために、適用前にテストできる仕組みが必要です。
+
+```json
+POST /api/policies/test
+
+{
+  "principal": {
+    "entityType": "Common::User",
+    "entityId": "user-123",
+    "attributes": { "groups": ["site:editor"] }
+  },
+  "action": "Site::Action::\"publishArticle\"",
+  "resource": {
+    "entityType": "Site::Article",
+    "entityId": "article-456",
+    "attributes": { "status": "draft", "author": "user-123" }
+  },
+  "additional_policies": [
+    {
+      "effect": "permit",
+      "body": "..."
+    }
+  ]
+}
+```
+
+レスポンス:
+
+```json
+{
+  "decision": "ALLOW",
+  "determining_policies": [
+    {
+      "id": "policy-789",
+      "description": "Site の editor は記事を編集・公開できる"
+    }
+  ]
+}
+```
+
+AVP の `IsAuthorized` は**どのポリシーが判定に影響したか**を返してくれるので、「なぜ許可/拒否されたか」が分かります。これをそのまま UI に表示すれば、管理者がポリシーの効果を理解しやすい。
+
+## 監査ログ
+
+誰がいつどのポリシーを変更したかを記録します。
+
+```json
+{
+  "timestamp": "2026-03-30T12:34:56Z",
+  "actor": "user-123 (admin@rellf.com)",
+  "action": "createPolicy",
+  "namespace": "Site",
+  "policy_id": "policy-789",
+  "description": "レビュアーはブログ記事を閲覧できる",
+  "template_id": "role-action-permit",
+  "parameters": { ... }
+}
+```
+
+保存先は DynamoDB か CloudWatch Logs。ポリシー変更はそう頻繁ではないので、コスト面の心配は不要です。
+
+## 管理 UI
+
+テンプレートベースなので、UI はシンプルなフォームで十分です。
+
+```
+┌─────────────────────────────────────────┐
+│  ポリシー作成                             │
+│                                          │
+│  テンプレート: [ロールにアクションを許可 ▼] │
+│                                          │
+│  ロール:       [site:reviewer         ▼] │
+│  アクション:   [☑ viewArticle          ] │
+│               [☐ editArticle          ] │
+│               [☐ publishArticle       ] │
+│  リソース:     [blog カテゴリ          ▼] │
+│                                          │
+│  説明: [レビュアーはブログを閲覧できる   ] │
+│                                          │
+│  [テスト実行]  [保存]                     │
+└─────────────────────────────────────────┘
+```
+
+- テンプレートを選ぶとフォームが動的に変わる
+- アクションとリソースの選択肢はスキーマから自動生成
+- 「テスト実行」で Dry Run してから保存
+
+Cedar を一切書かずにポリシーを管理できます。
+
+## 全体アーキテクチャ
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    rellf-authz                          │
+│                                                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ ポリシー管理  │  │ 認可判定     │  │ 管理 UI      │ │
+│  │ API          │  │ API          │  │ (SPA)        │ │
+│  │ CRUD + テスト │  │ IsAuthorized │  │              │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────────────┘ │
+│         │                  │                            │
+│         ▼                  ▼                            │
+│  ┌─────────────────────────────────┐                   │
+│  │    Amazon Verified Permissions   │                   │
+│  │    (Policy Store: rellf)         │                   │
+│  │    ├── Common::                  │                   │
+│  │    ├── Site::                    │                   │
+│  │    ├── Studio::                  │                   │
+│  │    └── Authz:: (自己管理)         │                   │
+│  └─────────────────────────────────┘                   │
+│         ▲                                              │
+│         │ 監査ログ                                      │
+│         ▼                                              │
+│  ┌──────────────┐                                      │
+│  │  DynamoDB     │                                      │
+│  │  (audit_log)  │                                      │
+│  └──────────────┘                                      │
+└────────────────────────────────────────────────────────┘
+         ▲                    ▲
+         │ JWT 認証             │ IsAuthorized
+         │                    │
+   rellf-auth           各プロダクト API
+   (OIDC Provider)      (Site, Studio, ...)
+```
+
+## 認可判定のフロー
+
+各プロダクトの API が認可判定を行うときのフロー:
+
+```
+1. クライアント → プロダクト API（JWT 付き）
+2. API が JWT を検証（rellf-auth の JWKS）
+3. API が rellf-authz に認可判定を問い合わせ
+   → IsAuthorized(user, action, resource)
+4. rellf-authz が AVP に問い合わせ
+5. AVP が Cedar ポリシーを評価 → ALLOW / DENY
+6. 結果に基づいてレスポンス返却
+```
+
+プロダクト API から見ると、認可は 1 回の API コール。ポリシーの中身を知る必要はありません。
+
+## rellf-auth の JWT との接続
+
+rellf-auth が発行する ID Token:
+
+```json
+{
+  "iss": "https://auth.rellf.com",
+  "sub": "user-123",
+  "email": "user@example.com",
+  "groups": ["admin", "site:editor", "studio:member"],
+  "aud": "my-app",
+  "exp": 1743350400
+}
+```
+
+`groups` クレームがそのまま `Common::Role` のメンバーシップになります。
+
+```
+Common::User::"user-123"
+  memberOf: [
+    Common::Role::"admin",
+    Common::Role::"site:editor",
+    Common::Role::"studio:member"
+  ]
+```
+
+rellf-auth 側でユーザーのロールを管理し（Cognito Groups）、rellf-authz 側でロールに何ができるかを管理する。責務が明確に分かれます。
+
+## 段階的な構築ステップ
+
+### Phase 1: 基盤
+
+- AVP Policy Store + スキーマを Terraform で構築
+- 基本ポリシー（admin 全許可、デフォルト拒否）をコードで管理
+- 認可判定 API（`IsAuthorized` のラッパー）を Lambda でデプロイ
+- 最初のプロダクト（Site）で組み込み
+
+### Phase 2: 管理 API
+
+- ポリシー CRUD API
+- Namespace スコープ制御
+- Policy Template の定義
+- 監査ログ（DynamoDB）
+- Dry Run エンドポイント
+
+### Phase 3: 管理 UI
+
+- テンプレートベースのポリシー作成フォーム
+- ポリシー一覧・検索・削除
+- Dry Run UI（テストケース実行）
+- 監査ログ閲覧
+
+### Phase 4: 運用成熟
+
+- ポリシーの影響分析（変更前後の差分）
+- アラート（特定ユーザーの拒否が急増した場合）
+- ポリシーのバージョン管理・ロールバック
+
+## まとめ
+
+| 設計判断 | 選択 | 理由 |
+|---|---|---|
+| 認証と認可の分離 | rellf-auth / rellf-authz | 責務を明確に分け、プロダクト増加時のスケーラビリティ確保 |
+| 認可エンジン | Amazon Verified Permissions | マネージド + Cedar 言語 + スキーマ検証 |
+| Policy Store | 共有 1 つ + Namespace 分離 | プロダクト横断の権限管理が自然に書ける |
+| ポリシー管理の委譲 | Policy Template + Namespace スコープ | プロダクト管理者が Cedar を書かずにポリシーを管理 |
+| 管理権限 | AVP 自身で管理（自己参照） | 認可基盤の権限管理も同じ仕組みで統一 |
+| 安全性 | Dry Run + 監査ログ | ポリシー変更のミスを防ぎ、変更履歴を追跡可能 |
+
+認証は「誰か」を証明するだけでシンプルだけど、認可は「何ができるか」なのでプロダクトのドメイン知識が必要です。だからこそ、認可のポリシー管理はプロダクトチームに委譲すべき。認可基盤チームはプラットフォームとガードレール（テンプレート、スキーマ検証、Dry Run）を提供する役割に徹するのが健全な設計です。
