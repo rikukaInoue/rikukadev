@@ -1,0 +1,429 @@
+---
+title: "AWS Cognito を裏側に隠した独自 OIDC Provider を Go で作った"
+date: 2026-03-30
+tags: ["Go", "OIDC", "AWS Cognito", "Lambda", "認証"]
+description: "Cognito をユーザーストアとして内部利用しつつ、外部には独自署名の JWT を返す OIDC Provider（Proxy IdP）を Go + Lambda で構築した話。設計判断とステートレスな実装の詳細を解説します。"
+---
+
+## やりたかったこと
+
+同人グループ「rellf」の認証基盤として **rellf-auth** を作っています。将来的に複数のアプリ（Web サイト、制作管理ツールなど）で共通のアカウントを使いたいので、認証基盤をマイクロサービスとして独立させたい。
+
+最初は AWS Cognito の薄いラッパーとして作りました。Cognito の `InitiateAuth` を呼んで、Cognito が発行した JWT をそのままクライアントに返す構成です。
+
+```
+クライアント → rellf-auth API → Cognito
+                                    ↓
+              ← Cognito の JWT をそのまま返す ←
+```
+
+これで動くけど、問題がありました。
+
+## Cognito 直接返しの問題
+
+### クライアントが Cognito を知ってしまう
+
+Cognito の JWT には `iss` (issuer) として `https://cognito-idp.ap-northeast-1.amazonaws.com/ap-northeast-1_xxxxx` が入ります。クライアント側で JWT を検証するには、この Cognito の JWKS エンドポイントを直接叩く必要があります。
+
+つまり、クライアントアプリが「裏で Cognito を使っている」ことを知っている状態。将来 IdP を変えたくなったら、全クライアントの JWT 検証ロジックを書き換える必要があります。
+
+### カスタムログイン画面が作れない
+
+Cognito の Hosted UI は見た目のカスタマイズに限界があります。ブランドに合わせたログイン画面を作りたいけど、Cognito の OAuth フローを使うと Cognito のドメインにリダイレクトされてしまいます。
+
+### トークンのクレームを自由に制御できない
+
+Cognito の JWT に含まれるクレーム（`cognito:groups` など）は Cognito 固有の形式です。標準的な OIDC クレーム形式で返したい。
+
+## 解決策: Proxy IdP パターン
+
+rellf-auth 自身を **OIDC Provider** にしました。Cognito はユーザーストア（認証バックエンド）として裏側で使い続けるけど、外部には rellf-auth が署名した JWT を返します。
+
+```
+クライアントアプリ
+    │
+    │ 標準 OIDC (Authorization Code + PKCE)
+    ▼
+rellf-auth (OIDC Provider)
+    │  /.well-known/openid-configuration
+    │  /oidc/authorize  → カスタムログイン UI
+    │  /oidc/token      → 自前署名 JWT 発行
+    │  /oidc/userinfo
+    │  /oidc/jwks.json
+    │
+    │ Cognito SDK (内部)
+    ▼
+AWS Cognito User Pool (ユーザーストア)
+```
+
+クライアントから見ると rellf-auth は普通の OIDC Provider です。Cognito の存在は完全に隠蔽されます。
+
+## 技術スタック
+
+| 要素 | 技術 |
+|---|---|
+| 言語 | Go (Gin) |
+| デプロイ先 | AWS Lambda (arm64, provided.al2023) |
+| API Gateway | HTTP API v2 |
+| ユーザーストア | AWS Cognito User Pool |
+| 秘密管理 | SSM Parameter Store |
+| IaC | Terraform |
+| ローカル開発 | floci（Cognito エミュレータ） |
+| JWT ライブラリ | lestrrat-go/jwx/v2 |
+
+## OIDC エンドポイントの実装
+
+### Discovery (`/.well-known/openid-configuration`)
+
+OIDC クライアントが最初にアクセスするエンドポイント。自分が提供するエンドポイント一覧を JSON で返すだけです。
+
+```go
+func (h *OIDCHandler) Discovery(c *gin.Context) {
+    iss := h.issuer.Issuer()
+    c.JSON(http.StatusOK, gin.H{
+        "issuer":                 iss,
+        "authorization_endpoint": iss + "/oidc/authorize",
+        "token_endpoint":         iss + "/oidc/token",
+        "userinfo_endpoint":      iss + "/oidc/userinfo",
+        "jwks_uri":               iss + "/oidc/jwks.json",
+        "response_types_supported": []string{"code"},
+        "grant_types_supported":    []string{"authorization_code"},
+        "id_token_signing_alg_values_supported": []string{"RS256"},
+        "scopes_supported":        []string{"openid", "email", "profile"},
+        "code_challenge_methods_supported": []string{"S256"},
+    })
+}
+```
+
+### JWKS (`/oidc/jwks.json`)
+
+RSA 公開鍵を JWK Set 形式で返します。クライアントはこれを使って JWT の署名を検証します。
+
+鍵の管理は `lestrrat-go/jwx/v2` に任せています。秘密鍵から公開鍵を抽出して JWK Set を構築するだけ。
+
+```go
+func NewTokenIssuer(privateKeyPEM, keyID, issuer string) (*TokenIssuer, error) {
+    privKey, err := jwk.ParseKey([]byte(privateKeyPEM), jwk.WithPEM(true))
+    if err != nil {
+        return nil, err
+    }
+    privKey.Set(jwk.KeyIDKey, keyID)
+    privKey.Set(jwk.AlgorithmKey, jwa.RS256)
+
+    pubKey, _ := privKey.PublicKey()
+    pubSet := jwk.NewSet()
+    pubSet.AddKey(pubKey)
+
+    return &TokenIssuer{
+        privateKey: privKey,
+        issuer:     issuer,
+        publicJWKS: pubSet,
+    }, nil
+}
+```
+
+本番では RSA 秘密鍵を SSM Parameter Store に保存し、`OIDC_SIGNING_KEY=ssm:/rellf-auth/oidc-signing-key` で参照します。ローカル開発時は起動時に自動生成。
+
+### Authorization (`/oidc/authorize`)
+
+ここが Proxy IdP の核心。カスタムログインページを表示して、ユーザーの認証を Cognito に委任し、成功したら認可コードを発行してリダイレクトします。
+
+**GET** でログインフォームを表示:
+
+```go
+func (h *OIDCHandler) Authorize(c *gin.Context) {
+    // client_id, redirect_uri を検証
+    if _, err := h.clients.Validate(clientID, redirectURI); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+        return
+    }
+    // OIDC パラメータを hidden フィールドに埋め込んでログインページ描画
+    h.templates.ExecuteTemplate(c.Writer, "login.html", data)
+}
+```
+
+**POST** でフォーム送信を処理:
+
+```go
+func (h *OIDCHandler) AuthorizeSubmit(c *gin.Context) {
+    // 1. Cognito で認証
+    tokens, err := h.cognito.Login(ctx, email, password)
+    if err != nil {
+        // ログインページ再表示（エラーメッセージ付き）
+        return
+    }
+
+    // 2. Cognito の ID トークンからユーザー情報を抽出
+    idToken, _ := jwt.Parse([]byte(tokens.IDToken), jwt.WithVerify(false))
+    sub := idToken.Subject()
+
+    // 3. 認可コードを生成（AES-GCM 暗号化）
+    code, _ := h.codec.Encode(&AuthCodePayload{
+        Sub: sub, Email: email, ClientID: clientID,
+        CodeChallenge: codeChallenge, // PKCE
+        ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
+    })
+
+    // 4. クライアントにリダイレクト
+    c.Redirect(http.StatusFound, redirectURI+"?code="+code+"&state="+state)
+}
+```
+
+ログインページは Go の `html/template` + `embed` で作っています。SPA フレームワークは不要で、シンプルな HTML フォームです。
+
+## ステートレス認可コード
+
+ここが一番工夫したポイントです。
+
+OIDC の Authorization Code Flow では、認可コードを一時的に保存して、トークンエンドポイントで引き換える必要があります。通常は Redis や DynamoDB に保存しますが、Lambda はステートレスなので外部ストレージが必要になります。
+
+**外部ストレージなしで実現する方法**: 認可コードそのものにペイロードを暗号化して埋め込む。
+
+```go
+type AuthCodePayload struct {
+    Sub                 string   `json:"sub"`
+    Email               string   `json:"email"`
+    ClientID            string   `json:"cid"`
+    RedirectURI         string   `json:"ruri"`
+    Scopes              []string `json:"scp"`
+    Nonce               string   `json:"nonce,omitempty"`
+    CodeChallenge       string   `json:"cc,omitempty"`
+    CodeChallengeMethod string   `json:"ccm,omitempty"`
+    ExpiresAt           int64    `json:"exp"`
+}
+```
+
+これを AES-256-GCM で暗号化し、base64url エンコードして認可コードとして返します。
+
+```go
+func (c *AuthCodeCodec) Encode(payload *AuthCodePayload) (string, error) {
+    plaintext, _ := json.Marshal(payload)
+
+    nonce := make([]byte, c.aead.NonceSize())
+    rand.Read(nonce)
+
+    ciphertext := c.aead.Seal(nonce, nonce, plaintext, nil)
+    return base64.RawURLEncoding.EncodeToString(ciphertext), nil
+}
+```
+
+トークンエンドポイントでデコードするときは、復号して有効期限をチェックするだけ。
+
+```go
+func (c *AuthCodeCodec) Decode(code string) (*AuthCodePayload, error) {
+    data, _ := base64.RawURLEncoding.DecodeString(code)
+
+    nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+    plaintext, err := c.aead.Open(nil, nonce, ciphertext, nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to decrypt auth code")
+    }
+
+    var payload AuthCodePayload
+    json.Unmarshal(plaintext, &payload)
+
+    if time.Now().Unix() > payload.ExpiresAt {
+        return nil, fmt.Errorf("auth code expired")
+    }
+    return &payload, nil
+}
+```
+
+メリット:
+- **外部ストレージ不要** — Lambda のコールドスタートに影響しない
+- **スケーラビリティ** — どのインスタンスでもデコードできる
+- **暗号化キー1つだけ管理すればいい** — SSM Parameter Store に入れるだけ
+
+デメリット:
+- 認可コードが長くなる（ペイロード + GCM タグ + nonce で数百バイト）
+- 認可コードの無効化ができない（有効期限切れを待つしかない）
+
+有効期限を 5 分に設定しているので、実用上は問題ありません。
+
+## PKCE サポート
+
+Public client（SPA やモバイルアプリ）は PKCE 必須にしています。
+
+```go
+func verifyPKCE(challenge, method, verifier string) bool {
+    if method != "S256" {
+        return false
+    }
+    h := sha256.Sum256([]byte(verifier))
+    computed := base64.RawURLEncoding.EncodeToString(h[:])
+    return computed == challenge
+}
+```
+
+Public client が PKCE なしでトークン交換しようとするとエラーになります。Confidential client は `client_secret` で認証するので PKCE はオプショナル。
+
+## JWT 署名
+
+ID Token と Access Token を RSA-256 で署名して返します。
+
+```go
+func (ti *TokenIssuer) SignIDToken(sub, email string, groups []string, aud, nonce string) (string, error) {
+    token, _ := jwt.NewBuilder().
+        Issuer(ti.issuer).          // "https://auth.rellf.com"
+        Subject(sub).
+        Audience([]string{aud}).
+        IssuedAt(time.Now()).
+        Expiration(time.Now().Add(1 * time.Hour)).
+        Claim("email", email).
+        Claim("email_verified", true).
+        Claim("nonce", nonce).
+        Build()
+
+    return jwt.Sign(token, jwt.WithKey(jwa.RS256, ti.privateKey))
+}
+```
+
+返される JWT の `iss` は `https://auth.rellf.com`（rellf-auth の URL）であり、Cognito の URL ではありません。クライアントは rellf-auth の JWKS だけ見ればよく、Cognito の存在を知る必要がありません。
+
+## クライアント登録
+
+Phase 1 では環境変数で静的に定義しています。
+
+```
+OIDC_CLIENTS=my-app::public:http://localhost:3000/callback
+```
+
+フォーマットは `client_id:secret:type:redirect_uris`。
+
+```go
+type OIDCClient struct {
+    ClientID     string
+    ClientSecret string   // public client は空
+    ClientType   string   // "public" or "confidential"
+    RedirectURIs []string
+}
+```
+
+動的登録（管理画面から追加）は将来の拡張として残しています。
+
+## ローカル開発
+
+**floci**（LocalStack ベースの Cognito エミュレータ）を使っています。`make local` 一発で floci 起動 → Cognito リソース作成 → ローカルサーバー起動まで完了します。
+
+ローカルでは RSA 鍵を自動生成するので、鍵の事前準備は不要です。
+
+```bash
+# .env.local に自動設定される
+OIDC_SIGNING_KEY=auto          # 起動時に RSA 鍵を自動生成
+OIDC_AUTH_CODE_KEY=01234...    # 固定のテスト用 AES 鍵
+OIDC_CLIENTS=test-client::public:http://localhost:3000/callback
+```
+
+## テスト
+
+モックは使わず、floci に対する結合テストを書いています。OIDC フロー全体を通しでテストできます。
+
+```go
+func TestOIDC_AuthorizationCodeFlow(t *testing.T) {
+    ts := setupOIDCTestServer(t)  // floci 接続のテストサーバー
+
+    // ユーザー作成・確認
+    ensureOIDCTestUser(t, ts.URL, email, password)
+
+    // PKCE ペア生成
+    hash := sha256.Sum256([]byte(codeVerifier))
+    codeChallenge := base64.RawURLEncoding.EncodeToString(hash[:])
+
+    // 1. POST /oidc/authorize → 認可コード取得
+    resp := postForm(ts.URL+"/oidc/authorize", form)
+    code := parseRedirectCode(resp)
+
+    // 2. POST /oidc/token → JWT 取得
+    tokens := exchangeCode(ts.URL, code, codeVerifier)
+
+    // 3. GET /oidc/userinfo → ユーザー情報確認
+    userInfo := getUserInfo(ts.URL, tokens.AccessToken)
+    assert(userInfo["sub"] != "")
+}
+```
+
+テストケースは 13 件:
+- Discovery / JWKS の応答確認
+- Authorization Code Flow（全ステップ）
+- PKCE フロー
+- 不正な code_verifier で失敗
+- 無効なクライアント・リダイレクト URI で失敗
+- 不正なパスワードでログインページ再表示
+- UserInfo の認証チェック
+
+## Terraform / インフラ
+
+Lambda の環境変数で秘密情報は `ssm:` プレフィックスを使います。起動時に SSM Parameter Store から自動取得されます。
+
+```hcl
+environment {
+  variables = {
+    COGNITO_CLIENT_SECRET = "ssm:/${var.project_name}/cognito-client-secret"
+    OIDC_SIGNING_KEY      = "ssm:/${var.project_name}/oidc-signing-key"
+    OIDC_AUTH_CODE_KEY    = "ssm:/${var.project_name}/oidc-auth-code-key"
+    OIDC_ISSUER           = aws_apigatewayv2_stage.main.invoke_url
+    OIDC_KEY_ID           = var.oidc_key_id
+    OIDC_CLIENTS          = var.oidc_clients
+  }
+}
+```
+
+## 既存 API との共存
+
+既存の `/auth/*`（サインアップ、ログイン等）と `/api/*`（ユーザー情報等）はそのまま残しています。管理画面（`/admin/*`）も健在。
+
+```
+GET  /.well-known/openid-configuration  ← NEW
+GET  /oidc/jwks.json                    ← NEW
+GET  /oidc/authorize                    ← NEW
+POST /oidc/authorize                    ← NEW
+POST /oidc/token                        ← NEW
+GET  /oidc/userinfo                     ← NEW
+
+POST /auth/signup                       ← 既存
+POST /auth/login                        ← 既存
+GET  /api/me                            ← 既存
+GET  /admin/users                       ← 既存
+```
+
+既存クライアントは段階的に OIDC に移行できます。
+
+## ディレクトリ構成
+
+```
+internal/
+  oidc/
+    handler.go          # 全 OIDC エンドポイント
+    token.go            # RSA 鍵管理 + JWT 署名
+    authcode.go         # ステートレス認可コード (AES-GCM)
+    client.go           # クライアント登録・検証
+    embed.go            # go:embed
+    templates/
+      login.html        # カスタムログインページ
+    static/
+      login.css
+  cognito/
+    client.go           # Cognito SDK ラッパー（既存）
+    admin.go            # 管理 API（既存）
+  config/
+    config.go           # 環境変数 + SSM 解決
+  handler/              # 既存 API ハンドラー
+  middleware/            # JWT 検証ミドルウェア
+  admin/                # 管理画面
+  router/               # ルーティング
+```
+
+## まとめ
+
+| 設計判断 | 選択 | 理由 |
+|---|---|---|
+| Proxy IdP パターン | ○ | Cognito 隠蔽 + カスタム UI + クレーム制御 |
+| ステートレス認可コード | AES-GCM 暗号化 | Lambda で外部ストレージ不要 |
+| PKCE 必須（public client） | S256 | SPA/モバイル対応のセキュリティ要件 |
+| JWT 署名 | RS256 | 標準的、JWKS で公開鍵配布可能 |
+| 鍵管理 | SSM Parameter Store | AWS ネイティブ、Terraform 管理可能 |
+| テスト | floci 結合テスト | モック不使用、実際の Cognito API を叩く |
+
+コードは GitHub で公開しています: [rikukaInoue/rellf-auth](https://github.com/rikukaInoue/rellf-auth)
+
+次のステップは refresh_token 対応と、Google OAuth を OIDC フロー経由で動かすことです。
