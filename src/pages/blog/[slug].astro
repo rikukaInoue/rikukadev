@@ -11,6 +11,7 @@ export async function getStaticPaths() {
 
 const { post } = Astro.props;
 const { Content } = await render(post);
+const rawBody = post.body ?? "";
 ---
 
 <!doctype html>
@@ -226,6 +227,37 @@ const { Content } = await render(post);
         color: var(--accent);
       }
 
+      .copy-md-container {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 0 2.5rem 2rem;
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .copy-md-btn {
+        font-family: 'Inter', sans-serif;
+        font-size: 0.75rem;
+        color: var(--muted);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.4rem 0.8rem;
+        cursor: pointer;
+        transition: all 0.2s;
+        letter-spacing: 0.04em;
+      }
+
+      .copy-md-btn:hover {
+        color: var(--text);
+        border-color: var(--accent);
+      }
+
+      .copy-md-btn.copied {
+        color: var(--accent);
+        border-color: var(--accent);
+      }
+
       footer {
         border-top: 1px solid var(--border);
         padding: 2rem 2.5rem;
@@ -265,10 +297,43 @@ const { Content } = await render(post);
       <div class="prose">
         <Content />
       </div>
+
+      <div class="copy-md-container">
+        <button id="copy-md-btn" class="copy-md-btn">Copy as Markdown</button>
+      </div>
+      <textarea id="md-source" style="display:none">{rawBody}</textarea>
     </article>
 
     <a href="/" class="back-link">&larr; Back to all posts</a>
 
     <footer>&copy; rikuka.dev &mdash; All rights reserved</footer>
+
+    <script>
+      document.getElementById('copy-md-btn')?.addEventListener('click', async () => {
+        const source = document.getElementById('md-source') as HTMLTextAreaElement;
+        const btn = document.getElementById('copy-md-btn')!;
+        if (!source) return;
+        try {
+          await navigator.clipboard.writeText(source.value);
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = 'Copy as Markdown';
+            btn.classList.remove('copied');
+          }, 2000);
+        } catch {
+          source.style.display = 'block';
+          source.select();
+          document.execCommand('copy');
+          source.style.display = 'none';
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = 'Copy as Markdown';
+            btn.classList.remove('copied');
+          }, 2000);
+        }
+      });
+    </script>
   </body>
 </html>
