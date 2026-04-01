@@ -1,0 +1,225 @@
+---
+title: "AVP を RBAC 特化で使い、ABAC はアプリに任せる設計判断"
+date: 2026-04-01
+tags: ["AVP", "Cedar", "認可", "RBAC", "設計判断"]
+description: "Amazon Verified Permissions を RBAC 特化で運用し、リソースレベルの認可（ABAC）はアプリケーション側のビジネスロジックに委ねる設計判断に至った経緯と実装を解説します。"
+---
+
+## 前提
+
+[前々回](/blog/rellf-auth-oidc-provider)で認証基盤（OIDC Provider）を、[前回](/blog/avp-multi-product-authz)で Amazon Verified Permissions (AVP) + Cedar によるマルチプロダクト認可基盤の設計案を書きました。
+
+今回はその設計案を**実装に落とす段階で行った設計判断**について書きます。結論から言うと、AVP は RBAC（ロールベース）に特化させ、ABAC（属性ベース）のリソースレベル認可はアプリケーション側に任せることにしました。
+
+## AVP で何ができるか（おさらい）
+
+AVP + Cedar は大きく 2 つの認可パターンをサポートしています。
+
+### RBAC（ロールベース）
+
+「このロールを持つユーザーは、この機能を使える」
+
+```cedar
+permit (
+  principal in rellf::Role::"site:editor",
+  action in [rellf::Action::"editArticle", rellf::Action::"publishArticle"],
+  resource
+);
+```
+
+### ABAC（属性ベース）
+
+「このリソースの所有者であるユーザーだけが編集できる」
+
+```cedar
+permit (
+  principal,
+  action == rellf::Action::"editArticle",
+  resource
+) when {
+  resource.author == principal
+};
+```
+
+設計段階では両方を AVP で管理する構想でした。しかし実装を始めてみると、ABAC を認可サービスに寄せることの現実的な問題が見えてきました。
+
+## ABAC を認可サービスに寄せると何が起きるか
+
+### 問題 1: 認可サービスがプロダクトのデータを知る必要がある
+
+「この記事の著者は誰か」を判定するには、認可サービスがプロダクトの DB を参照するか、呼び出し側からリソースの属性を渡してもらう必要があります。
+
+**認可サービスがプロダクト DB に依存するパターン:**
+
+```
+プロダクト API → 認可サービス → プロダクト DB
+```
+
+サービス間の結合が強すぎます。認可サービスがすべてのプロダクトの DB スキーマを知っている状態は保守できません。
+
+**呼び出し側が属性を渡すパターン:**
+
+```
+プロダクト API → (DB からリソース取得) → 認可サービスに属性付きで問い合わせ
+```
+
+プロダクト側でリソースを取得した時点で、`article.AuthorID == userID` は判定できています。わざわざ認可 API に投げる意味が薄い。
+
+### 問題 2: 細粒度認可の同期コスト
+
+Google Zanzibar 系（SpiceDB、Auth0 FGA）のような細粒度認可は、リソース間の関係をグラフとして認可サービス側に持ちます。
+
+```
+document:doc-123#owner@user:alice
+folder:folder-1#viewer@group:editors
+```
+
+これをやるには、プロダクト側でリソースの作成・更新・削除のたびに認可サービスにリレーションを同期する必要があります。データの二重管理です。
+
+大規模サービス（Google、Slack 等）では統一的な ACL 管理のメリットが同期コストを上回りますが、小〜中規模ではオーバーエンジニアリングです。
+
+## 設計判断: 認可の守備範囲を分ける
+
+```
+┌──────────────────────────┐
+│  AVP (rellf-authz)       │
+│  「このロールはこの機能を  │
+│    使えるか」             │
+│  → RBAC                  │
+└──────────────────────────┘
+
+┌──────────────────────────┐
+│  アプリケーション側       │
+│  「このリソースに対して    │
+│    このユーザーが操作      │
+│    できるか」             │
+│  → ビジネスロジック       │
+└──────────────────────────┘
+```
+
+### AVP の守備範囲
+
+- ロール × 機能の制御
+- 「ロール A はカテゴリ X の記事を閲覧・編集できる」
+- 「ロール B は全リソースにアクセスできる」
+
+### アプリケーション側の守備範囲
+
+- リソースの所有権チェック（`article.AuthorID == userID`）
+- ビジネスルール（「下書きは著者以外見えない」等）
+- リソース間の関係に基づくアクセス制御
+
+## 実装: JWT groups → AVP rellf::Role
+
+認証基盤（rellf-auth）が発行する JWT の `groups` クレームに、ロール情報を含めます。
+
+```json
+{
+  "sub": "user-123",
+  "email": "user@example.com",
+  "groups": ["admin", "role-a", "site:editor"]
+}
+```
+
+認可サービス（rellf-authz）は JWT の `groups` をそのまま AVP の `rellf::Role` メンバーシップにマッピングします。
+
+```go
+// JWT の groups から AVP Entity を組み立て
+userEntity := avp.EntityItem{
+    EntityType: "rellf::User",
+    EntityID:   claims.Sub,
+}
+for _, g := range claims.Groups {
+    userEntity.Parents = append(userEntity.Parents, avp.Parent{
+        EntityType: "rellf::Role",
+        EntityID:   g,
+    })
+}
+```
+
+Cognito のグループがそのまま AVP のロールになるので、追加の同期は不要です。
+
+## Cedar スキーマ
+
+```
+Policy Store: rellf
+  └── rellf::
+      ├── User (memberOfTypes: [Role])
+      ├── Role
+      ├── Article (memberOfTypes: [Category])
+      ├── Category
+      └── Action (viewArticle, editArticle, publishArticle)
+```
+
+※ AVP は1 Policy Store あたり1 Namespace の制限があるため、単一の `rellf` Namespace にすべてのエンティティを定義しています。
+
+## Cedar ポリシー例
+
+```cedar
+// 管理者: 全リソースアクセス可
+permit (principal in rellf::Role::"admin", action, resource);
+
+// ロール A: 特定カテゴリの閲覧・編集
+permit (
+  principal in rellf::Role::"role-a",
+  action in [rellf::Action::"viewArticle", rellf::Action::"editArticle"],
+  resource in rellf::Category::"category-x"
+);
+
+// サイト編集者: 全記事の閲覧・編集・公開
+permit (
+  principal in rellf::Role::"site:editor",
+  action in [
+    rellf::Action::"viewArticle",
+    rellf::Action::"editArticle",
+    rellf::Action::"publishArticle"
+  ],
+  resource
+);
+```
+
+## グループ管理
+
+Cognito のグループ（= AVP のロール）は 2 つの経路で管理します。
+
+1. **Terraform**: 初期・基本グループを定義（`admin`, `site:editor` 等）
+2. **API**: 運用中に動的に追加（管理画面やスクリプトから）
+
+Terraform は宣言的なので、API で追加したグループは Terraform の管轄外です。必要に応じて後から Terraform に取り込みます。
+
+## インフラ構成
+
+rellf-auth と同じパターンで構築しています。
+
+| 要素 | 技術 |
+|---|---|
+| 言語 | Go (Gin) |
+| デプロイ先 | AWS Lambda (arm64, provided.al2023) |
+| API Gateway | HTTP API v2 |
+| 認可エンジン | Amazon Verified Permissions |
+| ポリシー言語 | Cedar |
+| JWT 検証 | rellf-auth の JWKS エンドポイントを参照 |
+| IaC | Terraform |
+
+## API エンドポイント
+
+```
+POST /api/is-authorized    認可判定
+POST /api/policies          ポリシー作成
+GET  /api/policies          ポリシー一覧
+GET  /api/policies/:id      ポリシー詳細
+DELETE /api/policies/:id    ポリシー削除
+GET  /health                ヘルスチェック
+```
+
+## まとめ
+
+| 設計判断 | 選択 | 理由 |
+|---|---|---|
+| RBAC | AVP (Cedar) | ロール × 機能の制御はポリシーエンジンの得意領域 |
+| ABAC | アプリ側 | リソース属性の取得がアプリ側で完結、二重管理を避ける |
+| 細粒度認可 | 不採用 | リレーション同期のコストが規模に見合わない |
+| groups の管理 | Cognito + Terraform | JWT の groups がそのまま AVP ロールにマッピング |
+| ローカル開発 | 実 AWS | AVP のローカルエミュレータが存在しない |
+
+理想的なアーキテクチャと現実的な運用のバランスを取った結果、「AVP は RBAC 特化、ABAC はアプリ側」という切り分けに落ち着きました。プロダクトが増えて関係管理が複雑になったら、細粒度認可の再検討を行います。
