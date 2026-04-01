@@ -204,13 +204,35 @@ rellf-auth と同じパターンで構築しています。
 ## API エンドポイント
 
 ```
-POST /api/is-authorized    認可判定
-POST /api/policies          ポリシー作成
-GET  /api/policies          ポリシー一覧
-GET  /api/policies/:id      ポリシー詳細
-DELETE /api/policies/:id    ポリシー削除
-GET  /health                ヘルスチェック
+POST /api/is-authorized          認可判定（単一アクション）
+GET  /api/permissions             全サービスの許可アクション一覧
+GET  /api/permissions/:service    特定サービスの許可アクションのみ
+POST /api/policies                ポリシー作成
+GET  /api/policies                ポリシー一覧
+GET  /api/policies/:id            ポリシー詳細
+DELETE /api/policies/:id          ポリシー削除
+GET  /health                      ヘルスチェック
 ```
+
+### 権限一覧の取得パターン
+
+認証と認可を分離した設計では、フロントエンドがメニューの出し分け等で「このユーザーが何をできるか」を知る必要があります。
+
+検討した 3 つの案:
+
+1. **JWT に permissions を含める** — rellf-auth がトークン発行時に rellf-authz を叩く → 認証が認可に依存してしまう
+2. **userinfo エンドポイントで返す** — OAuth 的だが毎回取得が必要
+3. **フロントが初回に rellf-authz に聞く** — 認証と認可の責務が明確に分離される
+
+案 3 を採用しました。フロントの初回ロード時に:
+
+```
+1. JWT 取得（rellf-auth）
+2. GET /api/permissions（rellf-authz）→ 許可アクション一覧
+3. メニュー出し分け
+```
+
+内部では AVP の `BatchIsAuthorized` API を使い、全アクションに対する判定を一括で行います。サービス単位で絞る場合は `/api/permissions/site` のようにパス指定します。
 
 ## まとめ
 
