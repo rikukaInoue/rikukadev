@@ -1,0 +1,161 @@
+---
+title: "OpenID 2.0 のフェデレーションを Cognito + Go で実現する設計"
+date: 2026-04-02
+tags: ["OpenID", "Cognito", "Go", "認証", "フェデレーション"]
+description: "OpenID 2.0 ベースの外部 IdP を AWS Cognito に統合するための設計と、Go ライブラリの選定調査。Cognito が OpenID 2.0 を非サポートなため、Proxy IdP パターンで吸収する。"
+---
+
+## 背景
+
+認証基盤に外部の OpenID 2.0 プロバイダーを連携させたい場面が出てきました。しかし AWS Cognito がネイティブでサポートするフェデレーションは以下の 3 種類のみです。
+
+- OpenID Connect（OIDC）
+- SAML 2.0
+- ソーシャル IdP（Google, Facebook, Apple, Amazon）
+
+**OpenID 2.0 は非サポート。** OpenID Connect とは別物です。
+
+## OpenID 2.0 と OpenID Connect の違い
+
+混同しやすいですが、まったく別のプロトコルです。
+
+| | OpenID 2.0 | OpenID Connect |
+|---|---|---|
+| ベース | 独自プロトコル | OAuth 2.0 |
+| ディスカバリー | XHTML / Yadis | JSON (`/.well-known/openid-configuration`) |
+| トークン形式 | なし（署名付きアサーション） | JWT (ID Token) |
+| 策定時期 | 2007 年 | 2014 年 |
+| 現在の採用 | 一部のレガシーサービス | 主流 |
+
+OpenID 2.0 は XML ベースのディスカバリーと独自の署名検証を使います。Cognito の OIDC フェデレーション機能では処理できません。
+
+## 設計: Proxy IdP パターン
+
+[rellf-auth](/blog/rellf-auth-oidc-provider) は既に Cognito を裏に隠した Proxy IdP として動いています。この構成を拡張して、OpenID 2.0 の RP（Relying Party）機能を追加します。
+
+```
+ユーザー
+  │
+  │ 「外部IDでログイン」
+  ▼
+rellf-auth (Proxy IdP)
+  │
+  │ OpenID 2.0 Authentication Request
+  ▼
+外部 OpenID 2.0 Provider
+  │
+  │ OpenID 2.0 Authentication Response（署名付き）
+  ▼
+rellf-auth
+  │ 署名検証 + ユーザー情報抽出
+  │ AdminLinkProviderForUser で Cognito に紐づけ
+  │ rellf-auth の JWT を発行
+  ▼
+クライアントアプリ
+```
+
+### フロー詳細
+
+1. ユーザーが「外部IDでログイン」を選択
+2. rellf-auth が OpenID 2.0 の Authentication Request を組み立て、外部 OP にリダイレクト
+3. 外部 OP でユーザーが認証
+4. 外部 OP が rellf-auth のコールバック URL に署名付きレスポンスを返す
+5. rellf-auth が署名を検証し、ユーザー識別子を抽出
+6. Cognito の `AdminLinkProviderForUser` で外部 ID を Cognito ユーザーに紐づけ
+7. rellf-auth が通常通り JWT を発行
+
+### 初回連携と 2 回目以降
+
+**初回:** Cognito にユーザーが存在しない場合は `AdminCreateUser` でユーザーを作成し、その後 `AdminLinkProviderForUser` でリンク。
+
+**2 回目以降:** 外部 ID で Cognito ユーザーを検索し、見つかればそのまま JWT を発行。
+
+## Go ライブラリ選定
+
+OpenID 2.0 の RP を Go で実装するためのライブラリを調査しました。
+
+### 調査結果
+
+| ライブラリ | Stars | 最終更新 | 評価 |
+|---|---|---|---|
+| [yohcop/openid-go](https://github.com/yohcop/openid-go) | 88 | 2023-10 | **採用候補** |
+| qzaidi/openid-go | 0 | 2019 | yohcop の fork、放置 |
+| xwz/openid.go | 0 | 2015 | 放置 |
+| rogpeppe-contrib/openid.go | - | 古い | 放置 |
+| kushaldas/openid.go | - | 古い | 放置 |
+
+### 結論: yohcop/openid-go 一択
+
+**選定理由:**
+
+- Go で唯一メンテナンスされている OpenID 2.0 RP 実装
+- Apache v2.0 ライセンス
+- Debian パッケージとしても配布されている（一定の信頼性）
+- OpenID 2.0 の仕様自体が 2007 年に確定しており、ライブラリの更新頻度が低いのは規格が枯れているため（問題ではない）
+
+**懸念点:**
+
+- 最終更新が 2023 年 10 月（約 2 年半前）
+- Open Issues が 3 件
+- Star 数が 88 と少ない
+
+ただし OpenID 2.0 の仕様が変わることはないため、動作すれば問題ありません。必要に応じてフォークして自前メンテナンスする選択肢もあります。
+
+### 使い方（基本）
+
+```go
+import "github.com/yohcop/openid-go"
+
+// ディスカバリー + 認証リクエスト URL の生成
+url, err := openid.RedirectURL(
+    "https://example.com/openid",  // OP の Identifier
+    "https://auth.example.com/callback",  // 戻り先
+    "",  // realm
+)
+
+// コールバックでの検証
+id, err := openid.Verify(
+    "https://auth.example.com/callback?" + queryString,
+    discoveryCache,
+    nonceStore,
+)
+// id にはユーザーの OpenID 識別子が入る
+```
+
+## OpenID Connect ベースの IdP との比較
+
+OIDC をサポートしている IdP の場合は、Cognito の組み込みフェデレーション機能がそのまま使えます。
+
+```
+// OIDC の場合（Cognito が直接サポート）
+ユーザー → Cognito Hosted UI → OIDC Provider → Cognito → JWT
+
+// OpenID 2.0 の場合（rellf-auth で吸収）
+ユーザー → rellf-auth → OpenID 2.0 Provider → rellf-auth → Cognito → JWT
+```
+
+OpenID 2.0 の場合は rellf-auth が翻訳レイヤーとして機能し、Cognito からは通常の外部プロバイダーリンクとして見えます。
+
+## 検討したが不採用にした案
+
+### Cognito Custom Auth Flow
+
+Cognito の DefineAuthChallenge / CreateAuthChallenge / VerifyAuthChallenge Lambda トリガーで OpenID 2.0 のフローを実装する案。
+
+**不採用理由:** Lambda トリガー間でのステート管理が複雑になる。OpenID 2.0 のリダイレクトフローとCognito の Custom Auth Flow のインタラクションモデルが噛み合わない。
+
+### OIDC プロキシ（OpenID 2.0 → OIDC 変換）
+
+OpenID 2.0 のレスポンスを OIDC の ID Token に変換する独立したプロキシサービスを立てる案。
+
+**不採用理由:** 独立したサービスが増える。rellf-auth が既に Proxy IdP として動いているので、そこに RP 機能を追加する方がシンプル。
+
+## まとめ
+
+| 判断 | 選択 | 理由 |
+|---|---|---|
+| 連携方式 | Proxy IdP パターン | 既存の rellf-auth アーキテクチャを活用 |
+| Go ライブラリ | yohcop/openid-go | 唯一メンテナンスされている選択肢 |
+| Cognito 連携 | AdminLinkProviderForUser | 外部 ID をCognito ユーザーに紐づけ |
+| Custom Auth Flow | 不採用 | リダイレクトフローとの相性が悪い |
+| OIDC 変換プロキシ | 不採用 | サービス増加を避ける |
