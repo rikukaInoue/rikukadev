@@ -1,0 +1,229 @@
+---
+title: "rellf-auth の設計で工夫したこと"
+date: 2026-04-03
+tags: ["Go", "認証", "設計", "AWS", "DDD"]
+description: "独自 OIDC Provider を Go + Lambda で構築する中で行った設計上の工夫。Proxy IdP、ステートレス認可コード、ドメインモデルによるライフサイクル管理、メール任意化フローなど。"
+---
+
+## はじめに
+
+[rellf-auth](https://github.com/rikukaInoue/rellf-auth) は、AWS Cognito を裏に隠した独自 OIDC Provider です。複数プロダクトで共通のアカウントを使うための認証基盤として構築しました。
+
+この記事では、実装の中で特に工夫したポイントを紹介します。
+
+## 1. Proxy IdP パターン — Cognito を隠蔽する
+
+Cognito の JWT をそのままクライアントに返すと、`iss` に Cognito の URL が露出します。将来 IdP を変えたくなった時に全クライアントの検証ロジックを書き換える羽目になる。
+
+rellf-auth は Cognito を「ユーザーストア」として内部利用しつつ、外部には独自署名の JWT を返します。
+
+```
+クライアントアプリ
+    │
+    │ 標準 OIDC
+    ▼
+rellf-auth (OIDC Provider)
+    │
+    │ Cognito SDK (内部)
+    ▼
+AWS Cognito User Pool (ユーザーストア)
+```
+
+クライアントは rellf-auth の JWKS だけ見ればよく、裏が Cognito であることを知る必要がありません。Cognito → Auth0 に移行しても、rellf-auth の内部実装を変えるだけでクライアント側の変更はゼロです。
+
+## 2. ステートレス認可コード — 外部ストレージ不要
+
+OIDC の Authorization Code Flow では、認可コードを一時的に保存して、トークンエンドポイントで引き換える必要があります。通常は Redis や DynamoDB に保存しますが、Lambda はステートレス。
+
+**認可コード自体にペイロードを AES-256-GCM で暗号化して埋め込む**ことで、外部ストレージを不要にしました。
+
+```go
+type AuthCodePayload struct {
+    Sub                 string   `json:"sub"`
+    Email               string   `json:"email"`
+    Groups              []string `json:"scp"`
+    CodeChallenge       string   `json:"cc,omitempty"`
+    CodeChallengeMethod string   `json:"ccm,omitempty"`
+    ExpiresAt           int64    `json:"exp"`
+}
+```
+
+暗号化キー 1 つだけ SSM Parameter Store で管理すればよく、Lambda のコールドスタートにも影響しません。有効期限は 5 分に設定しているため、無効化できない問題も実用上ありません。
+
+**同じ仕組みをメール登録フローでも再利用しています。** OIDC のパラメータを暗号化トークンにして hidden フィールドで引き回すことで、メール登録画面を挟んでも状態を失いません。
+
+## 3. SSM Parameter Store の自動解決
+
+環境変数の値に `ssm:` プレフィックスを付けると、起動時に SSM Parameter Store から自動取得します。
+
+```bash
+# 環境変数
+COGNITO_CLIENT_SECRET=ssm:/rellf-auth/cognito-client-secret
+OIDC_SIGNING_KEY=ssm:/rellf-auth/oidc-signing-key
+```
+
+```go
+func resolveSSMParams(cfg *Config) {
+    // "ssm:" プレフィックスの値を収集
+    // バッチで GetParameters を呼ぶ（1回のAPI呼び出し）
+    // 値を書き戻す
+}
+```
+
+秘密情報を環境変数にハードコードせずに済み、Terraform からは `ssm:` プレフィックス付きの文字列を渡すだけ。Lambda の環境変数には「SSM のパス」だけが見えます。
+
+## 4. ドメインモデルによるライフサイクル管理
+
+ユーザーの状態遷移を Go の型システムで表現しています。
+
+**参照は interface、更新は状態ごとの struct。**
+
+```go
+// 参照: 状態に関係なく横断的に扱える
+type User interface {
+    UserID() string
+    UserEmail() string
+    UserStatus() UserStatus
+}
+
+// 更新: 不正な遷移がコンパイルエラーになる
+type ActiveUser struct { ... }
+func (u *ActiveUser) Suspend(reason string) *SuspendedUser { ... }
+
+type SuspendedUser struct { ... }
+func (u *SuspendedUser) Reactivate() *ActiveUser { ... }
+
+type DeletedUser struct { ... }
+// メソッドなし — 終端状態
+```
+
+`PendingUser` に `Suspend` は呼べない。`DeletedUser` には何も呼べない。これは型で制約されます。
+
+### なぜ 1 つの struct + status フィールドにしなかったか
+
+```go
+// こうしなかった
+func (u *User) Suspend() error {
+    if u.Status != StatusActive {
+        return errors.New("cannot suspend")
+    }
+    ...
+}
+```
+
+ランタイムエラーより、コンパイル時に不正な操作を防ぎたかった。特に管理画面のハンドラーが増えるにつれて、「この状態で本当にこの操作をしていいのか」をコードレビューで確認するのは辛い。型が教えてくれる方が確実です。
+
+## 5. ユースケース層 — ドメインと Cognito の橋渡し
+
+ハンドラーが Cognito を直接叩くのではなく、ユースケース層を経由します。
+
+```
+ハンドラー → ユースケース → ドメインモデル（状態チェック）→ Cognito API
+```
+
+```go
+func (uc *UserUseCase) SuspendUser(ctx context.Context, username, reason, actor string) (*domain.SuspendedUser, *domain.AuditEvent, error) {
+    // 1. Cognito からユーザー取得
+    user, err := uc.GetUser(ctx, username)
+
+    // 2. ドメインモデルで状態チェック（ActiveUser以外はエラー）
+    active, ok := user.(*domain.ActiveUser)
+    if !ok {
+        return nil, nil, fmt.Errorf("cannot suspend: user is %s", user.UserStatus())
+    }
+
+    // 3. Cognito で無効化
+    uc.admin.AdminDisableUser(ctx, username)
+
+    // 4. ドメインモデルで遷移 + 監査イベント生成
+    suspended := active.Suspend(reason)
+    event := domain.NewAuditEvent(username, domain.AuditSuspend, actor, reason)
+
+    return suspended, event, nil
+}
+```
+
+全操作が `AuditEvent` を返すので、永続化先（DynamoDB 等）を繋げばそのまま監査ログになります。
+
+## 6. メール任意化と OIDC フロー内での登録促進
+
+外部 IdP（OpenID 2.0 等）ではメールアドレスが返ってこないケースがあります。User Pool を `alias_attributes = ["email"]` に変更して、メールを任意にしました。
+
+ただし完全に任意にすると、パスワードリセットやアカウント復旧ができない。そこで **OIDC フローの途中でメール登録を促す画面を挟む** ようにしました。
+
+```
+ログイン → 認証成功 → メール未登録？
+  → 「メールアドレスを登録しませんか？」画面
+    → 登録する → 通常フローに合流
+    → スキップ → 通常フローに合流
+```
+
+OIDC のパラメータはステートレス認可コードと同じ暗号化トークンで引き回すので、画面を挟んでもパラメータを失いません。
+
+## 7. Fixtures によるローカル開発データ管理
+
+テストユーザーを `fixtures/users.json` で定義しています。
+
+```json
+[
+  {"email": "admin@example.com", "password": "Admin1234!", "groups": ["admin"], "confirmed": true},
+  {"email": "lawyer@example.com", "password": "Lawyer1234!", "groups": ["lawyer"], "confirmed": true},
+  {"username": "user-no-email", "password": "NoEmail1234!", "groups": [], "confirmed": true},
+  {"email": "pending@example.com", "password": "Pending1234!", "groups": [], "confirmed": false}
+]
+```
+
+`make floci-setup` を叩くと、この JSON から全ユーザーとグループが floci（Cognito エミュレータ）に投入されます。
+
+メール未登録ユーザー、未確認ユーザー、複数ロールユーザーなど、各状態のテストデータが一発で揃います。
+
+## 8. OIDC フローでのライフサイクル検証
+
+認証成功しただけではログインさせません。ドメインモデルでユーザーの状態を検証します。
+
+```go
+// 認証成功後
+_, validateErr := h.userUC.ValidateLoginState(ctx, sub)
+if validateErr != nil {
+    // 一時停止中 → 「このアカウントは一時停止されています」
+    // 削除済み   → 「このアカウントは削除されています」
+    // → ログインページに戻す
+}
+
+// ActiveUser のみ通過
+h.userUC.RecordLogin(ctx, sub)
+```
+
+Cognito 側で `AdminDisableUser` してあっても、`InitiateAuth` は通る場合があります（トークンキャッシュ等）。ドメインモデルでの二重チェックにより、一時停止中のユーザーが確実にブロックされます。
+
+## 9. 認可サービスとの責務分離
+
+認証（rellf-auth）と認可（[rellf-authz](https://github.com/rikukaInoue/rellf-authz)）を完全に分離しています。
+
+```
+rellf-auth  → 「この人は誰か」→ JWT 発行
+rellf-authz → 「この人は何ができるか」→ AVP (Cedar) で判定
+```
+
+JWT の `groups` クレームがそのまま AVP の Role にマッピングされるので、Cognito のグループ管理が認可の基盤になります。
+
+クライアントの初回ロード時:
+```
+1. JWT 取得（rellf-auth）
+2. GET /api/permissions（rellf-authz）→ 許可アクション一覧
+3. メニュー出し分け
+```
+
+## まとめ
+
+| 工夫 | 何を解決したか |
+|---|---|
+| Proxy IdP | IdP 変更時のクライアント影響ゼロ |
+| ステートレス認可コード | Lambda で外部ストレージ不要 |
+| SSM 自動解決 | 秘密情報を環境変数にハードコードしない |
+| 参照 interface / 更新 struct | 不正な状態遷移をコンパイル時に防止 |
+| ユースケース層 | ドメイン検証と Cognito 操作の責務分離 |
+| メール任意 + 登録促進 | 外部 IdP 対応しつつ復旧手段を確保 |
+| Fixtures | テストデータを宣言的に管理 |
+| ログイン時ライフサイクル検証 | 停止中ユーザーの確実なブロック |
+| 認証/認可分離 | 各サービスの独立した進化 |
