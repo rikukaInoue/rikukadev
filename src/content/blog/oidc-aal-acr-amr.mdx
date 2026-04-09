@@ -1,0 +1,290 @@
+---
+title: "NIST AAL に対応する — OIDC の amr / acr / auth_time でログイン強度を表現する"
+date: 2026-04-10
+tags: ["認証", "OIDC", "NIST", "セキュリティ", "設計"]
+description: "NIST SP 800-63B の AAL を OIDC Provider でどう実装するか。amr / acr / auth_time クレームの使い方、ステップアップ認証、独自 OIDC Provider への組み込み方を整理。"
+---
+
+## はじめに
+
+「パスワードだけで入った人」と「パスワード + MFA で入った人」を区別したい。「決済画面では MFA を必須にしたい」「アカウント削除には直前の再認証を要求したい」——こういう要件は、認証システムが**ユーザーがどの強度で認証したか**を覚えていないと実現できません。
+
+NIST SP 800-63B は認証強度を **AAL (Authenticator Assurance Level)** として定義していて、OIDC にはそれを表現するクレームが用意されています。この記事では、AAL の概要と OIDC での実装方法を整理します。
+
+## IAL / AAL / FAL の違い
+
+NIST SP 800-63 は識別と認証を 3 つのレベルに分けています。混同されがちなので最初に整理。
+
+| | 内容 | 例 |
+|---|------|-----|
+| **IAL** (Identity Assurance Level) | 身元証明の強度（誰か） | パスポート提示、対面確認 |
+| **AAL** (Authenticator Assurance Level) | 認証行為の強度（本人確認） | パスワード、MFA、生体 |
+| **FAL** (Federation Assurance Level) | フェデレーションの強度 | アサーションの暗号化・署名 |
+
+この記事で扱うのは **AAL** です。IAL は登録時の身元証明、AAL は毎回のログイン強度、と覚えておくと混乱しません。
+
+## NIST AAL の3段階
+
+| レベル | 要件 | 例 |
+|------|------|-----|
+| **AAL1** | 単要素 | パスワードのみ |
+| **AAL2** | 2 要素（知識 + 所有 / 知識 + 生体 等） | パスワード + TOTP |
+| **AAL3** | ハードウェアベースの暗号認証必須 | FIDO2 / WebAuthn |
+
+AAL2 と AAL3 の境目は「ハードウェア暗号鍵が必須かどうか」です。SMS OTP は AAL2 として認められなくなりつつある（SIM スワップ攻撃のリスク）点にも注意。
+
+## OIDC が用意してるクレーム
+
+OIDC には認証強度を表現するクレームが標準で定義されています。
+
+| クレーム | 意味 | 出典 |
+|---------|------|-----|
+| **`amr`** | 使った認証手段の配列 | RFC 8176 |
+| **`acr`** | 認証コンテキストクラス（≒ AAL） | OIDC Core 1.0 |
+| **`auth_time`** | 最後に認証した時刻 (UNIX time) | OIDC Core 1.0 |
+
+### `amr` の標準値（RFC 8176）
+
+| 値 | 意味 |
+|----|------|
+| `pwd` | パスワード |
+| `mfa` | 多要素認証 |
+| `otp` | ワンタイムパスワード（TOTP 等） |
+| `sms` | SMS |
+| `tel` | 電話 |
+| `fpt` | 指紋 |
+| `face` | 顔認証 |
+| `iris` | 虹彩 |
+| `hwk` | ハードウェアキー |
+| `swk` | ソフトウェアキー |
+| `user` | ユーザー存在確認（タッチ等） |
+| `pin` | PIN |
+| `geo` | 位置情報による認証 |
+| `mca` | 複数チャネル認証 |
+
+例えば「パスワード + TOTP でログイン」した JWT はこんな形：
+
+```json
+{
+  "sub": "user-uuid",
+  "iss": "https://auth.example.com",
+  "aud": "client-id",
+  "exp": 1712707800,
+  "iat": 1712707200,
+  "auth_time": 1712707200,
+  "amr": ["pwd", "otp", "mfa"],
+  "acr": "aal2"
+}
+```
+
+### `acr` の値
+
+`acr` は文字列なので任意の値を入れられますが、一般的には：
+
+- `urn:mace:incommon:iap:bronze` / `silver` / `gold` （InCommon の標準）
+- `aal1` / `aal2` / `aal3` （NIST 準拠の独自）
+- `0` / `1` / `2` / `3` （ISO/IEC 29115 の Level of Assurance）
+
+独自 OIDC Provider なら `aal1` / `aal2` / `aal3` がシンプルでわかりやすいです。
+
+## 実装例
+
+独自 OIDC Provider に AAL を組み込む例（Go）。
+
+### 1. 認証時に AMR を記録する
+
+```go
+func determineAMR(loginMethod string, mfaUsed bool) []string {
+    methods := []string{}
+
+    switch loginMethod {
+    case "password":
+        methods = append(methods, "pwd")
+    case "google":
+        methods = append(methods, "swk") // ソーシャルログインはソフトウェアキー扱い
+    case "webauthn":
+        methods = append(methods, "hwk", "user")
+    }
+
+    if mfaUsed {
+        methods = append(methods, "mfa")
+    }
+
+    return methods
+}
+```
+
+### 2. AMR から ACR を判定
+
+```go
+func determineACR(amr []string) string {
+    hasPwd := contains(amr, "pwd")
+    hasMfa := contains(amr, "mfa")
+    hasHwk := contains(amr, "hwk")
+
+    switch {
+    case hasHwk:
+        return "aal3" // FIDO2 等のハードウェア認証
+    case hasPwd && hasMfa:
+        return "aal2" // パスワード + 第2要素
+    default:
+        return "aal1"
+    }
+}
+```
+
+### 3. JWT クレームに含める
+
+```go
+claims := jwt.MapClaims{
+    "sub":       userID,
+    "iss":       "https://auth.example.com",
+    "aud":       clientID,
+    "exp":       expiry.Unix(),
+    "iat":       now.Unix(),
+    "auth_time": authTime.Unix(),
+    "amr":       determineAMR(loginMethod, mfaUsed),
+    "acr":       determineACR(amr),
+}
+```
+
+### 4. アプリ側でのチェック
+
+```go
+func RequireAAL2(c *gin.Context) {
+    claims := getClaims(c)
+
+    acr, _ := claims["acr"].(string)
+    if acr != "aal2" && acr != "aal3" {
+        c.JSON(403, gin.H{
+            "error":        "step_up_required",
+            "required_acr": "aal2",
+        })
+        c.Abort()
+        return
+    }
+
+    // auth_time も確認(古すぎたらNG)
+    authTime := time.Unix(int64(claims["auth_time"].(float64)), 0)
+    if time.Since(authTime) > 5*time.Minute {
+        c.JSON(403, gin.H{"error": "reauth_required"})
+        c.Abort()
+        return
+    }
+
+    c.Next()
+}
+```
+
+## ステップアップ認証
+
+クライアント側が「この操作には AAL2 が必要」と要求するパターンです。
+
+### クライアントから要求
+
+OIDC Authorization Request に `acr_values` パラメータを付ける：
+
+```
+GET /oidc/authorize?
+  client_id=xxx
+  &response_type=code
+  &redirect_uri=https://app.example.com/callback
+  &scope=openid
+  &acr_values=aal2
+  &max_age=300
+```
+
+- `acr_values=aal2` → 最低 AAL2 を要求
+- `max_age=300` → 直前 5 分以内の認証を要求
+
+### Provider 側の対応
+
+```go
+func handleAuthorize(c *gin.Context) {
+    requestedACR := c.Query("acr_values")
+    maxAge := parseMaxAge(c.Query("max_age"))
+
+    session := getSession(c)
+
+    // 現在のセッションが要求を満たすか確認
+    if !meetsACR(session.ACR, requestedACR) {
+        // MFA画面にリダイレクト
+        return redirectToMFA(c)
+    }
+
+    if maxAge > 0 && time.Since(session.AuthTime) > maxAge {
+        // 再認証画面にリダイレクト
+        return redirectToReauth(c)
+    }
+
+    // 要求を満たすので通常の認可フロー
+    return issueAuthCode(c, session)
+}
+```
+
+## ユースケース別の AAL 要求
+
+| 操作 | 推奨 AAL | 補足 |
+|------|---------|------|
+| 一般的な閲覧 | AAL1 | デフォルト |
+| プロフィール編集 | AAL1 | + 直前 1 時間以内 |
+| パスワード変更 | AAL2 | |
+| メールアドレス変更 | AAL2 | + 古いメールアドレスへの通知 |
+| アカウント削除 | AAL2 | + 5 分以内の再認証 |
+| 決済 | AAL2 | + 直前の認証 |
+| 個人情報の閲覧 | AAL2 | GDPR / 個人情報保護法 |
+| 管理者操作 | AAL3 | 推奨 |
+
+## 設計上の注意点
+
+### 1. `auth_time` はリフレッシュで更新しない
+
+リフレッシュトークンで新しい JWT を発行するとき、`auth_time` は**元の認証時刻のまま**にします。`iat` は更新されますが、`auth_time` は「ユーザーが実際にパスワード等を入力した時刻」を表すので、リフレッシュで進めるとステップアップ認証の意味がなくなります。
+
+```go
+// リフレッシュ時の JWT 生成
+claims := jwt.MapClaims{
+    "iat":       now.Unix(),                  // 更新する
+    "exp":       now.Add(1 * time.Hour).Unix(),
+    "auth_time": session.OriginalAuthTime,    // 元のまま!
+    "amr":       session.OriginalAMR,
+    "acr":       session.OriginalACR,
+}
+```
+
+### 2. AAL は下がらない
+
+セッション継続中に AAL が下がることはありません。後から MFA を追加したらアップグレードはできますが、下げることはできません。「`auth_time` が古くなったから再認証要求」という形で対応します。
+
+### 3. MFA をスキップしたい場合（Trusted Device 等）
+
+ユーザー体験を考えると、毎回 MFA を要求するのは厳しい。よくあるパターン：
+
+- 信頼済みデバイス Cookie を発行し、30 日間は MFA スキップ
+- ただし「金融取引」「パスワード変更」のような高リスク操作では再要求
+
+この場合、**通常セッションは AAL2、高リスク操作時に `max_age=0` で強制再認証**という設計になります。
+
+### 4. ソーシャルログインの扱い
+
+Google ログインなどは「Google が認証してくれた」状態ですが、Google が MFA を要求したかは Provider 側ではわかりません。`amr_values` を Google が返してくれれば取れますが、保守的には：
+
+- ソーシャルログイン単独 → AAL1
+- ソーシャルログイン + 自前の MFA → AAL2
+
+としておくのが安全です。
+
+### 5. クライアント別の最低 AAL 設定
+
+「このクライアントは最低 AAL2 必須」のような制御も入れたくなります。OIDC の Dynamic Client Registration（RFC 7591）には `default_acr_values` という項目があり、これを使えます。
+
+## まとめ
+
+- AAL は「認証行為の強度」を表す NIST の分類
+- OIDC の `amr` / `acr` / `auth_time` クレームで表現できる
+- 独自 OIDC Provider なら、認証手段から `amr` を組み立て、それを元に `acr` を決定する設計が素直
+- ステップアップ認証は `acr_values` + `max_age` パラメータで実現
+- `auth_time` はリフレッシュで更新しないのがポイント
+- ユースケースごとに要求 AAL を分けると、UX とセキュリティのバランスが取りやすい
+
+認証強度の表現は最初は地味ですが、後から「決済機能を追加したい」「監査要件で再認証を強制したい」となったときに、これがないと詰みます。OIDC Provider を作るなら早めに入れておくのが正解です。
