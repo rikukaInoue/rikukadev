@@ -1,0 +1,122 @@
+---
+title: "既存の認証システムから Cognito に乗り換えるとき、SES はそのまま使えるのか"
+date: 2026-04-03
+tags: ["AWS", "Cognito", "SES", "移行"]
+description: "独自認証から Cognito に移行する際に、既存の SES ドメイン認証・本番モード・レピュテーションをそのまま引き継ぐときの考慮点を整理。"
+---
+
+## 前提
+
+独自の認証システムがあり、メール送信に Amazon SES を使っている。これを Cognito User Pool ベースの認証に乗り換えたい。SES のドメイン認証や本番モードはすでに整っているので、できればそのまま引き継ぎたい。
+
+この記事では、その「引き継ぎ」がどこまでスムーズにいくか、どこに落とし穴があるかを整理します。
+
+## 結論
+
+**SES の引き継ぎ自体は簡単**です。Cognito の `email_configuration` に既存 SES ドメインの ARN を指定するだけ。ただし、リージョン制約やメール制御方式の違いなど、いくつかの考慮点があります。
+
+## そのまま引き継げるもの
+
+| 資産 | 引き継ぎ |
+|------|---------|
+| ドメイン認証（DKIM / SPF） | そのまま使える |
+| 本番モード（プロダクションアクセス） | アカウント単位なのでそのまま |
+| 送信レピュテーション | 引き継がれる（メリット） |
+| 送信元アドレス | 同じアドレスを指定可能 |
+| Configuration Sets | Cognito でも指定可能 |
+
+既存の SES 設定に手を加える必要はありません。
+
+## 考慮が必要なポイント
+
+### 1. リージョン制約
+
+Cognito が SES と連携できるリージョンは限られています。
+
+- Cognito と**同じリージョン**の SES
+- または `us-east-1` / `us-west-2` / `eu-west-1` のいずれか
+
+既存 SES がこれらのリージョンにない場合、そのままでは連携できません。対応リージョンに新しく SES ドメインを作るか、Cognito 側のリージョンを合わせる必要があります。
+
+**これが一番のブロッカーになりうるポイント**です。移行検討の最初に確認してください。
+
+### 2. 送信元アドレスが 1 つに限定される
+
+Cognito の `from_email_address` には 1 つのアドレスしか設定できません。
+
+```hcl
+email_configuration {
+  email_sending_account = "DEVELOPER"
+  from_email_address    = "no-reply@example.com"  # 1 つだけ
+  source_arn            = aws_sesv2_email_identity.main.arn
+}
+```
+
+既存システムが用途に応じて送信元を使い分けていた場合（`no-reply@` と `support@` など）、Cognito 経由のメールは 1 つに統一する必要があります。
+
+### 3. メール制御方式が変わる
+
+既存システムでは SES API（`SendEmail` / `SendTemplatedEmail`）で直接メールを送っていたはずです。Cognito 経由になると、メールの制御方法が変わります。
+
+| | 既存（SES 直接） | Cognito 経由 |
+|---|---|---|
+| テンプレート | SES Templates / アプリ内 | CustomMessage Lambda |
+| 送信タイミング | アプリが制御 | Cognito が自動送信 |
+| 送信対象 | 任意 | 確認コード・パスワードリセット等に限定 |
+| 添付ファイル | 可能 | 不可 |
+
+CustomMessage Lambda では `event.Request.CodeParameter` に確認コードが渡されるので、それを HTML テンプレートに埋め込んで返す形になります。SES Templates は使えません。
+
+### 4. Cognito で送れないメールがある
+
+Cognito が SES 経由で送るのは以下のメールだけです。
+
+- サインアップ時の確認コード
+- パスワードリセット
+- 確認コードの再送
+- メールアドレス変更の確認
+- 管理者によるユーザー作成（一時パスワード）
+
+**お知らせメール、ニュースレター、アカウント関連の通知**などは Cognito の管轄外です。これらは引き続き既存システム（またはアプリケーション側）から SES を直接呼ぶ必要があります。
+
+つまり、移行後は SES の利用者が「既存アプリ」と「Cognito」の 2 つになります。
+
+### 5. 並行稼働期間のメトリクス混在
+
+移行中に両システムが同じ SES から送信すると、バウンス率や苦情率のメトリクスが混ざります。
+
+どちらのシステムが問題を起こしているか切り分けるために、**Configuration Sets を分けておく**のがおすすめです。
+
+```hcl
+# 既存システム用
+resource "aws_sesv2_configuration_set" "legacy" {
+  configuration_set_name = "legacy-auth"
+}
+
+# Cognito 用
+resource "aws_sesv2_configuration_set" "cognito" {
+  configuration_set_name = "cognito-auth"
+}
+```
+
+Cognito 側は User Pool の設定で Configuration Set を指定できます。
+
+### 6. ロールバック
+
+SES 自体は共有リソースなので、Cognito 側の設定を外す（`COGNITO_DEFAULT` に戻す）だけで元に戻せます。SES への影響はありません。ロールバックのリスクが低いのは安心材料です。
+
+## 移行チェックリスト
+
+1. **既存 SES のリージョンを確認** — Cognito と連携可能か
+2. **送信元アドレスの整理** — Cognito 用に 1 つ決める
+3. **メールの棚卸し** — どのメールが Cognito 管轄になり、どれが既存のまま残るか
+4. **CustomMessage Lambda の実装** — 既存テンプレートを Lambda に移植
+5. **Configuration Sets の分離** — メトリクスの切り分け（推奨）
+6. **サンドボックスでのテスト** — Cognito + SES の送信確認
+7. **切り替え** — Cognito の `email_configuration` を `DEVELOPER` に変更
+
+## まとめ
+
+既存の SES をCognito でそのまま使うこと自体は簡単です。ドメイン認証・本番モード・レピュテーションはすべて引き継げます。
+
+ただし、リージョン制約の確認と、メール制御方式の変化（SES Templates → CustomMessage Lambda）への対応は必要です。また、Cognito で送れるメールは認証フロー関連に限定されるため、それ以外のメールは既存の仕組みを維持する必要がある点を見落とさないようにしてください。

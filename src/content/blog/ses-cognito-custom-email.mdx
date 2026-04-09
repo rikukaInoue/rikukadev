@@ -1,0 +1,274 @@
+---
+title: "Cognito の確認メールをカスタマイズする — SES 連携・CustomMessage Lambda・alias_attributes の罠"
+date: 2026-04-03
+tags: ["AWS", "Cognito", "SES", "Lambda", "Go", "Terraform"]
+description: "Cognito のデフォルト確認メールを、SES による送信元カスタマイズと CustomMessage Lambda による HTML テンプレートで置き換えた記録。alias_attributes 環境での SignUp/ConfirmSignUp のハマりポイントも。"
+---
+
+## 目的
+
+rellf-auth は Cognito を内部に隠した独自 OIDC Provider です。メール確認やパスワードリセットの通知は Cognito が送りますが、デフォルトだと以下の問題があります。
+
+- 送信元が `no-reply@verificationemail.com` — 自サービスのドメインではない
+- 文面がプレーンテキストの英語テンプレート — ブランディングも日本語対応もない
+- 1 日 50 通の制限 — 開発中でもすぐ使い切る
+
+今回の対応で目指したのは：
+
+1. **送信元を `no-reply@rikuka.dev` に変更** — ドメインの信頼性向上
+2. **HTML メールで日本語の文面にカスタマイズ** — ユーザー体験の改善
+3. **SES 本番モードへの移行** — 送信先・送信数の制限解除
+
+## やったことの全体像
+
+```
+Before:
+  Cognito → COGNITO_DEFAULT → no-reply@verificationemail.com（プレーンテキスト英語）
+
+After:
+  Cognito → CustomMessage Lambda（HTML生成）→ SES（DEVELOPER モード）→ no-reply@rikuka.dev
+```
+
+必要な作業は以下の 4 つ。
+
+| # | 作業 | 目的 |
+|---|------|------|
+| 1 | SES ドメイン認証 + DKIM | `rikuka.dev` からの送信を認証 |
+| 2 | Cognito を DEVELOPER モードに変更 | SES 経由の送信に切り替え |
+| 3 | CustomMessage Lambda の追加 | メール文面の HTML カスタマイズ |
+| 4 | SES 本番モード申請 | サンドボックスの制限解除 |
+
+## Cognito のメール送信モード
+
+### COGNITO_DEFAULT（デフォルト）
+
+- 送信元: `no-reply@verificationemail.com`（変更不可）
+- 1 日あたり 50 通の制限
+- 文面のカスタマイズは `verification_message_template` で件名・本文のみ（HTML 不可）
+- 追加コストなし
+
+### DEVELOPER（SES 連携）
+
+- 送信元: 自分のドメインのアドレス（例: `no-reply@rikuka.dev`）
+- SES の送信上限に依存（サンドボックスでは 200 通/日、本番では実質無制限）
+- CustomMessage Lambda と組み合わせれば完全に自由な HTML メール
+- SES の料金が発生（1,000 通あたり $0.10）
+- Cognito の Lite プランでも使える（Essentials / Plus は不要）
+
+## SES サンドボックスと本番モード
+
+SES のアカウントは最初「サンドボックス」モードです。
+
+| | サンドボックス | 本番（プロダクション） |
+|---|---|---|
+| **送信先** | 検証済みアドレスのみ | 任意のアドレス |
+| **送信上限** | 200 通/日、1 通/秒 | リクエストに応じて引き上げ |
+| **用途** | 開発・テスト | ユーザー向け送信 |
+| **デメリット** | — | バウンス率 5% / 苦情率 0.1% 超で一時停止の可能性 |
+
+サンドボックスで開発する場合、**送信先のメールアドレスも SES に登録が必要**です。
+
+```bash
+# テスト用メールアドレスの登録（検証メールが届くのでリンクをクリック）
+aws sesv2 create-email-identity --email-identity your-email@example.com
+
+# 検証状態の確認
+aws sesv2 get-email-identity --email-identity your-email@example.com
+```
+
+### 本番モードへの申請
+
+確認メール・パスワードリセットのようなトランザクショナルメールだけなら、バウンス/苦情率が問題になることはまずないので、早めに申請しておいて問題ありません。
+
+```bash
+aws sesv2 put-account-details \
+  --mail-type TRANSACTIONAL \
+  --website-url "https://auth.rikuka.dev" \
+  --use-case-description "Sending verification codes and password reset emails for user authentication service. Low volume, transactional only." \
+  --production-access-enabled \
+  --contact-language JA
+```
+
+通常 24 時間以内に審査完了。用途説明が不十分だと却下されますが、再申請可能です。
+
+## Terraform による実装
+
+### 1. SES ドメイン認証
+
+```hcl
+resource "aws_sesv2_email_identity" "main" {
+  email_identity = var.domain_zone  # "rikuka.dev"
+}
+
+resource "aws_route53_record" "ses_dkim" {
+  count = 3
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "${aws_sesv2_email_identity.main.dkim_signing_attributes[0].tokens[count.index]}._domainkey.${var.domain_zone}"
+  type    = "CNAME"
+  ttl     = 300
+  records = ["${aws_sesv2_email_identity.main.dkim_signing_attributes[0].tokens[count.index]}.dkim.amazonses.com"]
+}
+```
+
+`aws_sesv2_email_identity` でドメインを登録すると DKIM トークンが 3 つ生成されるので、Route 53 に CNAME レコードとして追加します。
+
+### 2. Cognito の SES 連携設定
+
+```hcl
+resource "aws_cognito_user_pool" "main" {
+  # ...
+
+  email_configuration {
+    email_sending_account  = "DEVELOPER"
+    from_email_address     = "no-reply@${var.domain_zone}"
+    source_arn             = aws_sesv2_email_identity.main.arn
+  }
+
+  lambda_config {
+    pre_sign_up    = aws_lambda_function.presignup.arn
+    custom_message = aws_lambda_function.custommessage.arn
+  }
+}
+```
+
+### 3. CustomMessage Lambda
+
+```hcl
+resource "aws_lambda_function" "custommessage" {
+  function_name = "${var.project_name}-custommessage"
+  role          = aws_iam_role.custommessage.arn
+  handler       = "bootstrap"
+  runtime       = "provided.al2023"
+  architectures = ["arm64"]
+  timeout       = 5
+  memory_size   = 128
+
+  filename         = var.custommessage_zip_path
+  source_code_hash = filebase64sha256(var.custommessage_zip_path)
+}
+```
+
+IAM ロールは `AWSLambdaBasicExecutionRole` だけで十分です。CustomMessage トリガーはメール本文を返すだけで、Cognito API を呼ぶ必要はありません。
+
+## Go による CustomMessage Lambda
+
+```go
+func handler(ctx context.Context, event events.CognitoEventUserPoolsCustomMessage) (events.CognitoEventUserPoolsCustomMessage, error) {
+    code := event.Request.CodeParameter
+
+    switch event.TriggerSource {
+    case "CustomMessage_SignUp", "CustomMessage_ResendCode", "CustomMessage_VerifyUserAttribute":
+        event.Response.EmailSubject = "[rellf-auth] メールアドレスの確認"
+        event.Response.EmailMessage = buildVerificationEmail(code)
+
+    case "CustomMessage_ForgotPassword":
+        event.Response.EmailSubject = "[rellf-auth] パスワードリセット"
+        event.Response.EmailMessage = buildPasswordResetEmail(code)
+
+    case "CustomMessage_UpdateUserAttribute":
+        event.Response.EmailSubject = "[rellf-auth] メールアドレス変更の確認"
+        event.Response.EmailMessage = buildAttributeUpdateEmail(code)
+    }
+
+    return event, nil
+}
+```
+
+`event.Request.CodeParameter` に確認コードが入っているので、HTML テンプレートに埋め込んで返します。**`EmailMessage` に確認コードを含めないと Cognito がエラーを返す**ので注意。
+
+### 対応するトリガーソース
+
+| TriggerSource | タイミング |
+|---|---|
+| `CustomMessage_SignUp` | サインアップ時の確認コード |
+| `CustomMessage_ForgotPassword` | パスワードリセット |
+| `CustomMessage_ResendCode` | 確認コードの再送 |
+| `CustomMessage_UpdateUserAttribute` | メールアドレス変更時 |
+| `CustomMessage_VerifyUserAttribute` | 属性の検証 |
+| `CustomMessage_AdminCreateUser` | 管理者によるユーザー作成（一時パスワード） |
+
+## alias_attributes 環境でのハマりポイント
+
+`alias_attributes = ["email"]` で構成した User Pool には、`username_attributes = ["email"]` とは異なる制約があります。今回 2 つのバグに遭遇しました。
+
+### 1. SignUp で「Username cannot be of email format」
+
+`alias_attributes` の User Pool では、**Username にメール形式の文字列を渡せません**。email はあくまでエイリアスであり、Username は別に用意する必要があります。
+
+```go
+// NG: email をそのまま Username にする
+Username: aws.String(email),
+
+// OK: UUID を生成して Username にする
+username := generateUUID()
+Username: aws.String(username),
+UserAttributes: []types.AttributeType{
+    {Name: aws.String("email"), Value: aws.String(email)},
+},
+```
+
+SecretHash の計算にも Username（UUID）を使う点に注意。
+
+```go
+SecretHash: aws.String(c.computeSecretHash(username)), // email ではなく username
+```
+
+### 2. ConfirmSignUp で「Username/client id combination not found」
+
+`alias_attributes` では、**メール確認が完了するまで email でユーザーを引けません**。ConfirmSignUp の時点ではまだ未確認なので、email を Username として渡すと見つからない。
+
+解決策: `ListUsers` で email からユーザーを検索し、実際の Username（UUID）を取得してから ConfirmSignUp を呼ぶ。
+
+```go
+func (c *Client) ConfirmSignUp(ctx context.Context, email, code string) error {
+    // email → 実際の Username を解決
+    username, err := c.findUsernameByEmail(ctx, email)
+    if err != nil {
+        return err
+    }
+
+    input := &cip.ConfirmSignUpInput{
+        ClientId:         aws.String(c.clientID),
+        Username:         aws.String(username),
+        ConfirmationCode: aws.String(code),
+        SecretHash:       aws.String(c.computeSecretHash(username)),
+    }
+    _, err = c.cip.ConfirmSignUp(ctx, input)
+    return err
+}
+
+func (c *Client) findUsernameByEmail(ctx context.Context, email string) (string, error) {
+    result, err := c.cip.ListUsers(ctx, &cip.ListUsersInput{
+        UserPoolId: aws.String(c.poolID),
+        Filter:     aws.String(fmt.Sprintf("email = \"%s\"", email)),
+        Limit:      aws.Int32(1),
+    })
+    if err != nil {
+        return "", err
+    }
+    if len(result.Users) == 0 {
+        return "", fmt.Errorf("user not found for email: %s", email)
+    }
+    return aws.ToString(result.Users[0].Username), nil
+}
+```
+
+`ListUsers` の `email` フィルターは未確認のユーザーも返すので、ConfirmSignUp 前でも問題なく動きます。
+
+### alias_attributes vs username_attributes
+
+| | `alias_attributes = ["email"]` | `username_attributes = ["email"]` |
+|---|---|---|
+| Username | 任意の文字列（UUID 等） | email そのもの |
+| email の扱い | エイリアス（確認後に有効） | プライマリ識別子 |
+| SignUp の Username | メール形式不可 | メール形式必須 |
+| 確認前の email 検索 | `ListUsers` で可能 | Username = email なので不要 |
+
+`alias_attributes` は「ユーザー名 + メールアドレスの両方でログインさせたい」場合に使いますが、API 呼び出し時の Username の扱いが異なるので注意が必要です。
+
+## まとめ
+
+Cognito のメールカスタマイズは「SES ドメイン認証 + DEVELOPER モード + CustomMessage Lambda」の 3 点セットで実現できます。
+
+ただし `alias_attributes = ["email"]` の User Pool では、SignUp に UUID の生成、ConfirmSignUp に ListUsers による Username 解決が必要になるという落とし穴があります。`username_attributes = ["email"]` ならこの問題は起きないので、要件に応じて使い分けてください。
