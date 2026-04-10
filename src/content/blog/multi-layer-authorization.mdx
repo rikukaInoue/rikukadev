@@ -1,0 +1,233 @@
+---
+title: "認可は多層で設計する — XACML・ABAC・ReBAC と実装パターンの整理"
+date: 2026-04-10
+tags: ["認可", "XACML", "ABAC", "Cedar", "設計", "セキュリティ"]
+description: "認可を複数の粒度で設計するためのフレームワーク（XACML、NIST ABAC、Zanzibar/ReBAC）を整理し、JWT groups + AVP/Cedar の実装パターンとの対応関係をまとめる。"
+---
+
+## はじめに
+
+「このユーザーはこのエンドポイントにアクセスできるか」と「このユーザーはこのリソースを操作できるか」は、同じ「認可」でも粒度が違います。
+
+実際のシステムでは、1 つの認可メカニズムですべてをカバーするのは難しく、複数の粒度を組み合わせるのが一般的です。この記事では、認可の多層設計に関するフレームワークと実装パターンを整理します。
+
+## 認可の粒度
+
+認可には大きく 4 つの粒度があります。
+
+| 粒度 | 判定内容 | 例 |
+|------|---------|-----|
+| **API レベル** | このアプリに何を許可するか | OAuth 2.0 Scopes |
+| **ロールレベル** | このユーザーは何者か | JWT groups / RBAC |
+| **属性レベル** | 条件を満たすか | ABAC（時刻、部署、リソース属性） |
+| **関係性レベル** | 誰と何の関係があるか | ReBAC（owner、editor、viewer） |
+
+下に行くほど細かい判定ができますが、実装の複雑さも上がります。実際のシステムでは**上の層で大部分をフィルタし、必要な場所だけ下の層で細かく判定する**のが定石です。
+
+## フレームワーク別の解説
+
+### XACML（OASIS 標準）
+
+**eXtensible Access Control Markup Language**。認可の多層設計を最も体系的にアーキテクチャ化した標準です。
+
+XACML は認可を 4 つのコンポーネントに分解します。
+
+| コンポーネント | 役割 | 実装例 |
+|-------------|------|--------|
+| **PEP** (Policy Enforcement Point) | 認可判定を「実行」する場所 | API ミドルウェア、Gateway |
+| **PDP** (Policy Decision Point) | 認可判定を「下す」エンジン | Cedar/AVP、OPA |
+| **PAP** (Policy Administration Point) | ポリシーを「管理」する場所 | 管理画面、ポリシー CRUD API |
+| **PIP** (Policy Information Point) | 判定に必要な「属性を提供」する場所 | ユーザーDB、Cognito |
+
+重要なのは、**PEP は複数のレイヤーに配置できる**という設計思想です。
+
+```
+        ┌─────┐
+        │ PAP │  ポリシー管理
+        └──┬──┘
+           ▼
+        ┌─────┐
+        │ PDP │  判定エンジン
+        └──┬──┘
+           │
+    ┌──────┼──────┐
+    ▼      ▼      ▼
+  ┌─────┐┌─────┐┌─────┐
+  │ PEP ││ PEP ││ PEP │  実行ポイント
+  └─────┘└─────┘└─────┘
+  API GW  App層  DB層
+```
+
+API Gateway 層で粗い PEP（ロールチェック）を置き、アプリ層で細かい PEP（リソースレベルの判定）を置く、という構成が自然に表現できます。
+
+### NIST ABAC（SP 800-162）
+
+**Attribute-Based Access Control** のガイドライン。「ロールだけでなく、あらゆる属性で認可判定する」モデルです。
+
+判定に使える属性は 4 種類に分類されます。
+
+| 属性の種類 | 例 |
+|----------|-----|
+| **Subject 属性** | ロール、所属部署、資格、クリアランスレベル |
+| **Resource 属性** | 機密度、所有者、作成日、ステータス |
+| **Action 属性** | read / write / delete / approve |
+| **Environment 属性** | 時刻、IP アドレス、デバイス種別 |
+
+RBAC（ロールベース）が Subject 属性の 1 つだけで判定するのに対し、ABAC は 4 種類の属性を組み合わせて判定します。
+
+```
+例: 以下のすべてを満たす場合に許可
+  - Subject: lawyer ロール
+  - Resource: 担当案件
+  - Action: view
+  - Environment: 営業時間内
+```
+
+AWS の Cedar（Amazon Verified Permissions で使われるポリシー言語）は ABAC エンジンの一種です。
+
+```cedar
+permit(
+  principal in Common::Role::"lawyer",
+  action == Site::Action::"view",
+  resource
+) when {
+  resource.assignedTo == principal &&
+  context.time.hour >= 9 &&
+  context.time.hour <= 18
+};
+```
+
+### Google Zanzibar / ReBAC
+
+Google が内部で使っている **Relationship-Based Access Control** システム。Google Drive、YouTube、Google Maps 等で使われています。2019 年に論文が公開されました。
+
+ReBAC は**オブジェクト間の関係性**を大量に保持し、それを辿って認可判定します。
+
+```
+# 関係性の定義
+document:readme#owner@user:alice
+folder:docs#viewer@team:engineering
+folder:docs#parent@document:readme
+
+# クエリ
+check: user:alice は document:readme を view できるか？
+→ alice は readme の owner → owner は view を含む → 許可
+```
+
+特徴は**関係性の伝播**です。「フォルダの viewer は、その中のドキュメントも viewer」のような**階層的なアクセス制御**が自然に表現できます。
+
+OSS 実装:
+- **SpiceDB** — Zanzibar の OSS 実装
+- **OpenFGA** — Auth0/Okta が開発する OSS。Cedar とは別のアプローチ
+
+### OAuth 2.0 Scopes
+
+認可の中で最も粗い粒度。**「このアプリに何を許可するか」**を制御します。
+
+```
+scope=openid email profile
+```
+
+Scopes は「ユーザーの認可」ではなく「アプリの認可」です。ユーザーが admin ロールでも、アプリに `write` scope がなければ書き込みはできない。
+
+これは他の認可レイヤーとは直交する概念で、組み合わせて使います。
+
+## 多層認可の実装パターン
+
+### パターン: JWT groups + ABAC エンジン
+
+最も実用的な多層パターンの一つ。粗い認可は JWT だけで完結し、細かい認可だけ外部エンジンに問い合わせます。
+
+```
+リクエスト
+  │
+  ▼
+[ミドルウェア] JWT の groups を確認
+  │  lawyer じゃなければ → 403
+  │
+  ▼
+[ハンドラー] ビジネスロジック
+  │  リソースレベルの判定が必要
+  │
+  ▼
+[認可サービス] ABAC エンジン (Cedar/AVP) に問い合わせ
+  │  「このユーザーはこの案件の担当者か？」
+  │
+  ▼
+レスポンス
+```
+
+| レイヤー | 粒度 | レイテンシ | XACML での名前 |
+|---------|------|----------|-------------|
+| JWT groups | ロールレベル | 0ms（トークンに含まれてる） | PEP（粗い） |
+| ABAC エンジン | 属性/関係性レベル | 数 ms（API 呼び出し） | PEP（細かい）+ PDP |
+
+大部分のリクエストは JWT groups で通過/拒否できるので、ABAC エンジンへの問い合わせは本当に必要な場面だけに限定できます。
+
+### XACML の用語で整理
+
+| レイヤー | やってること | XACML |
+|---------|------------|-------|
+| JWT groups（ミドルウェア） | RBAC | PEP（粗い） |
+| 認可サービス（AVP 等） | ABAC | PEP（細かい）+ PDP |
+| ポリシー管理 API | ポリシー CRUD | PAP |
+| ユーザーストア（Cognito 等） | ユーザー属性提供 | PIP |
+
+### Linux との類似性
+
+実はこの多層構造は Linux のアクセス制御にも見られます。
+
+| Linux | 認可システム |
+|-------|-----------|
+| **group** (`www-data`, `docker`) | JWT groups（ロールレベル） |
+| **file permission** (`770`) | エンドポイントレベルの認可 |
+| **ACL** (`setfacl -m u:alice:rx`) | リソースレベルの ABAC/ReBAC |
+| **SELinux / AppArmor** | ポリシーエンジン（PDP） |
+
+Linux でも「group でざっくり制御 + ACL で細かく制御 + SELinux でポリシーベースの強制」という多層構造になっています。
+
+## どのフレームワークを選ぶか
+
+| 要件 | 適したフレームワーク |
+|------|-------------------|
+| API ごとのアクセス制御だけ | OAuth 2.0 Scopes + RBAC |
+| ロールベースで十分 | RBAC（JWT groups） |
+| リソースの属性で判定したい | ABAC（Cedar / OPA） |
+| 階層的な共有・権限継承がある | ReBAC（SpiceDB / OpenFGA） |
+| 上記の組み合わせ | XACML アーキテクチャで整理 |
+
+重要なのは、**いきなり細かい粒度から始めないこと**です。
+
+```
+推奨の導入順序:
+
+1. RBAC（JWT groups）← ほとんどのケースはこれで足りる
+2. 必要な箇所だけ ABAC を追加
+3. 階層的な共有が必要になったら ReBAC を検討
+```
+
+## 注意点
+
+### 認可の判定は必ずサーバーサイドで
+
+クライアント側で「groups に admin があるからボタンを表示する」のは UI の最適化としては OK ですが、**認可の判定そのものはサーバーサイドで行う必要があります**。JWT はクライアントが読めるので、UI の出し分けにしか使えません。
+
+### キャッシュ戦略
+
+ABAC エンジンへの問い合わせは毎回行うとレイテンシが積みます。一般的な戦略:
+
+- **ポリシーの結果をキャッシュ**（TTL 付き）
+- **バッチ判定**（1 リクエストで複数リソースの判定をまとめる）
+- **粗い層で早期リターン**（JWT groups で弾ければ ABAC に行かない）
+
+### ポリシーの可視化
+
+多層になると「結局このユーザーは何ができるのか」が見えにくくなります。管理画面やデバッグツールで「このユーザーの有効な権限一覧」を出せるようにしておくと、運用が楽です。
+
+## まとめ
+
+- 認可は粗い→細かいの多層で設計するのが定石
+- XACML は多層認可を体系化した標準で、PEP / PDP / PAP / PIP の分離が核心
+- RBAC（JWT groups）で大部分をカバーし、ABAC / ReBAC は必要な箇所にだけ導入する
+- Linux の group + ACL + SELinux と同じ発想
+- いきなり細かい粒度から始めない——RBAC で足りるうちは RBAC で十分
