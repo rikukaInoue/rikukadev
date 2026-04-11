@@ -1,0 +1,335 @@
+---
+title: "PR ごとのプレビュー環境を Lambda@Edge + Google OIDC で保護する"
+date: 2026-04-11
+tags: ["AWS", "Lambda@Edge", "CloudFront", "Google OIDC", "CI/CD", "GitHub Actions"]
+description: "GitHub PR が作られたら自動でプレビュー環境を作成し、共有 CloudFront + Lambda@Edge + Google OIDC でアクセス制限をかける設計。CloudFront を PR ごとに作らずに実現する方法を整理。"
+---
+
+## はじめに
+
+PR ごとにプレビュー環境があるとレビューが格段に楽になります。ただし、プレビュー環境を外部に公開するわけにはいかないので、アクセス制限が必要です。
+
+この記事では、Lambda Web Adapter で動く React Router v7 (SSR) アプリを対象に、以下を実現する設計を整理します。
+
+- PR 作成時に自動で環境が立ち上がる
+- PR クローズ時に自動で削除される
+- **指定した Google アカウントでしかアクセスできない**
+- デプロイは 2 分で完了する
+
+## 要件と制約
+
+### やりたいこと
+
+- PR ごとに `feature-login.demo.rikuka.dev` のような URL でアクセス
+- Google OIDC で認証、許可されたメールアドレスのみアクセス可能
+- 本番と同じく Lambda@Edge で認証を強制（アプリ層ではなくインフラ層で）
+
+### 制約
+
+- CloudFront の作成/削除に 15 分かかる → PR ごとに作りたくない
+- Lambda@Edge は CloudFront にしか紐付けられない
+- Cognito は使わない（Google OIDC に直接つなぐ）
+
+## アーキテクチャ
+
+### 核心: CloudFront を共有する
+
+CloudFront を PR ごとに作るのではなく、**1 つの CloudFront + Lambda@Edge を全 PR で共有**し、サブドメインでルーティングします。
+
+```
+*.demo.rikuka.dev → 共有 CloudFront（1つだけ）
+  │
+  ├─ Lambda@Edge (viewer-request)
+  │    Google OIDC で認証 + メアド制限
+  │
+  └─ Lambda@Edge (origin-request)
+       サブドメインから API GW を特定してルーティング
+       ├─ demo.rikuka.dev         → 本番 API GW
+       ├─ feature-login.demo...   → PR-123 の API GW
+       └─ fix-signup.demo...      → PR-456 の API GW
+```
+
+### PR ごとに作るもの
+
+| リソース | 作成時間 |
+|---------|---------|
+| Lambda（Docker） | ~1分 |
+| API Gateway v2 | ~30秒 |
+| DynamoDB にルーティング登録 | 即座 |
+
+**CloudFront も Lambda@Edge も作らない**ので、デプロイは 2 分で終わります。
+
+### 共有インフラ（一度だけ作る）
+
+| リソース | 用途 |
+|---------|------|
+| CloudFront | ワイルドカード `*.demo.rikuka.dev` |
+| ACM 証明書 | `*.demo.rikuka.dev`（us-east-1） |
+| Route 53 | `*.demo.rikuka.dev` → CloudFront（ワイルドカード） |
+| Lambda@Edge (viewer-request) | Google OIDC 認証ゲート |
+| Lambda@Edge (origin-request) | サブドメインルーティング |
+| DynamoDB | ルーティングテーブル |
+
+## Google OIDC 認証（Cognito を使わない）
+
+プレビュー環境の認証は Cognito を介さず、**Google の OIDC エンドポイントに直接つなぎます**。
+
+### なぜ Cognito を使わないか
+
+| | Cognito 経由 | Google 直接 |
+|---|---|---|
+| 依存 | Cognito + Google | Google のみ |
+| 設定 | Cognito に callback URL 管理が必要 | Google Cloud Console に 1 URL 追加するだけ |
+| プレビュー用の追加リソース | UserPoolClient 等 | なし |
+| Lambda@Edge のコード量 | ほぼ同じ | ほぼ同じ |
+
+プレビュー環境のためだけに Cognito を設定するのは過剰です。
+
+### Google OIDC のエンドポイント
+
+| 用途 | URL |
+|------|-----|
+| Authorization | `https://accounts.google.com/o/oauth2/v2/auth` |
+| Token | `https://oauth2.googleapis.com/token` |
+| JWKS | `https://www.googleapis.com/oauth2/v3/certs` |
+
+### 認証フロー
+
+```
+1. feature-login.demo.rikuka.dev にアクセス
+
+2. Lambda@Edge (viewer-request): cookie なし
+   → Google の authorize エンドポイントへリダイレクト
+     client_id=xxx
+     redirect_uri=https://demo.rikuka.dev/auth/callback
+     scope=openid email profile
+     state=feature-login.demo.rikuka.dev  ← 元のホストを保持
+
+3. Google ログイン画面 → ユーザーが認証
+
+4. → https://demo.rikuka.dev/auth/callback?code=xxx&state=feature-login...
+
+5. Lambda@Edge (viewer-request): /auth/callback パス
+   → Google の token エンドポイントに code を送信
+   → id_token を取得、email を確認
+   → allowedEmails に含まれてなければ 403
+   → cookie セット: Domain=.demo.rikuka.dev（全サブドメインで共有）
+   → state の URL にリダイレクト
+
+6. feature-login.demo.rikuka.dev に cookie 付きでアクセス
+   → Lambda@Edge: cookie あり → オリジンへ通す
+```
+
+### ポイント
+
+- **コールバック URL は 1 つ**（`https://demo.rikuka.dev/auth/callback`）に固定。PR ごとに追加不要
+- **`state` パラメータ**で元のサブドメインを保持し、認証後にリダイレクト
+- **cookie の Domain を `.demo.rikuka.dev`** にすることで、一度ログインすれば全 PR 環境で認証済み
+- **`allowedEmails`** でアクセス可能なメールアドレスを制限
+
+### Google Cloud Console の設定
+
+既存の OAuth クライアントにコールバック URL を 1 つ追加するだけ:
+
+```
+Authorized redirect URIs:
+  https://demo.rikuka.dev/auth/callback  ← 追加
+```
+
+## サブドメインルーティング
+
+### origin-request Lambda@Edge
+
+CloudFront の origin-request イベントで、サブドメインに応じてオリジン（API GW の URL）を動的に切り替えます。
+
+```javascript
+// origin-request Lambda@Edge
+export async function handler(event) {
+  const request = event.Records[0].cf.request;
+  const host = request.headers.host[0].value;
+
+  // サブドメインを抽出: feature-login.demo.rikuka.dev → feature-login
+  const subdomain = host.split('.')[0];
+
+  // DynamoDB からオリジン URL を取得
+  const origin = await getOrigin(subdomain);
+  if (!origin) {
+    return { status: '404', body: 'Preview not found' };
+  }
+
+  // CloudFront のオリジンを動的に書き換え
+  request.origin = {
+    custom: {
+      domainName: origin,  // e.g. a1b2c3d4.execute-api.us-east-1.amazonaws.com
+      port: 443,
+      protocol: 'https',
+      path: '',
+      sslProtocols: ['TLSv1.2'],
+      readTimeout: 30,
+      keepaliveTimeout: 5,
+    },
+  };
+  request.headers.host = [{ key: 'Host', value: origin }];
+
+  return request;
+}
+```
+
+### DynamoDB ルーティングテーブル
+
+```
+Table: preview-routes
+
+subdomain (PK)  │ origin
+────────────────┼──────────────────────────────────────────
+_default        │ pgui67b3gl.execute-api.us-east-1.amazonaws.com
+feature-login   │ a1b2c3d4e5.execute-api.us-east-1.amazonaws.com
+fix-signup      │ f6g7h8i9j0.execute-api.us-east-1.amazonaws.com
+```
+
+## GitHub Actions
+
+### デプロイ（PR 作成/更新時）
+
+```yaml
+# .github/workflows/preview-deploy.yml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanitize branch name
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          SUBDOMAIN=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+          echo "SUBDOMAIN=$SUBDOMAIN" >> $GITHUB_ENV
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: aws-actions/setup-sam@v2
+
+      - run: sam build --template template-preview.yaml
+
+      - name: Deploy preview stack
+        run: |
+          sam deploy \
+            --template template-preview.yaml \
+            --stack-name "preview-${SUBDOMAIN}" \
+            --parameter-overrides "Subdomain=${SUBDOMAIN}" \
+            --resolve-image-repos --resolve-s3 \
+            --no-confirm-changeset \
+            --capabilities CAPABILITY_IAM
+
+      - name: Register route
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "preview-${SUBDOMAIN}" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiDomain`].OutputValue' \
+            --output text)
+          aws dynamodb put-item \
+            --table-name preview-routes \
+            --item "{\"subdomain\":{\"S\":\"${SUBDOMAIN}\"},\"origin\":{\"S\":\"${API_URL}\"}}"
+
+      - name: Comment on PR
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            🚀 Preview deployed!
+            https://${{ env.SUBDOMAIN }}.demo.rikuka.dev
+```
+
+### 削除（PR クローズ時）
+
+```yaml
+# .github/workflows/preview-teardown.yml
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sanitize branch name
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          SUBDOMAIN=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+          echo "SUBDOMAIN=$SUBDOMAIN" >> $GITHUB_ENV
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: aws-actions/setup-sam@v2
+
+      - name: Remove route
+        run: |
+          aws dynamodb delete-item \
+            --table-name preview-routes \
+            --key "{\"subdomain\":{\"S\":\"${SUBDOMAIN}\"}}"
+
+      - name: Delete preview stack
+        run: |
+          sam delete \
+            --stack-name "preview-${SUBDOMAIN}" \
+            --no-prompts
+```
+
+## ブランチ名のサニタイズ
+
+DNS に使えない文字を変換します。
+
+```
+feature/login-fix  →  feature-login-fix
+bugfix/JIRA-123    →  bugfix-jira-123
+Feature/OAuth      →  feature-oauth
+```
+
+```bash
+SUBDOMAIN=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+```
+
+## コスト
+
+| リソース | 固定費 | 従量費 |
+|---------|-------|-------|
+| CloudFront（共有 1 つ） | $0（リクエスト課金） | ~$0（レビュー程度） |
+| Lambda@Edge（共有 2 つ） | $0（リクエスト課金） | ~$0 |
+| DynamoDB（ルーティング） | $0（オンデマンド） | ~$0 |
+| Lambda（PR ごと） | $0（リクエスト課金） | ~$0 |
+| API GW（PR ごと） | $0（リクエスト課金） | ~$0 |
+| ECR（イメージ保存） | $0.10/GB/月 | レイヤー共有で数十円 |
+
+**1 日 10 個作って消しても月額 $1 未満**の見込み。
+
+## API GW の URL ではダメなのか
+
+「CloudFront なしで API GW を直接叩けばいいのでは？」という選択肢もありますが、以下の理由で CloudFront 共有方式を選んでいます。
+
+| | API GW 直接 | 共有 CloudFront |
+|---|---|---|
+| URL | `https://a1b2c3d4.execute-api...`（ランダム） | `feature-login.demo.rikuka.dev` |
+| 認証 | アプリ層で実装が必要 | Lambda@Edge で本番同等 |
+| 本番との一致度 | 低い（CloudFront を通らない） | 高い（同じインフラを通る） |
+| 設定 | 何もいらない | 共有インフラの初期構築が必要 |
+
+URL の見やすさ、認証のインフラ層強制、本番との一致度を重視するなら共有 CloudFront 方式が優れています。
+
+## まとめ
+
+- CloudFront と Lambda@Edge を**共有**し、PR ごとには **Lambda + API GW だけ作る**
+- 認証は **Google OIDC に直接つなぐ**（Cognito 不要）
+- **`allowedEmails`** で指定した Google アカウントだけアクセス可能
+- cookie の `Domain=.demo.rikuka.dev` で**一度ログインすれば全 PR 環境で認証済み**
+- ルーティングは **DynamoDB + origin-request Lambda@Edge** で動的に切り替え
+- デプロイ 2 分、コスト月額 $1 未満
