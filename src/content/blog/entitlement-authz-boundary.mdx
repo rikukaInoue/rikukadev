@@ -1,0 +1,376 @@
+---
+title: "エンタイトルメントと認可の境界 — billing がゲート、authz がリソースレベル判定"
+date: 2026-04-12
+tags: ["認可", "課金", "エンタイトルメント", "設計", "SaaS"]
+description: "マルチプロダクト SaaS で「どのプロダクトが使えるか」と「リソースに対して何ができるか」を分離する設計。billing のエンタイトルメントと authz のポリシーの責任境界を整理する。"
+---
+
+## はじめに
+
+「pro プランだから cases プロダクトが使える」と「このユーザーはこの案件の担当者だから閲覧できる」は、どちらも「認可」ですが性質が全く違います。
+
+前者は**プラン（契約）に基づく機能の有効/無効**、後者は**ユーザーとリソースの関係に基づくアクセス制御**です。これを同じ仕組みで管理しようとすると設計が破綻します。
+
+この記事では、billing が管理すべき「エンタイトルメント」と authz が管理すべき「リソースレベル認可」の境界を整理します。
+
+## 問題: 認可ポリシーにプラン情報を混ぜると何が起きるか
+
+### よくある設計
+
+Cedar ポリシーにプラン条件を直接書くパターン。
+
+```cedar
+permit(
+  principal,
+  action == App::Action::"create_case",
+  resource
+) when {
+  context.plan in ["pro", "enterprise"]
+};
+
+permit(
+  principal,
+  action == App::Action::"view_reports",
+  resource
+) when {
+  context.plan == "enterprise"
+};
+```
+
+### 問題点
+
+| 問題 | 具体例 |
+|------|--------|
+| **プラン変更のたびにポリシーをデプロイ** | 新プラン「business」を追加したら、全ポリシーの `in [...]` を書き換え |
+| **プランの定義がコードに散らばる** | 「pro で何が使えるか」を知るには全ポリシーを grep する必要がある |
+| **ビジネス担当者が変更できない** | Cedar を書ける開発者しかプランの機能を変更できない |
+| **テストが困難** | プラン × 機能 × ロール × リソースの組み合わせが爆発 |
+
+根本的な原因は、**「何が使えるか」（エンタイトルメント）と「どうアクセスできるか」（認可）を混ぜている**ことです。
+
+## あるべき姿: 2段階の判定
+
+```
+リクエスト
+  │
+  ▼
+[1段階目: エンタイトルメント] billing
+  「この org のプランで、このプロダクト/機能は使えるか？」
+  → 使えない → 403 (ここで終了)
+  → 使える → 続行
+  │
+  ▼
+[2段階目: リソースレベル認可] authz
+  「このユーザーは、このリソースに対して、この操作ができるか？」
+  → permit / forbid
+```
+
+**billing がプロダクトレベルのゲート、authz がリソースレベルの細かい判定。**
+
+## エンタイトルメント（billing の責任）
+
+### エンタイトルメントとは
+
+「このプランで何が使えるか」の定義です。プランと機能のマッピングテーブル。
+
+```json
+// GET /api/plans/pro/entitlements
+{
+  "plan": "pro",
+  "products": {
+    "cases": {
+      "enabled": true,
+      "limits": { "max_items": -1 }
+    },
+    "docs": {
+      "enabled": true,
+      "limits": { "max_storage_gb": 50 }
+    },
+    "reports": {
+      "enabled": true
+    },
+    "admin": {
+      "enabled": false
+    }
+  },
+  "features": {
+    "api_access": true,
+    "export": true,
+    "sso": false,
+    "audit_log": false
+  }
+}
+```
+
+### プラン別の比較
+
+```
+         free        standard     pro          enterprise
+cases    ✓ (10件)    ✓ (100件)    ✓ (無制限)    ✓ (無制限)
+docs     ✓ (1GB)     ✓ (10GB)     ✓ (50GB)     ✓ (無制限)
+reports  ✗           ✗            ✓            ✓
+admin    ✗           ✗            ✗            ✓
+api      ✗           ✓            ✓            ✓
+export   ✗           ✗            ✓            ✓
+sso      ✗           ✗            ✗            ✓
+audit    ✗           ✗            ✗            ✓
+```
+
+これは **billing のデータ**であり、Cedar ポリシーではありません。
+
+### なぜ billing に置くか
+
+| 理由 | 説明 |
+|------|------|
+| **変更頻度が高い** | 新プラン追加、機能の追加/削除はビジネス判断で頻繁に起きる |
+| **デプロイ不要で変更したい** | DB やコンフィグの更新だけで即反映 |
+| **ビジネス担当者が管理したい** | 管理画面で「standard に reports を追加」ができるべき |
+| **契約と機能が 1:1 で紐づく** | プランを買う = 機能が使えるようになる。これは課金の責任 |
+
+### API 設計
+
+```
+# プラン定義の管理
+GET    /api/plans                          # プラン一覧
+GET    /api/plans/:plan/entitlements       # エンタイトルメント取得
+PUT    /api/plans/:plan/entitlements       # エンタイトルメント更新
+
+# 組織のエンタイトルメント（プラン経由で解決）
+GET    /api/orgs/:id/entitlements          # この org で何が使えるか
+
+# 個別チェック（高速、キャッシュ可能）
+GET    /api/orgs/:id/entitlements/check?product=cases&feature=export
+  → { "allowed": true, "limit": -1 }
+```
+
+## リソースレベル認可（authz の責任）
+
+authz は「エンタイトルメントで使えると判定されたプロダクト内で、このユーザーはこのリソースに対して何ができるか」だけに集中します。
+
+### Cedar ポリシーの例（プラン条件なし）
+
+```cedar
+// 担当者だけが案件を編集できる
+permit(
+  principal,
+  action == Cases::Action::"edit",
+  resource
+) when {
+  resource.assignedTo == principal
+};
+
+// admin グループは全案件を閲覧できる
+permit(
+  principal in Common::Role::"admin",
+  action == Cases::Action::"view",
+  resource
+);
+
+// ドラフト状態の記事は author のみ
+permit(
+  principal,
+  action == Docs::Action::"view",
+  resource
+) when {
+  resource.status == "draft" &&
+  resource.author == principal
+};
+```
+
+**プランの条件が一切入っていない**のがポイント。authz はユーザー × リソース × アクションだけを判定します。
+
+## 2段階判定の実装
+
+### SDK での統合
+
+```go
+func (c *Client) Can(ctx context.Context, req AuthzRequest) (*AuthzResult, error) {
+    user := UserFrom(ctx)
+    org := OrgFrom(ctx)
+
+    // 1段階目: エンタイトルメント（billing）
+    entitled, err := c.billing.CheckEntitlement(ctx, CheckEntitlementRequest{
+        OrgID:   org.ID,
+        Product: req.Product,
+        Feature: req.Feature,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("entitlement check failed: %w", err)
+    }
+    if !entitled.Allowed {
+        return &AuthzResult{
+            Allowed: false,
+            Reason:  "plan_not_entitled",
+            Detail:  fmt.Sprintf("product %s is not available on %s plan", req.Product, entitled.Plan),
+        }, nil
+    }
+
+    // 上限チェック（該当する場合）
+    if entitled.Limit > 0 && req.CurrentCount >= entitled.Limit {
+        return &AuthzResult{
+            Allowed: false,
+            Reason:  "limit_reached",
+            Detail:  fmt.Sprintf("limit %d reached for %s", entitled.Limit, req.Product),
+        }, nil
+    }
+
+    // 2段階目: リソースレベル認可（authz）
+    if req.Resource.ID != "" {
+        authzResult, err := c.authz.IsAuthorized(ctx, IsAuthorizedRequest{
+            Principal: Principal{ID: user.Sub, Groups: user.Groups},
+            Action:    req.Action,
+            Resource:  req.Resource,
+        })
+        if err != nil {
+            return nil, fmt.Errorf("authorization check failed: %w", err)
+        }
+        return authzResult, nil
+    }
+
+    // リソース指定なし = エンタイトルメントだけで判定
+    return &AuthzResult{Allowed: true}, nil
+}
+```
+
+### プロダクト側のコード
+
+```go
+// エンタイトルメント + リソースレベル認可（2段階）
+result, _ := client.Can(ctx, rellf.AuthzRequest{
+    Product:  "cases",
+    Action:   "edit",
+    Resource: rellf.Resource{Type: "Case", ID: "case-123"},
+})
+
+// エンタイトルメントだけ（リソース指定なし）
+result, _ := client.Can(ctx, rellf.AuthzRequest{
+    Product: "reports",
+    Feature: "export",
+})
+```
+
+プロダクト側は `Can()` 1 行。内部の 2 段階判定を意識する必要はありません。
+
+## プラン変更時の影響
+
+### before: Cedar にプラン条件がある場合
+
+```
+プラン「business」を追加
+  → Cedar ポリシーを全部確認
+  → "pro" が入ってる箇所に "business" を追加
+  → ポリシーをデプロイ
+  → テスト
+  → 本番反映
+```
+
+所要時間: 数時間〜数日（開発者の作業が必要）
+
+### after: エンタイトルメントが billing にある場合
+
+```
+プラン「business」を追加
+  → billing の管理画面で新プラン定義
+  → 使えるプロダクト/機能をチェックボックスで選択
+  → 保存
+  → 即反映
+```
+
+所要時間: 数分（ビジネス担当者でも可能）
+
+Cedar ポリシーは一切変更不要。authz は「このユーザーはこのリソースにアクセスできるか」だけを判定し続けます。
+
+## 責任の境界
+
+| 判定内容 | 担当 | 例 |
+|---------|------|-----|
+| このプロダクトが使えるか | **billing** | cases は pro 以上 |
+| この機能が使えるか | **billing** | export は pro 以上 |
+| 上限に達していないか | **billing** | 案件数 10 件まで（free） |
+| このリソースにアクセスできるか | **authz** | この案件の担当者か |
+| この操作ができるか | **authz** | admin は全案件を閲覧可 |
+
+### 判断基準
+
+- **プランを変えたら変わるもの** → billing（エンタイトルメント）
+- **ユーザーやリソースの関係で変わるもの** → authz（ポリシー）
+
+## キャッシュ戦略
+
+エンタイトルメントは変更頻度が低いので積極的にキャッシュできます。
+
+```
+billing のエンタイトルメント:
+  キャッシュ TTL: 5分
+  無効化: PlanChanged イベントで即座に破棄
+
+authz のポリシー判定:
+  キャッシュ: しない or 短い TTL（ポリシー変更が即反映されるべき）
+```
+
+```
+[PlanChanged イベント]
+  billing → EventBridge → 各プロダクトの SDK
+    → エンタイトルメントキャッシュをクリア
+    → 次のリクエストで billing に再取得
+```
+
+## ブラウザ側での UI 制御
+
+エンタイトルメントはフロントエンドでも使います（機能の出し分け）。
+
+```typescript
+// ブラウザ SDK
+const entitlements = await rellf.getEntitlements()
+
+// UI の出し分け
+{entitlements.features.export && (
+  <button onClick={handleExport}>エクスポート</button>
+)}
+
+{!entitlements.products.reports.enabled && (
+  <div className="upgrade-banner">
+    レポート機能は Pro プランから利用できます。
+    <a href="/upgrade">アップグレード</a>
+  </div>
+)}
+```
+
+ただし **UI での制御はあくまで UX の最適化**。実際の認可判定はバックエンドで行います。
+
+## 全体の流れ
+
+```
+[ユーザーがリクエスト]
+  │
+  ├─ auth: JWT 検証 → sub, groups
+  │
+  ├─ billing: エンタイトルメントチェック
+  │    「org-abc の pro プランで cases は使えるか？」
+  │    → 使えない → 403 {"reason": "plan_not_entitled"}
+  │    → 使える → 続行
+  │
+  ├─ billing: 上限チェック（該当する場合）
+  │    「案件数は上限内か？」
+  │    → 超過 → 403 {"reason": "limit_reached"}
+  │    → OK → 続行
+  │
+  ├─ authz: リソースレベル認可
+  │    「このユーザーはこの案件を編集できるか？」
+  │    → forbid → 403 {"reason": "not_permitted"}
+  │    → permit → 続行
+  │
+  ▼
+[ビジネスロジック実行]
+```
+
+3段階のゲートを通過して初めてビジネスロジックが実行されます。SDK がこの 3 段階を `Can()` 1 行に隠蔽します。
+
+## まとめ
+
+- **エンタイトルメント**（プランで何が使えるか）は **billing** の責任
+- **リソースレベル認可**（ユーザーとリソースの関係でアクセス制御）は **authz** の責任
+- Cedar ポリシーにプラン条件を混ぜない — プラン変更のたびにポリシーデプロイが必要になる
+- エンタイトルメントを billing に分離すれば、プラン変更が即座に反映され、ビジネス担当者でも管理可能
+- SDK の `Can()` が 2 段階判定を隠蔽し、プロダクト側は 1 行で済む
+- 判断基準: **「プランを変えたら変わるもの → billing」「ユーザーやリソースの関係で変わるもの → authz」**
