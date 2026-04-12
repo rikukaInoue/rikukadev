@@ -1,0 +1,266 @@
+---
+title: "OAuth 2.0 / OIDC のフロー全比較 — どれを使うか判断フローチャート付き"
+date: 2026-04-12
+tags: ["OAuth", "OIDC", "認証", "PKCE", "設計"]
+description: "Authorization Code、PKCE、Client Credentials、Device Authorization、Implicit、Resource Owner Password の6つのフローを比較。判断フローチャートと PKCE の仕組みをわかりやすく解説。"
+---
+
+## はじめに
+
+OAuth 2.0 / OIDC には複数の認証フローがあり、「どれを使えばいいのか」が最初の壁になります。この記事では、各フローの動き・用途・セキュリティ特性を整理し、判断フローチャートで選び方を示します。
+
+## フロー一覧
+
+| フロー | 一言で | 使う場面 | ステータス |
+|-------|-------|---------|----------|
+| **Authorization Code** | 一番安全、基本これ | サーバーサイドのある Web アプリ | 推奨 |
+| **Authorization Code + PKCE** | ↑の Public クライアント版 | SPA、モバイル、CLI | 推奨 |
+| **Client Credentials** | ユーザー不在、マシン間通信 | バックエンド同士の API 呼び出し | 推奨 |
+| **Device Authorization** | 画面入力できないデバイス | テレビ、CLI、IoT | 推奨 |
+| **Implicit** | トークン直接返却 | 昔の SPA | **非推奨** |
+| **Resource Owner Password** | パスワード直送 | レガシー移行の一時しのぎ | **非推奨** |
+
+## 各フローの動き
+
+### Authorization Code
+
+サーバーサイドのある Web アプリ向け。最も一般的で最も安全。
+
+```
+ブラウザ
+  │ 1. ログインボタン押下
+  ▼
+OIDC Provider (auth.example.com)
+  │ 2. ログイン画面 → 認証
+  │ 3. 認可コード発行
+  ▼
+ブラウザ (redirect_uri に戻る)
+  │ 4. 認可コードをバックエンドに渡す
+  ▼
+バックエンド
+  │ 5. 認可コード + client_secret → トークン交換（サーバー間通信）
+  │ 6. トークン取得
+  ▼
+セッション確立
+```
+
+- 認可コードはブラウザを経由するが、**トークン交換はバックエンドで行う**
+- トークンがブラウザに露出しない
+- `client_secret` でクライアント認証
+
+### Authorization Code + PKCE
+
+SPA やモバイルアプリなど、`client_secret` を安全に保持できないクライアント向け。
+
+```
+ブラウザ / モバイル
+  │ 1. code_verifier（ランダム値）を生成
+  │    code_challenge = SHA256(code_verifier)
+  │ 2. 認可リクエスト（code_challenge 付き）
+  ▼
+OIDC Provider
+  │ 3. code_challenge を保存、認可コード発行
+  ▼
+ブラウザ / モバイル
+  │ 4. トークン交換（code_verifier 付き）
+  ▼
+OIDC Provider
+  │ 5. SHA256(code_verifier) == 保存した code_challenge ？
+  │    → 一致すればトークン発行
+  ▼
+トークン取得
+```
+
+`client_secret` の代わりに PKCE で「認可コードを要求した人 = トークン交換する人」を証明します。
+
+### Client Credentials
+
+ユーザーが介在しない、サービス間通信向け。
+
+```
+バックエンド A
+  │ 1. client_id + client_secret で直接トークン要求
+  ▼
+OIDC Provider
+  │ 2. トークン発行（sub はサービス自体）
+  ▼
+バックエンド A
+  │ 3. トークンを使ってバックエンド B の API を呼ぶ
+  ▼
+バックエンド B
+```
+
+```http
+POST /oidc/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials
+&client_id=batch-service
+&client_secret=xxx
+&scope=api:internal
+```
+
+- ブラウザもリダイレクトも認可コードもない
+- 1 リクエストでトークンが返る
+- 夜間バッチ、Webhook、マイクロサービス間通信
+
+### Device Authorization
+
+キーボード入力が困難なデバイス向け。
+
+```
+デバイス（テレビ等）
+  │ 1. POST /device/code → ユーザーコード取得
+  │
+  │ 画面表示:
+  │ 「https://auth.example.com/device にアクセスして
+  │  コード ABCD-1234 を入力してください」
+  │
+  │                   ユーザー（スマホのブラウザで操作）
+  │                     │ 2. URL にアクセス
+  │                     │ 3. コード入力
+  │                     │ 4. ログイン → 承認
+  │                     ▼
+  │                   OIDC Provider: 承認を記録
+  │
+  │ 5. デバイスがポーリング（数秒間隔）
+  │    POST /token { grant_type=device_code, device_code=xxx }
+  │    → "authorization_pending" → "authorization_pending" → トークン発行！
+  ▼
+トークン取得
+```
+
+- テレビ（Netflix 等）、CLI ツール、スマートスピーカー
+- デバイスとブラウザが別なのが特徴
+
+### Implicit（非推奨）
+
+```
+ブラウザ
+  │ 1. 認可リクエスト（response_type=token）
+  ▼
+OIDC Provider
+  │ 2. トークンが URL フラグメントで直接返る
+  ▼
+https://app.com/callback#access_token=xxx&token_type=Bearer
+```
+
+- トークン交換のステップがない → **トークンが URL に露出**
+- ブラウザ履歴、リファラー、ログに漏れるリスク
+- **PKCE の登場で存在意義がなくなった**
+- OAuth 2.1 で正式に削除予定
+
+### Resource Owner Password（非推奨）
+
+```
+ユーザー → アプリにパスワードを直接入力
+              │
+              ▼
+          アプリが OIDC Provider にパスワードを送信
+          POST /token { grant_type=password, username=..., password=... }
+```
+
+- **アプリがユーザーのパスワードを見れてしまう**
+- フィッシングと区別がつかない
+- レガシーシステムの移行期に「一時的に」使うケース以外は不可
+
+## PKCE の仕組み
+
+PKCE（Proof Key for Code Exchange、ピクシーと読む）は、認可コードの横取り攻撃を防ぐ仕組みです。
+
+### 何を防ぐか
+
+```
+正規アプリ → OIDC Provider → 認可コード発行
+                                │
+                    悪意あるアプリが認可コードを横取り
+                                │
+                                ▼
+                    横取りしたコードでトークン交換 → 成功してしまう！
+```
+
+特にモバイルアプリのカスタムスキーム（`myapp://callback`）は、別アプリが同じスキームを登録して横取りできます。
+
+### PKCE がこれを防ぐ
+
+```
+1. クライアントがランダム値を生成
+   code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+2. そのハッシュを計算
+   code_challenge = BASE64URL(SHA256(code_verifier))
+   → "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+3. 認可リクエストに code_challenge を付ける
+   GET /authorize?...&code_challenge=E9Melh...&code_challenge_method=S256
+
+4. OIDC Provider は code_challenge を保存
+
+5. トークン交換時に code_verifier（元の値）を送る
+   POST /token  code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+
+6. OIDC Provider が検証:
+   SHA256("dBjftJeZ4CVP...") == "E9Melhoa2Owv..." → 一致！→ トークン発行
+```
+
+ハッシュの一方向性により：
+- `code_challenge`（ハッシュ）を傍受しても `code_verifier` は逆算できない
+- 認可コードを横取りしても、`code_verifier` がなければトークン交換できない
+
+### 誰が使うべきか
+
+| クライアント種別 | PKCE | client_secret | 推奨 |
+|---------------|------|--------------|------|
+| SPA | 必須 | 持てない | PKCE のみ |
+| モバイル | 必須 | 持てない | PKCE のみ |
+| CLI | 必須 | 持てない | PKCE のみ |
+| SSR Web アプリ | 推奨 | 使える | **両方**（ベスト） |
+
+OAuth 2.1 では **Confidential Client でも PKCE が必須**になる予定です。今から両対応にしておくのが無難。
+
+## 判断フローチャート
+
+```
+ユーザーはいる？
+  │
+  ├─ No → Client Credentials
+  │
+  └─ Yes
+      │
+      画面でログインできる？
+        │
+        ├─ No → Device Authorization
+        │
+        └─ Yes
+            │
+            バックエンドはある？
+              │
+              ├─ Yes → Authorization Code + PKCE
+              │        （client_secret も使えるなら両方）
+              │
+              └─ No（SPA / モバイル）
+                  │
+                  → Authorization Code + PKCE（必須）
+```
+
+**迷ったら Authorization Code + PKCE** が正解です。
+
+## セキュリティ比較
+
+| フロー | トークン露出リスク | client_secret 要否 | PKCE | 推奨度 |
+|-------|------------------|-------------------|------|-------|
+| Authorization Code | 低（バックチャネル） | 必須 | 推奨 | ◎ |
+| Authorization Code + PKCE | 低 | 不要 | 必須 | ◎ |
+| Client Credentials | 低（サーバー間） | 必須 | 不要 | ◎ |
+| Device Authorization | 低 | 任意 | 不要 | ○ |
+| Implicit | **高（URL に露出）** | 不要 | 不要 | ✗ |
+| Resource Owner Password | **高（パスワード露出）** | 任意 | 不要 | ✗ |
+
+## まとめ
+
+- **Web アプリ** → Authorization Code（+ PKCE 推奨）
+- **SPA / モバイル** → Authorization Code + PKCE（必須）
+- **サービス間通信** → Client Credentials
+- **テレビ / CLI** → Device Authorization
+- **Implicit / Resource Owner Password** → 使わない
+- **PKCE** はハッシュの一方向性で認可コード横取りを防ぐ。OAuth 2.1 で全クライアント必須化予定
