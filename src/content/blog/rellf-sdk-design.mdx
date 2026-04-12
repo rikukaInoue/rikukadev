@@ -1,0 +1,505 @@
+---
+title: "マルチプロダクト基盤のクライアント SDK 設計 — Go バックエンド + ブラウザ/React フロントエンド"
+date: 2026-04-12
+tags: ["SDK", "Go", "TypeScript", "React", "OIDC", "設計"]
+description: "認証・認可・課金の3サービス基盤をプロダクトが簡単に利用できるようにする SDK の設計。Go バックエンド SDK とブラウザ/React SDK の責任分担、API 設計、内部フロー、段階的リリース戦略を整理。"
+---
+
+## はじめに
+
+認証・認可・課金の3サービスを基盤として提供しても、プロダクト側が毎回3つの API を個別に呼ぶのは面倒です。JWT 検証、JWKS キャッシュ、Client Credentials トークン管理、認可判定の context 組み立て——これらを各プロダクトで実装するのは無駄な重複です。
+
+この記事では、プロダクトが **SDK を入れるだけで基盤に接続できる** ようにするための設計を整理します。バックエンド（Go）とフロントエンド（ブラウザ/React）の 2 つの SDK を対象にします。
+
+## 全体像
+
+```
+ブラウザ SDK (@rellf/sdk)
+  │ OIDC (Authorization Code + PKCE)
+  │ → ID Token + Access Token 取得
+  │
+  │ Access Token を Authorization ヘッダーに付けて API 呼び出し
+  ▼
+プロダクト API
+  │
+  │ Go SDK (rellf-sdk-go)
+  │ → JWT 検証 + 認可判定 + プラン取得
+  ▼
+auth / authz / billing
+```
+
+ブラウザ SDK が入口（ユーザー認証）、Go SDK が出口（検証・認可・課金）。プロダクト開発者はこの 2 つを入れるだけで rellf 基盤に接続できます。
+
+## Go SDK（バックエンド）
+
+### 使用イメージ
+
+```go
+// 初期化（アプリ起動時に1回）
+client := rellf.New(rellf.Config{
+    AuthIssuer:    "https://auth.rikuka.dev",
+    AuthzURL:      "https://authz.rikuka.dev",
+    BillingURL:    "https://billing.rikuka.dev",
+    ServiceID:     "cases-api",
+    ServiceSecret: os.Getenv("RELLF_CLIENT_SECRET"),
+})
+
+// ミドルウェア登録（JWT 検証を自動でやる）
+router.Use(client.AuthMiddleware())
+
+// ハンドラー内
+func CreateCase(c *gin.Context) {
+    // ミドルウェアが注入したユーザー情報を取得
+    user := rellf.UserFrom(c)
+    // user.Sub       → "550e8400-..."
+    // user.Email     → "taishi@example.com"
+    // user.Groups    → ["admin", "lawyer"]
+    // user.AuthTime  → 2026-04-12T10:00:00Z
+    // user.AMR       → ["pwd"]
+
+    // 認可判定（内部で billing + authz を呼ぶ）
+    result, err := client.Can(c.Request.Context(), rellf.AuthzRequest{
+        Action:   "create_case",
+        Resource: rellf.Resource{Type: "Case"},
+    })
+    if err != nil {
+        c.JSON(500, gin.H{"error": "authorization check failed"})
+        return
+    }
+    if !result.Allowed {
+        c.JSON(403, gin.H{"error": "forbidden", "reason": result.Reason})
+        return
+    }
+
+    // ビジネスロジック...
+}
+```
+
+### SDK の責任範囲
+
+| レイヤー | SDK がやること |
+|---------|-------------|
+| **JWT 検証** | JWKS 取得・キャッシュ、署名検証、iss/aud/exp 検証、クレーム抽出 |
+| **認可判定** | billing からプラン取得 → authz に context 組み立て → 判定 |
+| **Client Credentials** | サービス間通信用トークンの取得・キャッシュ・自動更新 |
+| **ミドルウェア** | Gin / net/http 用の認証ミドルウェア |
+| **ユーザー情報** | context からのユーザー情報取得ヘルパー |
+
+### SDK がやらないこと
+
+| 機能 | 理由 |
+|------|------|
+| ユーザー管理（登録・削除等） | auth の Admin API を直接叩くべき（頻度低い） |
+| ポリシー管理 | authz の API を直接叩くべき（管理画面から操作） |
+| プラン変更・請求 | billing の API を直接叩くべき |
+
+**「リクエスト処理中に毎回やること」だけ SDK に入れる。** 管理系の操作は頻度が低いので直接 API で十分。
+
+### `Can()` の内部フロー
+
+```
+client.Can(ctx, req)
+  │
+  ├─ 1. ctx から JWT クレームを取得（ミドルウェアが注入済み）
+  │     sub, groups, auth_time, amr
+  │
+  ├─ 2. billing からプラン取得（キャッシュあり、TTL 5分）
+  │     Client Credentials トークンで認証
+  │     GET /api/orgs/{orgId}/plan → { plan: "pro" }
+  │
+  └─ 3. authz に判定要求
+        POST /api/{product}/is-authorized
+        {
+          principal: { id: sub, groups: ["lawyer"] },
+          action: "create_case",
+          resource: { type: "Case" },
+          context: { plan: "pro", auth_time: 1712796400, amr: ["pwd"] }
+        }
+        → { allowed: true } or { allowed: false, reason: "..." }
+```
+
+プロダクト側は `Can()` 1 行で 3 サービスの連携が完了します。
+
+### パッケージ構成
+
+```
+github.com/rikukaInoue/rellf-sdk-go/
+  ├── rellf.go          // Client 構造体、New()
+  ├── auth.go           // JWT 検証、JWKS キャッシュ
+  ├── authz.go          // IsAuthorized 呼び出し、Can()
+  ├── billing.go        // プラン取得、キャッシュ
+  ├── credentials.go    // Client Credentials トークン管理
+  ├── middleware.go      // AuthMiddleware()（Gin / net/http）
+  ├── context.go        // UserFrom(c)、context への注入
+  └── types.go          // User, AuthzRequest, AuthzResult 等
+```
+
+### JWT 検証の詳細
+
+```go
+// auth.go（内部実装のイメージ）
+
+type JWKSCache struct {
+    jwks      jwk.Set
+    fetchedAt time.Time
+    ttl       time.Duration
+    mu        sync.RWMutex
+}
+
+func (c *Client) verifyJWT(tokenString string) (*User, error) {
+    // 1. JWKS をキャッシュから取得（期限切れなら再取得）
+    jwks, err := c.jwksCache.Get(c.authJWKSURL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to fetch JWKS: %w", err)
+    }
+
+    // 2. JWT の署名を検証
+    token, err := jwt.Parse([]byte(tokenString),
+        jwt.WithKeySet(jwks),
+        jwt.WithIssuer(c.authIssuer),
+        jwt.WithValidate(true),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("invalid token: %w", err)
+    }
+
+    // 3. クレームを抽出
+    return &User{
+        Sub:      token.Subject(),
+        Email:    getStringClaim(token, "email"),
+        Groups:   getStringSliceClaim(token, "groups"),
+        AuthTime: getTimeClaim(token, "auth_time"),
+        AMR:      getStringSliceClaim(token, "amr"),
+    }, nil
+}
+```
+
+### Client Credentials の自動管理
+
+```go
+// credentials.go（内部実装のイメージ）
+
+func (c *Client) getServiceToken(ctx context.Context) (string, error) {
+    c.tokenMu.Lock()
+    defer c.tokenMu.Unlock()
+
+    // キャッシュが有効なら返す（有効期限の1分前まで）
+    if c.cachedToken != "" && time.Now().Before(c.tokenExpiry.Add(-1*time.Minute)) {
+        return c.cachedToken, nil
+    }
+
+    // 新しいトークンを取得
+    resp, err := http.PostForm(c.authIssuer+"/oidc/token", url.Values{
+        "grant_type":    {"client_credentials"},
+        "client_id":     {c.serviceID},
+        "client_secret": {c.serviceSecret},
+        "scope":         {strings.Join(c.scopes, " ")},
+    })
+    if err != nil {
+        return "", err
+    }
+    // ...
+    c.cachedToken = tokens.AccessToken
+    c.tokenExpiry = time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second)
+    return c.cachedToken, nil
+}
+```
+
+## ブラウザ SDK（フロントエンド）
+
+### 使用イメージ（Vanilla）
+
+```typescript
+import { createRellfClient } from "@rellf/sdk"
+
+const rellf = createRellfClient({
+  issuer: "https://auth.rikuka.dev",
+  clientId: "cases-frontend",
+  redirectUri: "https://cases.example.com/callback",
+})
+
+// ログイン（Authorization Code + PKCE を自動で処理）
+rellf.login()
+
+// コールバック処理
+await rellf.handleCallback()
+
+// ユーザー情報取得
+const user = rellf.getUser()
+// user.sub, user.email, user.groups
+
+// 認証状態チェック
+if (!rellf.isAuthenticated()) {
+  rellf.login()
+}
+
+// API 呼び出し（Access Token を自動付与）
+const resp = await rellf.fetch("/api/cases")
+
+// ログアウト
+rellf.logout()
+```
+
+### React 向け
+
+```tsx
+import { RellfProvider, useAuth, RequireAuth, AuthCallback } from "@rellf/sdk/react"
+
+// App.tsx
+function App() {
+  return (
+    <RellfProvider config={{
+      issuer: "https://auth.rikuka.dev",
+      clientId: "cases-frontend",
+      redirectUri: "https://cases.example.com/callback",
+    }}>
+      <Routes>
+        <Route path="/callback" element={<AuthCallback />} />
+        <Route path="/" element={
+          <RequireAuth>
+            <Dashboard />
+          </RequireAuth>
+        } />
+      </Routes>
+    </RellfProvider>
+  )
+}
+
+// Dashboard.tsx
+function Dashboard() {
+  const { user, logout, fetch } = useAuth()
+  const [cases, setCases] = useState([])
+
+  useEffect(() => {
+    // fetch は Access Token を自動で Authorization ヘッダーに付ける
+    fetch("/api/cases").then(r => r.json()).then(setCases)
+  }, [])
+
+  return (
+    <div>
+      <p>Signed in as: {user.email}</p>
+      <p>Groups: {user.groups.join(", ")}</p>
+      <button onClick={logout}>ログアウト</button>
+      {/* ... */}
+    </div>
+  )
+}
+```
+
+### SDK の責任範囲
+
+| レイヤー | SDK がやること |
+|---------|-------------|
+| **OIDC フロー** | Authorization Code + PKCE の全処理 |
+| **トークン管理** | ID Token / Access Token の保存・有効期限管理 |
+| **PKCE** | code_verifier / code_challenge の生成 |
+| **ユーザー情報** | ID Token のデコード、`getUser()` |
+| **API 呼び出し** | Access Token を自動付与する `fetch()` ラッパー |
+| **ログアウト** | RP-Initiated Logout |
+| **React 統合** | Provider、hooks、ガードコンポーネント |
+
+### SDK がやらないこと
+
+| 機能 | 理由 |
+|------|------|
+| JWT の署名検証 | フロントエンドでは不要（バックエンドの Go SDK が検証） |
+| 認可判定 | バックエンドで行う |
+| billing 連携 | バックエンドで行う |
+
+**ブラウザ SDK は「OIDC フロー + トークン管理」に特化**。セキュリティ上の判定は全てバックエンドに委譲。
+
+### パッケージ構成
+
+```
+@rellf/sdk
+  ├── client.ts         // createRellfClient()
+  ├── auth.ts           // login(), logout(), handleCallback()
+  ├── pkce.ts           // code_verifier / code_challenge 生成
+  ├── token.ts          // トークン保存・デコード・有効期限管理
+  ├── user.ts           // getUser(), isAuthenticated()
+  ├── fetch.ts          // Access Token 自動付与 fetch ラッパー
+  └── react/
+      ├── provider.tsx  // <RellfProvider>
+      ├── hooks.ts      // useAuth(), useUser()
+      ├── callback.tsx  // <AuthCallback>
+      └── guard.tsx     // <RequireAuth>
+```
+
+### PKCE フローの内部処理
+
+```typescript
+// auth.ts（内部実装のイメージ）
+
+async function login() {
+  // 1. PKCE 用のランダム値を生成
+  const codeVerifier = generateCodeVerifier()  // 43-128文字のランダム文字列
+  const codeChallenge = await sha256Base64Url(codeVerifier)
+
+  // 2. state（CSRF 防止）と nonce（リプレイ防止）を生成
+  const state = generateRandom()
+  const nonce = generateRandom()
+
+  // 3. セッションストレージに保存（コールバックで使う）
+  sessionStorage.setItem("rellf_code_verifier", codeVerifier)
+  sessionStorage.setItem("rellf_state", state)
+  sessionStorage.setItem("rellf_nonce", nonce)
+
+  // 4. OIDC Provider にリダイレクト
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    scope: "openid email profile",
+    state,
+    nonce,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+  })
+
+  window.location.href = `${config.issuer}/oidc/authorize?${params}`
+}
+
+async function handleCallback() {
+  const params = new URLSearchParams(window.location.search)
+  const code = params.get("code")
+  const state = params.get("state")
+
+  // state の検証（CSRF 防止）
+  if (state !== sessionStorage.getItem("rellf_state")) {
+    throw new Error("State mismatch")
+  }
+
+  // トークン交換
+  const resp = await fetch(`${config.issuer}/oidc/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: config.redirectUri,
+      client_id: config.clientId,
+      code_verifier: sessionStorage.getItem("rellf_code_verifier"),
+    }),
+  })
+
+  const tokens = await resp.json()
+
+  // トークンを保存
+  saveTokens(tokens)
+
+  // クリーンアップ
+  sessionStorage.removeItem("rellf_code_verifier")
+  sessionStorage.removeItem("rellf_state")
+  sessionStorage.removeItem("rellf_nonce")
+}
+```
+
+### トークンの保存場所
+
+| 保存先 | セキュリティ | 使いやすさ | 推奨 |
+|-------|-----------|----------|------|
+| **メモリ（変数）** | 最も安全（XSS で取れない） | タブを閉じたら消える | セキュリティ重視 |
+| **sessionStorage** | XSS で取られうる | タブ単位で保持 | バランス型 |
+| **localStorage** | XSS で取られうる | 永続 | 非推奨 |
+| **HttpOnly Cookie** | XSS で取れない | CSRF 対策が必要 | SSR アプリ向け |
+
+SDK のデフォルトは**メモリ保存**にして、設定で変更可能にするのが安全です。
+
+## Go SDK vs ブラウザ SDK の責任分担
+
+| 機能 | Go SDK | ブラウザ SDK |
+|------|--------|------------|
+| OIDC フロー（PKCE） | — | ✓ |
+| JWT 署名検証 | ✓（JWKS） | —（デコードのみ） |
+| JWT クレーム抽出 | ✓ | ✓（表示用） |
+| 認可判定 | ✓（`Can()`） | —（バックエンドに委譲） |
+| billing 連携 | ✓ | — |
+| Client Credentials | ✓ | — |
+| トークン管理 | サービストークンのキャッシュ | ユーザートークンの保存・更新 |
+| ミドルウェア | ✓（Gin / net/http） | —（React Provider） |
+| ログアウト | — | ✓（RP-Initiated Logout） |
+
+**セキュリティ上の判定は全て Go SDK（バックエンド）で行う。** ブラウザ SDK はトークンの取得と保持、UI の出し分けに特化。
+
+## SDK を配ることのメリット
+
+| | SDK あり | SDK なし |
+|---|---|---|
+| JWT 検証 | `client.AuthMiddleware()` | 各プロダクトで実装 |
+| JWKS キャッシュ | SDK が自動管理 | 各自で実装 |
+| Client Credentials | SDK が自動管理 | 各自で実装 |
+| PKCE フロー | `rellf.login()` | 各自で実装 |
+| 認可判定 | `client.Can()` | billing + authz を個別に呼ぶ |
+| 基盤の仕様変更 | SDK をバージョンアップ | 全プロダクトで修正 |
+
+**最後が最大のメリット。** authz の API 仕様が変わっても、SDK を更新するだけで全プロダクトが対応できます。
+
+## バージョニングと互換性
+
+### セマンティックバージョニング
+
+```
+v1.2.3
+│ │ │
+│ │ └─ patch: バグ修正（互換性あり）
+│ └── minor: 機能追加（互換性あり）
+└─── major: breaking change（移行ガイド必須）
+```
+
+### 互換性のルール
+
+- **patch**: バグ修正。プロダクト側の変更不要
+- **minor**: 新しいメソッドや設定の追加。既存コードはそのまま動く
+- **major**: API の変更。deprecation 期間を 1 バージョン設けてから削除
+
+### SDK と基盤 API のバージョン対応
+
+```
+rellf-sdk-go v1.x → authz API v1 に対応
+rellf-sdk-go v2.x → authz API v2 に対応（v1 も一定期間サポート）
+```
+
+基盤 API 側も新しいバージョンと古いバージョンを並行で提供し、SDK の移行期間を確保します。
+
+## 段階的リリース
+
+### Go SDK
+
+| バージョン | 内容 |
+|----------|------|
+| **v0.1** | JWT 検証 + ミドルウェア + `UserFrom()` |
+| **v0.2** | + Client Credentials トークン管理 |
+| **v0.3** | + `Can()`（billing + authz の統合） |
+| **v1.0** | 安定版リリース |
+
+### ブラウザ SDK
+
+| バージョン | 内容 |
+|----------|------|
+| **v0.1** | `login()` / `handleCallback()` / `getUser()` / `logout()` |
+| **v0.2** | + `fetch()` ラッパー（Access Token 自動付与） |
+| **v0.3** | + React 統合（Provider / hooks / guard） |
+| **v1.0** | 安定版リリース |
+
+**Go SDK の v0.1 だけでもプロダクト側は相当楽になる**ので、まずそこから始めるのが現実的です。
+
+## 他の言語への展開
+
+Go と TypeScript 以外のプロダクトが出てきた場合：
+
+| 言語 | 優先度 | 理由 |
+|------|--------|------|
+| Python | 中 | データ分析ツール、管理スクリプト |
+| Rust | 低 | パフォーマンス重視のサービス |
+| Swift / Kotlin | 低 | ネイティブモバイルアプリ |
+
+SDK が薄い（API を呼ぶだけ）なので、新しい言語への移植コストは小さいです。Go SDK の設計をそのまま踏襲できます。
+
+## まとめ
+
+- **Go SDK**（バックエンド）: JWT 検証 + 認可判定 + Client Credentials を1パッケージで提供
+- **ブラウザ SDK**（フロントエンド）: OIDC フロー（PKCE）+ トークン管理 + React 統合
+- **責任分担**: セキュリティ判定はバックエンド、トークン取得と UI はフロントエンド
+- **SDK に入れるのは「毎リクエスト使うもの」だけ**。管理系の操作は直接 API で十分
+- **段階的リリース**: v0.1（JWT 検証だけ）から始めても十分価値がある
+- **基盤の仕様変更時は SDK 更新だけで全プロダクト対応** — これが SDK を配る最大の理由
