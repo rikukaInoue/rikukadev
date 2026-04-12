@@ -13,17 +13,141 @@ description: "マルチプロダクト向けの共通基盤を認証(rellf-auth)
 
 ## 3 サービスの全体像
 
+```mermaid
+graph TB
+    subgraph "ブラウザ"
+        Browser["ブラウザ / SPA"]
+    end
+
+    subgraph "SDK"
+        BrowserSDK["@rellf/sdk<br/>OIDC + PKCE<br/>トークン管理"]
+        GoSDK["rellf-sdk-go<br/>JWT検証 + Can()"]
+    end
+
+    subgraph "プロダクト"
+        AppA["プロダクト A<br/>(cases.example.com)"]
+        AppB["プロダクト B<br/>(docs.example.com)"]
+    end
+
+    subgraph "rellf 基盤"
+        direction TB
+        Auth["rellf-auth<br/>認証<br/>あなたは誰？"]
+        Authz["rellf-authz<br/>認可<br/>何ができる？"]
+        Billing["rellf-billing<br/>課金<br/>プランは？"]
+    end
+
+    subgraph "auth 内部"
+        Cognito["Cognito User Pool"]
+        Google["Google OAuth"]
+        SES["SES<br/>メール送信"]
+        AuthLambda["Lambda (Go/Gin)"]
+        AuthTrigger["CustomMessage<br/>PreSignup"]
+    end
+
+    subgraph "authz 内部"
+        AVP["AVP<br/>Cedar ポリシー"]
+        PolicyStoreA["Policy Store<br/>Product A"]
+        PolicyStoreB["Policy Store<br/>Product B"]
+        AuthzLambda["Lambda (Go/Gin)"]
+    end
+
+    subgraph "billing 内部"
+        BillingDB["DynamoDB<br/>orgs / plans /<br/>licenses / usage"]
+        BillingLambda["Lambda (Go/Gin)"]
+    end
+
+    subgraph "イベント基盤"
+        EventBridge["EventBridge"]
+    end
+
+    Browser -->|"OIDC + PKCE"| BrowserSDK
+    BrowserSDK -->|"Authorization Code"| Auth
+    BrowserSDK -->|"Access Token"| AppA
+    BrowserSDK -->|"Access Token"| AppB
+
+    AppA --- GoSDK
+    AppB --- GoSDK
+
+    GoSDK -->|"1. JWT検証 (JWKS)"| Auth
+    GoSDK -->|"2. エンタイトルメント"| Billing
+    GoSDK -->|"3. リソース認可"| Authz
+
+    Auth --- AuthLambda
+    AuthLambda -->|"SDK"| Cognito
+    Cognito <-->|"OAuth 2.0"| Google
+    Cognito -->|"トリガー"| AuthTrigger
+    Cognito -->|"送信"| SES
+
+    Authz --- AuthzLambda
+    AuthzLambda --> AVP
+    AVP --- PolicyStoreA
+    AVP --- PolicyStoreB
+
+    Billing --- BillingLambda
+    BillingLambda --> BillingDB
+
+    Auth -->|"UserDeleted"| EventBridge
+    Billing -->|"PlanChanged"| EventBridge
+    EventBridge -->|"通知"| Billing
+    EventBridge -->|"キャッシュ無効化"| Authz
+
+    style Auth fill:#527fff,color:#fff
+    style Authz fill:#16a34a,color:#fff
+    style Billing fill:#f59e0b,color:#fff
+    style Cognito fill:#527fff,color:#fff
+    style AVP fill:#16a34a,color:#fff
+    style BillingDB fill:#f59e0b,color:#fff
+    style EventBridge fill:#e11d48,color:#fff
+    style GoSDK fill:#6366f1,color:#fff
+    style BrowserSDK fill:#6366f1,color:#fff
+    style SES fill:#dd344c,color:#fff
 ```
-rellf-auth    → 認証（あなたは誰？）
-rellf-authz   → 認可（あなたは何ができる？）
-rellf-billing  → 課金（あなたのプランは？）
+
+### リクエスト処理の流れ
+
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant A as プロダクト API<br/>(Go SDK)
+    participant Auth as rellf-auth
+    participant Bill as rellf-billing
+    participant Authz as rellf-authz
+
+    Note over B,A: 初回ログイン
+    B->>Auth: OIDC Authorization Code + PKCE
+    Auth->>B: ID Token + Access Token
+
+    Note over B,Authz: API リクエスト
+    B->>A: GET /api/cases/123<br/>Authorization: Bearer {token}
+
+    A->>Auth: JWKS 取得（キャッシュ）
+    A->>A: JWT 署名検証<br/>sub, groups, auth_time, amr
+
+    A->>Bill: エンタイトルメントチェック<br/>「org-abc は cases を使えるか？」
+    Bill->>A: ✓ 使える (pro プラン)
+
+    A->>Authz: リソースレベル認可<br/>「user-xxx は case-123 を view できるか？」
+    Authz->>A: ✓ permit (担当者)
+
+    A->>B: 200 OK { case data }
 ```
+
+### 各サービスの責任
 
 | サービス | 責任 | 持つデータ | 他プロダクトへの提供 |
 |---------|------|----------|-------------------|
-| **rellf-auth** | 認証、ユーザー ID 発行 | sub, email, groups, MFA | JWT |
-| **rellf-authz** | 認可判定 | Cedar ポリシー | IsAuthorized API |
-| **rellf-billing** | 契約・プラン・使用量管理 | org, plan, 上限, 請求 | プラン情報 API |
+| **rellf-auth** | 認証、ユーザー ID 発行 | sub, email, groups, MFA | JWT (OIDC) |
+| **rellf-authz** | リソースレベル認可判定 | Cedar ポリシー | IsAuthorized API |
+| **rellf-billing** | 契約・プラン・エンタイトルメント・使用量 | org, plan, 上限, ライセンスキー | エンタイトルメント API |
+
+### 判定の 2 段階
+
+| 段階 | 担当 | 問い | 例 |
+|------|------|------|-----|
+| 1. エンタイトルメント | billing | このプランでこのプロダクト/機能が使えるか？ | pro なら cases は使える |
+| 2. リソースレベル | authz | このユーザーはこのリソースに対して操作できるか？ | この案件の担当者か |
+
+billing がプロダクトレベルの**ゲート**、authz がリソースレベルの**細かい判定**。プラン変更は billing のエンタイトルメント更新だけで即反映され、Cedar ポリシーの変更は不要。
 
 ## なぜ 3 つに分けるか
 
