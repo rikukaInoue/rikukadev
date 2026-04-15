@@ -1,0 +1,592 @@
+---
+title: "ポリシーエンジン比較 — AVP / OpenFGA / OPA / SpiceDB / Cerbos をマルチプロダクトで使うとどうなるか"
+date: 2026-04-15
+tags: ["認可", "Cedar", "OpenFGA", "OPA", "SpiceDB", "Cerbos", "設計"]
+description: "主要なポリシーエンジン5つを同じマルチプロダクトのユースケースで実装し、記述方法・モデル設計・運用特性を具体的に比較する。"
+---
+
+## はじめに
+
+ポリシーエンジンは種類が多く、ドキュメントを読んだだけでは違いが実感しにくいです。この記事では、**同じマルチプロダクトのユースケース**を 5 つのエンジンで実装し、具体的なコードで比較します。
+
+## 共通のユースケース
+
+以下の要件を各エンジンで実装します。
+
+### プロダクト
+
+- **Cases** — 案件管理（弁護士向け）
+- **Docs** — ドキュメント管理（全ユーザー）
+
+### ユーザー
+
+```
+Alice: admin グループ、org-abc 所属
+Bob:   lawyer グループ、org-abc 所属
+Carol: viewer グループ、org-xyz 所属
+```
+
+### リソース
+
+```
+case-001: org-abc の案件、担当者は Bob
+doc-001:  org-abc のドキュメント、作成者は Alice、ステータスは draft
+doc-002:  org-abc のドキュメント、作成者は Bob、ステータスは published
+```
+
+### 認可ルール
+
+| # | ルール |
+|---|-------|
+| R1 | admin は全リソースを閲覧・編集できる |
+| R2 | lawyer は自分が担当する案件を閲覧・編集できる |
+| R3 | viewer は published のドキュメントだけ閲覧できる |
+| R4 | ドキュメントの作成者は自分のドキュメントを編集できる |
+| R5 | 他の org のリソースにはアクセスできない |
+
+### 期待結果
+
+| ユーザー | リソース | view | edit |
+|---------|---------|------|------|
+| Alice (admin) | case-001 | ✓ | ✓ |
+| Alice (admin) | doc-001 (draft) | ✓ | ✓ |
+| Bob (lawyer) | case-001 (担当) | ✓ | ✓ |
+| Bob (lawyer) | doc-001 (draft) | ✗ | ✗ |
+| Bob (lawyer) | doc-002 (published, 作成者) | ✓ | ✓ |
+| Carol (viewer, 別org) | case-001 | ✗ | ✗ |
+| Carol (viewer) | doc-002 (published) | ✓ | ✗ |
+
+## 1. Amazon Verified Permissions (AVP) / Cedar
+
+### 特徴
+
+- **モデル**: ABAC + RBAC
+- **言語**: Cedar（宣言的、型安全）
+- **デプロイ**: AWS マネージド
+- **思想**: 「条件が合えば許可/拒否」
+
+### スキーマ定義
+
+Cedar はスキーマ（型定義）を先に書く必要があります。
+
+```json
+{
+  "Common": {
+    "entityTypes": {
+      "User": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "org": { "type": "String" },
+            "groups": { "type": "Set", "element": { "type": "String" } }
+          }
+        }
+      }
+    },
+    "actions": {}
+  },
+  "Cases": {
+    "entityTypes": {
+      "Case": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "org": { "type": "String" },
+            "assignedTo": { "type": "String" }
+          }
+        }
+      }
+    },
+    "actions": {
+      "view": { "appliesTo": { "principalTypes": ["Common::User"], "resourceTypes": ["Cases::Case"] } },
+      "edit": { "appliesTo": { "principalTypes": ["Common::User"], "resourceTypes": ["Cases::Case"] } }
+    }
+  },
+  "Docs": {
+    "entityTypes": {
+      "Document": {
+        "shape": {
+          "type": "Record",
+          "attributes": {
+            "org": { "type": "String" },
+            "author": { "type": "String" },
+            "status": { "type": "String" }
+          }
+        }
+      }
+    },
+    "actions": {
+      "view": { "appliesTo": { "principalTypes": ["Common::User"], "resourceTypes": ["Docs::Document"] } },
+      "edit": { "appliesTo": { "principalTypes": ["Common::User"], "resourceTypes": ["Docs::Document"] } }
+    }
+  }
+}
+```
+
+### ポリシー
+
+```cedar
+// R1: admin は全リソースを閲覧・編集できる
+permit(
+  principal,
+  action,
+  resource
+) when {
+  principal.groups.contains("admin") &&
+  principal.org == resource.org
+};
+
+// R2: lawyer は担当案件を閲覧・編集できる
+permit(
+  principal,
+  action,
+  resource is Cases::Case
+) when {
+  principal.groups.contains("lawyer") &&
+  principal.org == resource.org &&
+  resource.assignedTo == principal
+};
+
+// R3: viewer は published ドキュメントを閲覧できる
+permit(
+  principal,
+  action == Docs::Action::"view",
+  resource is Docs::Document
+) when {
+  principal.groups.contains("viewer") &&
+  resource.status == "published"
+};
+
+// R4: ドキュメントの作成者は編集できる
+permit(
+  principal,
+  action,
+  resource is Docs::Document
+) when {
+  principal.org == resource.org &&
+  resource.author == principal
+};
+
+// R5: org の不一致はデフォルトで forbid（Cedar は deny-by-default なので明示不要）
+```
+
+### API 呼び出し
+
+```json
+{
+  "principal": { "entityType": "Common::User", "entityId": "bob" },
+  "action": { "actionType": "Cases::Action", "actionId": "view" },
+  "resource": { "entityType": "Cases::Case", "entityId": "case-001" },
+  "entities": [
+    {
+      "identifier": { "entityType": "Common::User", "entityId": "bob" },
+      "attributes": { "org": "org-abc", "groups": ["lawyer"] }
+    },
+    {
+      "identifier": { "entityType": "Cases::Case", "entityId": "case-001" },
+      "attributes": { "org": "org-abc", "assignedTo": "bob" }
+    }
+  ]
+}
+```
+
+### 所感
+
+- **良い**: 型安全。スキーマがあるのでポリシーの整合性が保証される
+- **つらい**: スキーマ定義が冗長。API に entities を毎回渡すのが面倒。デバッグ情報が少ない
+
+---
+
+## 2. OpenFGA
+
+### 特徴
+
+- **モデル**: ReBAC（Zanzibar ベース）
+- **言語**: 独自 DSL
+- **デプロイ**: セルフホスト or Okta FGA（クラウド）
+- **思想**: 「関係があれば許可」
+
+### モデル定義
+
+```
+model
+  schema 1.1
+
+type user
+
+type org
+  relations
+    define member: [user]
+    define admin: [user]
+
+type case
+  relations
+    define org: [org]
+    define assignee: [user]
+    define can_view: assignee or admin from org
+    define can_edit: assignee or admin from org
+
+type document
+  relations
+    define org: [org]
+    define author: [user]
+    define can_view: author or admin from org or viewer_if_published
+    define can_edit: author or admin from org
+    define viewer_if_published: [user with published_condition]
+
+condition published_condition(status: string) {
+  status == "published"
+}
+```
+
+### 関係性の登録（Tuples）
+
+```json
+// 組織メンバー
+{ "user": "user:alice", "relation": "admin", "object": "org:org-abc" }
+{ "user": "user:bob",   "relation": "member", "object": "org:org-abc" }
+{ "user": "user:carol", "relation": "member", "object": "org:org-xyz" }
+
+// 案件
+{ "user": "org:org-abc", "relation": "org",      "object": "case:case-001" }
+{ "user": "user:bob",    "relation": "assignee",  "object": "case:case-001" }
+
+// ドキュメント
+{ "user": "org:org-abc", "relation": "org",    "object": "document:doc-001" }
+{ "user": "user:alice",  "relation": "author", "object": "document:doc-001" }
+{ "user": "org:org-abc", "relation": "org",    "object": "document:doc-002" }
+{ "user": "user:bob",    "relation": "author", "object": "document:doc-002" }
+```
+
+### チェック
+
+```json
+// Bob は case-001 を view できる？
+{ "user": "user:bob", "relation": "can_view", "object": "case:case-001" }
+→ allowed (assignee だから)
+
+// Carol は doc-002 を view できる？
+{ "user": "user:carol", "relation": "can_view", "object": "document:doc-002",
+  "context": { "status": "published" } }
+→ allowed (published だから)
+```
+
+### 所感
+
+- **良い**: 関係性の伝播が自然。「admin from org」で組織の admin が自動的にアクセスできる。Playground が優秀
+- **つらい**: 属性ベースの条件（published かどうか等）は Conditions で書くが、Cedar ほど柔軟ではない。Tuple の管理が大量になる
+
+---
+
+## 3. Open Policy Agent (OPA) / Rego
+
+### 特徴
+
+- **モデル**: 汎用（認可以外にも使える）
+- **言語**: Rego（Datalog ベースの汎用ポリシー言語）
+- **デプロイ**: サイドカー / ライブラリ
+- **思想**: 「任意のデータに対して任意のルールを書ける」
+
+### ポリシー
+
+```rego
+package authz
+
+import future.keywords.if
+import future.keywords.in
+
+default allow := false
+
+# R1: admin は全リソースを閲覧・編集できる（同じ org 内）
+allow if {
+  "admin" in input.user.groups
+  input.user.org == input.resource.org
+}
+
+# R2: lawyer は担当案件を閲覧・編集できる
+allow if {
+  "lawyer" in input.user.groups
+  input.resource.type == "case"
+  input.resource.assignedTo == input.user.sub
+  input.user.org == input.resource.org
+}
+
+# R3: viewer は published ドキュメントを閲覧できる
+allow if {
+  "viewer" in input.user.groups
+  input.resource.type == "document"
+  input.resource.status == "published"
+  input.action == "view"
+}
+
+# R4: ドキュメントの作成者は編集できる
+allow if {
+  input.resource.type == "document"
+  input.resource.author == input.user.sub
+  input.user.org == input.resource.org
+}
+```
+
+### 入力
+
+```json
+{
+  "user": {
+    "sub": "bob",
+    "org": "org-abc",
+    "groups": ["lawyer"]
+  },
+  "action": "view",
+  "resource": {
+    "type": "case",
+    "id": "case-001",
+    "org": "org-abc",
+    "assignedTo": "bob"
+  }
+}
+```
+
+### クエリ
+
+```bash
+curl -X POST http://localhost:8181/v1/data/authz/allow \
+  -H "Content-Type: application/json" \
+  -d '{ "input": { ... } }'
+
+→ { "result": true }
+```
+
+### 所感
+
+- **良い**: 何でも書ける。テストフレームワーク内蔵。Kubernetes Admission Control との相性が良い
+- **つらい**: Rego の学習コストが高い。型がないのでタイポに気づきにくい。「認可専用」ではないので設計指針が自分次第
+
+---
+
+## 4. SpiceDB
+
+### 特徴
+
+- **モデル**: ReBAC（Zanzibar 完全準拠）
+- **言語**: Schema + Relationships
+- **デプロイ**: セルフホスト or AuthZed Cloud
+- **思想**: 「Google Drive のように共有と権限継承を表現する」
+
+### スキーマ
+
+```
+definition user {}
+
+definition org {
+  relation admin: user
+  relation member: user
+}
+
+definition case {
+  relation org: org
+  relation assignee: user
+  permission view = assignee + org->admin
+  permission edit = assignee + org->admin
+}
+
+definition document {
+  relation org: org
+  relation author: user
+  relation published: user:*
+
+  permission view = author + org->admin + published
+  permission edit = author + org->admin
+}
+```
+
+### 関係性の書き込み
+
+```
+// gRPC or HTTP API
+case:case-001#org@org:org-abc
+case:case-001#assignee@user:bob
+org:org-abc#admin@user:alice
+org:org-abc#member@user:bob
+
+document:doc-001#org@org:org-abc
+document:doc-001#author@user:alice
+
+document:doc-002#org@org:org-abc
+document:doc-002#author@user:bob
+document:doc-002#published@user:*    // 全ユーザーに公開
+```
+
+### チェック
+
+```
+CheckPermission(user:bob, view, case:case-001) → ALLOWED
+CheckPermission(user:carol, view, document:doc-002) → ALLOWED (published)
+CheckPermission(user:carol, edit, document:doc-002) → DENIED
+```
+
+### 所感
+
+- **良い**: スキーマが直感的。`org->admin` で「組織の admin」が自然に表現できる。gRPC ネイティブで高速
+- **つらい**: 属性ベースの条件（status == "published" 等）の表現が Caveats で若干不自然。セルフホストの運用が必要
+
+---
+
+## 5. Cerbos
+
+### 特徴
+
+- **モデル**: ABAC + RBAC
+- **言語**: YAML / JSON
+- **デプロイ**: サイドカー / クラウド
+- **思想**: 「YAML で書けるので開発者じゃなくても読める」
+
+### ポリシー
+
+```yaml
+# cases_policy.yaml
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  resource: "case"
+  version: "default"
+  rules:
+    # R1: admin は全操作可能（同じ org）
+    - actions: ["view", "edit"]
+      roles: ["admin"]
+      condition:
+        match:
+          expr: request.resource.attr.org == request.principal.attr.org
+
+    # R2: lawyer は担当案件のみ
+    - actions: ["view", "edit"]
+      roles: ["lawyer"]
+      condition:
+        match:
+          all:
+            of:
+              - expr: request.resource.attr.org == request.principal.attr.org
+              - expr: request.resource.attr.assignedTo == request.principal.id
+```
+
+```yaml
+# documents_policy.yaml
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  resource: "document"
+  version: "default"
+  rules:
+    # R1: admin は全操作可能
+    - actions: ["view", "edit"]
+      roles: ["admin"]
+      condition:
+        match:
+          expr: request.resource.attr.org == request.principal.attr.org
+
+    # R3: viewer は published のみ閲覧
+    - actions: ["view"]
+      roles: ["viewer"]
+      condition:
+        match:
+          expr: request.resource.attr.status == "published"
+
+    # R4: 作成者は編集可能
+    - actions: ["view", "edit"]
+      roles: ["*"]
+      condition:
+        match:
+          all:
+            of:
+              - expr: request.resource.attr.org == request.principal.attr.org
+              - expr: request.resource.attr.author == request.principal.id
+```
+
+### API 呼び出し
+
+```json
+{
+  "principal": {
+    "id": "bob",
+    "roles": ["lawyer"],
+    "attr": { "org": "org-abc" }
+  },
+  "resource": {
+    "kind": "case",
+    "id": "case-001",
+    "attr": { "org": "org-abc", "assignedTo": "bob" }
+  },
+  "actions": ["view", "edit"]
+}
+```
+
+```json
+// レスポンス
+{
+  "results": {
+    "case-001": {
+      "actions": {
+        "view": "EFFECT_ALLOW",
+        "edit": "EFFECT_ALLOW"
+      }
+    }
+  }
+}
+```
+
+### 所感
+
+- **良い**: YAML なので読みやすい。リソース単位でポリシーを分けるのがわかりやすい。バッチチェック（複数アクションを一度に判定）が便利
+- **つらい**: 関係性の伝播（フォルダの権限が中のファイルに継承される等）は苦手。複雑な条件は YAML が深くなる
+
+---
+
+## 総合比較
+
+### 記述量
+
+同じルールを書くのに必要な行数（概算）：
+
+| | スキーマ/モデル | ポリシー/関係性 | 合計 |
+|---|---|---|---|
+| **Cedar (AVP)** | 40行 | 30行 | 70行 |
+| **OpenFGA** | 25行 | 15行 (tuples) | 40行 |
+| **OPA (Rego)** | 0行 | 30行 | 30行 |
+| **SpiceDB** | 20行 | 10行 (relations) | 30行 |
+| **Cerbos** | 0行 | 40行 (YAML) | 40行 |
+
+### マルチプロダクトでの使いやすさ
+
+| 要件 | Cedar | OpenFGA | OPA | SpiceDB | Cerbos |
+|------|-------|---------|-----|---------|--------|
+| プロダクト間のポリシー分離 | ◎ (namespace) | ○ (type で分離) | △ (package で分離) | ○ (definition で分離) | ◎ (resource 単位) |
+| 新プロダクト追加 | スキーマ + ポリシー追加 | モデル + tuple 追加 | 新 package 追加 | 新 definition 追加 | 新 YAML ファイル追加 |
+| ビジネス担当者が読める | △ | △ | ✗ | △ | ◎ (YAML) |
+| テスト | △ (AVP テスト機能) | ○ (Playground) | ◎ (内蔵テスト) | ○ (zed CLI) | ◎ (テストスイート) |
+| デバッグ | △ | ○ | ◎ (explain) | ○ (trace) | ○ (explain) |
+
+### 向いてるユースケース
+
+| エンジン | 最適なケース |
+|---------|-----------|
+| **Cedar (AVP)** | AWS にいる。型安全が欲しい。マネージドでやりたい |
+| **OpenFGA** | Google Drive のような共有モデル。フォルダ → ファイルの権限継承 |
+| **OPA** | 認可以外もやりたい（k8s Admission, Terraform policy）。何でも書きたい |
+| **SpiceDB** | 大規模な関係性データ。パフォーマンス重視。Zanzibar を忠実にやりたい |
+| **Cerbos** | チームに開発者以外もいる。YAML で管理したい。API 認可に特化 |
+
+## AVP から移行するなら
+
+| 移行先 | 移行の難易度 | 理由 |
+|-------|-----------|------|
+| **Cerbos** | 低 | ABAC 同士。ポリシーを YAML に書き直すだけ。概念モデルが近い |
+| **OPA** | 中 | Rego への書き換えが必要だが、ABAC の発想は同じ |
+| **OpenFGA** | 高 | ABAC → ReBAC のモデル変換が必要。関係性の設計からやり直し |
+| **SpiceDB** | 高 | 同上 |
+
+**ABAC で困ってるなら Cerbos か OPA、関係性ベースが必要なら OpenFGA か SpiceDB** という判断です。
+
+## まとめ
+
+- 同じルールでもエンジンによって記述方法が全く違う
+- **ABAC 系**（Cedar, OPA, Cerbos）は「条件」で書く。属性による柔軟な制御が得意
+- **ReBAC 系**（OpenFGA, SpiceDB）は「関係性」で書く。権限の継承・伝播が得意
+- マルチプロダクトでは**プロダクトごとのポリシー分離**が重要。Cedar の namespace、Cerbos のリソース単位ファイル、OPA の package が使える
+- 「どれが一番いい」はなく、**ユースケースに合ったモデル（ABAC vs ReBAC）を先に選び、その中でエンジンを比較**するのが正しい順序
