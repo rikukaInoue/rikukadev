@@ -17,9 +17,9 @@ Astro で構築したブログに Mermaid 図を埋め込みたい。ただし�
 
 ## 選択肢の比較
 
-```mermaid
+```text
 graph TB
-    Input["Markdown 内の<br/>```mermaid ブロック"]
+    Input["Markdown 内の<br/>```text ブロック"]
 
     Input --> Choice{どの戦略？}
 
@@ -46,9 +46,9 @@ graph TB
 
 今回の構成はこうなります。
 
-```mermaid
+```text
 graph LR
-    MDX["記事 (.mdx)<br/>```mermaid"]
+    MDX["記事 (.mdx)<br/>```text"]
     Astro["Astro ビルド"]
     Rehype["rehype-mermaid"]
     Mermaid["mermaid-isomorphic"]
@@ -147,7 +147,7 @@ grep -c '<svg' dist/blog/your-post/index.html
 記事の中では普通の fenced code block として書くだけ。
 
 ````markdown
-```mermaid
+```text
 graph TB
     A[開始] --> B{条件}
     B -->|Yes| C[処理A]
@@ -159,7 +159,7 @@ graph TB
 
 レンダリング結果：
 
-```mermaid
+```text
 graph TB
     A[開始] --> B{条件}
     B -->|Yes| C[処理A]
@@ -174,7 +174,7 @@ Mermaid が対応している図なら何でも書けます。
 
 ### シーケンス図
 
-```mermaid
+```text
 sequenceDiagram
     participant B as ブラウザ
     participant A as Astro ビルド
@@ -189,7 +189,7 @@ sequenceDiagram
 
 ### ER 図
 
-```mermaid
+```text
 erDiagram
     USER ||--o{ POST : writes
     POST ||--o{ COMMENT : has
@@ -206,7 +206,7 @@ erDiagram
 
 ### 状態遷移図
 
-```mermaid
+```text
 stateDiagram-v2
     [*] --> Draft
     Draft --> Review: 提出
