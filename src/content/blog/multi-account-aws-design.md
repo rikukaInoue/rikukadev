@@ -1,6 +1,6 @@
 ---
 title: "マルチアカウントAWSにおける社内サービス連携の設計 — TGW・PrivateLink・Route53の使い分けと落とし穴"
-date: 2026-04-20
+date: 2026-04-19
 tags: ["AWS", "マルチアカウント", "ネットワーク", "TGW", "PrivateLink", "Route53", "IPAM"]
 description: "AWS マルチアカウント環境でのサービス間接続方式（TGW・PrivateLink・VPC Peering・インターネット経由）をコスト計算付きで比較。Route53 Private Hosted Zone の落とし穴、IPAM の実務的な使い方、中央 egress 集約の設計判断まで整理します。"
 ---
