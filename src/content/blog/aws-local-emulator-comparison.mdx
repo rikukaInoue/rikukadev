@@ -1,0 +1,224 @@
+---
+title: "AWS ローカル開発エミュレータ比較 — floci / cognito-local / MiniStack / LocalStack / moto"
+date: 2026-04-19
+tags: ["AWS", "Cognito", "ローカル開発", "テスト", "DX"]
+description: "Cognito を使った認証サービスのローカル開発で、floci (LocalStack) の制限にぶつかった。cognito-local、MiniStack、LocalStack 有料版、moto を含む5つのエミュレータを Cognito の機能対応で比較する。"
+---
+
+## はじめに
+
+AWS Cognito を使った認証サービスをローカルで開発するとき、エミュレータの選択は開発体験を大きく左右します。
+
+実際に floci（LocalStack ベース）で開発を進めた結果、以下の機能が動かないことがわかりました。
+
+- JWT の `cognito:groups` クレームにグループ情報が含まれない
+- Lambda トリガー（PreSignUp、CustomMessage）が発火しない
+- SES メール送信ができない
+- Google OAuth 等の外部 IdP 連携ができない
+
+これは floci に限った話ではなく、多くの無料エミュレータで同様の制限があります。この記事では、Cognito を中心に 5 つのエミュレータを比較します。
+
+## 何が問題だったか
+
+認証サービス（rellf-auth）では、以下の機能をローカルで検証する必要がありました。
+
+| 機能 | 本番 | floci |
+|------|------|-------|
+| 基本操作（SignUp, Login, AdminGetUser） | 動く | 動く |
+| `cognito:groups` in JWT | 含まれる | **含まれない** |
+| PreSignUp Lambda トリガー | 発火する | **発火しない** |
+| CustomMessage Lambda トリガー | 発火する | **発火しない** |
+| SES メール送信 | 送信される | **送信されない** |
+| Google OAuth / 外部 IdP | 動く | **動かない** |
+| client_secret | Cognito が生成 | ダミー値 |
+| メール確認コード | 実コード | `000000` 固定 |
+
+`cognito:groups` が含まれないのが地味に一番痛い問題でした。ロールベースの認可テストがローカルでできず、コード内で回避策を入れる羽目になります。
+
+```go
+// 本来は不要なローカルモード分岐
+if !m.local {
+    groupsRaw, ok := token.Get("cognito:groups")
+    if !ok || !containsAdmin(groupsRaw) {
+        // 403
+    }
+}
+```
+
+## エミュレータ一覧
+
+### 1. cognito-local
+
+**GitHub**: [jagregory/cognito-local](https://github.com/jagregory/cognito-local) | TypeScript | 無料
+
+Cognito に特化したエミュレータ。最も多くの Cognito 固有機能を再現しています。
+
+| 機能 | 対応 |
+|------|------|
+| 基本操作 | 対応 |
+| `cognito:groups` in JWT | **対応** |
+| PreSignUp トリガー | **対応** |
+| CustomMessage トリガー | **対応** |
+| PreTokenGeneration トリガー | **対応** |
+| SES | 非対応（CustomEmailSender で代替可） |
+| 外部 IdP | 非対応 |
+| JWKS | 対応 |
+
+Docker または npm でセットアップ可能。Cognito の機能に特化しているため、S3 や DynamoDB 等の他の AWS サービスには対応していません。
+
+### 2. MiniStack
+
+**GitHub**: [ministackorg/ministack](https://github.com/ministackorg/ministack) | Python | 無料
+
+2026 年 3 月に LocalStack の Community Edition 廃止を受けて登場した新しいプロジェクト。40+ の AWS サービスに対応していますが、Cognito の対応はまだ基本的です。
+
+| 機能 | 対応 |
+|------|------|
+| 基本操作 | 対応 |
+| `cognito:groups` in JWT | 不明（stub JWT） |
+| Lambda トリガー | 不明 |
+| SES | 対応 |
+| 外部 IdP | 未対応 |
+| 対応サービス数 | 40+ |
+
+JWT が「structurally valid だが暗号署名なし」の stub 実装とのこと。groups の挙動は未確認です。成長が速いので今後に期待。
+
+### 3. LocalStack（有料版）
+
+**Website**: [localstack.cloud](https://www.localstack.cloud/) | Python | $39+/月
+
+最も包括的なエミュレータ。2026 年 3 月に Community Edition が廃止され、商用利用には有料ライセンスが必要になりました。
+
+| 機能 | 対応 |
+|------|------|
+| 基本操作 | 対応 |
+| `cognito:groups` in JWT | **対応** |
+| PreSignUp トリガー | **対応（バグ報告あり）** |
+| CustomMessage トリガー | **対応（バグ報告あり）** |
+| SES | 対応 |
+| 外部 IdP | 有料プランで対応 |
+| 対応サービス数 | 80+ |
+
+Lambda トリガーは対応していますが、「claims が間違ったトークンに注入される」「PostConfirmation が発火しない」等のバグが GitHub Issues で報告されています。
+
+**料金体系の変更（2026年）:**
+- Community Edition は廃止
+- Hobby（非商用のみ）: 無料
+- Pro: $39/月/ライセンス（年間契約）
+- Team: カスタム
+
+### 4. moto
+
+**GitHub**: [getmoto/moto](https://github.com/getmoto/moto) | Python | 無料
+
+AWS の API をモックするライブラリ。Python のデコレータとして使うのが主流ですが、Server モードで Docker 起動すれば任意の言語から HTTP 経由で利用可能です。
+
+| 機能 | 対応 |
+|------|------|
+| 基本操作 | 対応 |
+| `cognito:groups` in JWT | **対応** |
+| Lambda トリガー | **非対応（設定は保存されるが発火しない）** |
+| SES | 対応（モック、実送信なし） |
+| 外部 IdP | 非対応 |
+| 対応サービス数 | 150+ |
+| Server モード | `docker run motoserver/moto:latest` |
+
+`cognito:groups` が JWT に含まれることはテストスイートで確認されています。ただし Lambda トリガーは「設定は受け付けるが実際には発火しない」モック実装です。
+
+テスト用途に特化しており、エミュレータではなくモックとして捉えるのが正しいです。
+
+### 5. cognitox
+
+**GitHub**: [unvalley/cognitox](https://github.com/unvalley/cognitox) | Rust | 無料
+
+2026 年に登場した Rust 製の Cognito エミュレータ。119 の API オペレーションに対応を謳っていますが、Lambda トリガーは未対応。
+
+| 機能 | 対応 |
+|------|------|
+| 基本操作 | 対応 |
+| `cognito:groups` in JWT | おそらく対応 |
+| Lambda トリガー | **非対応** |
+| SES | 非対応 |
+| 外部 IdP | 不明 |
+| 管理 UI | Web UI あり |
+
+Rust 製で起動が高速。管理 UI（ブラウザで Pool/User/Group を閲覧）が便利ですが、Lambda トリガー未対応は認証サービスの開発では致命的です。
+
+## 比較表
+
+| 機能 | cognito-local | MiniStack | LocalStack (有料) | moto | cognitox |
+|------|:---:|:---:|:---:|:---:|:---:|
+| **料金** | 無料 | 無料 | $39+/月 | 無料 | 無料 |
+| **groups in JWT** | ✅ | ❓ | ✅ | ✅ | ✅? |
+| **PreSignUp** | ✅ | ❓ | ✅ (⚠️) | ❌ | ❌ |
+| **CustomMessage** | ✅ | ❓ | ✅ (⚠️) | ❌ | ❌ |
+| **PreTokenGeneration** | ✅ | ❓ | ✅ (⚠️) | ❌ | ❌ |
+| **SES** | ❌ | ✅ | ✅ | ✅ | ❌ |
+| **外部 IdP** | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **Cognito 以外** | ❌ | 40+ | 80+ | 150+ | ❌ |
+| **成熟度** | 高 | 低 | 高 | 高 | 低 |
+| **セットアップ** | 簡単 | 簡単 | 中 | 簡単 | 簡単 |
+
+✅ = 対応 ❌ = 非対応 ❓ = 未確認 ⚠️ = バグ報告あり
+
+## どれを選ぶか
+
+### Cognito の機能テストが最優先なら → cognito-local
+
+groups in JWT、Lambda トリガー（PreSignUp / CustomMessage / PreTokenGeneration）が全て動く唯一の無料選択肢。SES は非対応ですが、CustomEmailSender トリガーで代替可能。
+
+Cognito 以外の AWS サービス（S3、DynamoDB 等）が必要なら、moto の Server モードと併用するのが現実的です。
+
+### 単一ツールで全部やりたいなら → LocalStack（有料）
+
+最も包括的ですが、$39/月のコストと Lambda トリガーのバグリスクがあります。チーム開発で全員が同じ環境を使うなら投資する価値はあります。
+
+### テスト（ユニット/結合）が目的なら → moto
+
+groups in JWT が動くので、ロールベースの認可テストは書けます。Lambda トリガーの統合テストは別の方法で。Server モードなら Go からも使えます。
+
+### 将来に期待するなら → MiniStack / cognitox
+
+どちらも 2026 年に登場した新しいプロジェクト。MiniStack は 40+ サービス対応で急成長中。cognitox は Rust 製で高速。ただし、現時点では Cognito の高度な機能（トリガー、groups in JWT）の対応が不十分です。
+
+## 第 4 の選択肢: 実 AWS を叩く
+
+エミュレータの制限に悩むなら、**開発環境でも実 AWS を叩く**という選択肢もあります。
+
+| | エミュレータ | 実 AWS |
+|---|---|---|
+| コスト | 無料 | Cognito 無料枠あり（MAU 50,000） |
+| セットアップ | Docker 起動 | Terraform apply |
+| 機能の完全性 | 制限あり | 完全 |
+| オフライン開発 | 可能 | 不可 |
+| テスト速度 | 速い | ネットワークレイテンシあり |
+| CI | Docker-in-Docker | AWS クレデンシャル必要 |
+
+開発用の AWS アカウントを用意し、Terraform でリソースを管理すれば、「エミュレータで動くのに本番で動かない」問題がゼロになります。認可サービス（rellf-authz）では AVP が非対応なため、この方式を採用しています。
+
+## おすすめの構成
+
+```
+ローカル開発:
+  cognito-local（Cognito + トリガー）
+  + moto Server モード（S3、DynamoDB 等）
+
+CI/CD:
+  cognito-local（Docker で起動）
+  or 実 AWS（開発用アカウント）
+
+統合テスト:
+  実 AWS（本番と同じ構成で検証）
+```
+
+段階を分けて使い分けるのが現実的です。ローカルでは cognito-local で高速に回し、CI と統合テストでは実 AWS で本番同等の検証を行う。
+
+## まとめ
+
+- **floci / LocalStack 無料版**では `cognito:groups` in JWT や Lambda トリガーが動かない
+- **cognito-local** が Cognito 特化で最も機能が充実（無料）
+- **moto** は groups in JWT が動くのでテスト用途に有用（トリガーは非対応）
+- **LocalStack 有料版**は包括的だがコストとバグリスクがある
+- **MiniStack / cognitox** は新しく今後に期待
+- エミュレータの制限に悩むなら**実 AWS を叩く**のも有力な選択肢
+- ローカルは cognito-local、CI/統合テストは実 AWS、という使い分けが現実的
