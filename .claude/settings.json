@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Write(src/**)",
+      "Edit(src/**)",
+      "Write(public/**)",
+      "Edit(public/**)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch *)",
+      "Bash(npm run dev *)",
+      "Bash(npm run build *)",
+      "Bash(npm run preview *)",
+      "Bash(npx astro *)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard *)",
+      "Write(.env*)",
+      "Write(*.pem)",
+      "Write(*.key)",
+      "Read(.env*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/inouetaishi/gh/claude-harness/hooks/protect-bash.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/inouetaishi/gh/claude-harness/hooks/file-guard.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/inouetaishi/gh/claude-harness/hooks/post-compact.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
