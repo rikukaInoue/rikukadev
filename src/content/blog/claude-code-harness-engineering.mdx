@@ -1,0 +1,425 @@
+---
+title: "Claude Code ハーネスエンジニアリング — 長時間自律稼働を実現する設計と実例"
+date: 2026-04-26
+tags: ["Claude Code", "AI", "ハーネスエンジニアリング", "自動化", "開発環境"]
+description: "Claude Codeを長時間安定して自律稼働させるために必要なパーミッション設計、Hooks、コンテキスト圧縮対策を実例付きで解説する。"
+---
+
+## はじめに
+
+Claude Code はモデル（Claude）とハーネス（CLI アプリケーション）の 2 層構造で動いています。モデル自体はステートレスで、毎回の API コールに応答するだけです。**ループを回し、承認を管理し、コンテキストを維持する**のはハーネスの仕事です。
+
+この外側の制御層をうまく設計して、モデルの能力を安全かつ効率的に引き出す技術を**ハーネスエンジニアリング**と呼びます。Mitchell Hashimoto（HashiCorp 共同創業者）が [My AI Adoption Journey](https://mitchellh.com/writing/my-ai-adoption-journey) で提唱した概念で、「エージェントがミスをしたら、二度と同じミスをしないよう環境側に恒久的な修正を施す」という原則です。
+
+この記事では、Claude Code を長時間自律的に稼働させるための具体的な設計パターンと実例を紹介します。
+
+## アーキテクチャ — なぜ長時間稼働できるのか
+
+```text
+┌─────────────────────────────────┐
+│         ハーネス (CLI)            │
+│  ┌───────────────────────────┐  │
+│  │  パーミッション管理         │  │
+│  │  ツール実行エンジン         │  │
+│  │  Hooks (自動化)            │  │
+│  │  コンテキスト圧縮           │  │
+│  │  会話ループ制御             │  │
+│  └───────────────────────────┘  │
+│         ↕ API 呼び出し           │
+│  ┌───────────────────────────┐  │
+│  │  Claude モデル              │  │
+│  │  (思考 → ツール呼び出し要求) │  │
+│  └───────────────────────────┘  │
+└─────────────────────────────────┘
+```
+
+長時間稼働を支える仕組みは 3 つあります。
+
+| 仕組み | 役割 |
+|--------|------|
+| パーミッション | 安全な操作を自動承認し、人間の介入を最小化する |
+| Hooks | ツール実行の前後にシェルスクリプトで自動検査・注入する |
+| コンテキスト圧縮 | 会話がコンテキストウィンドウの上限に近づくと過去のメッセージを自動圧縮する |
+
+`--dangerously-skip-permissions` で全操作を素通しにするのではなく、**許可境界を適切に設計する**ことが本質です。
+
+## Layer 1: パーミッション設計
+
+### 評価順序
+
+パーミッションは **deny → ask → allow** の順に評価されます。最初にマッチしたルールが勝ちます。どのレベル（user / project）でも deny されたツールは、他のレベルで allow できません。
+
+### パターン A: バランス型（実用的な自律稼働）
+
+読み取り系と限定的な書き込みを自動承認し、破壊的操作をブロックするパターンです。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Write(src/**)",
+      "Edit(src/**)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(npm run test *)",
+      "Bash(npm run lint)",
+      "Bash(npx tsc --noEmit)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)",
+      "Write(.env*)",
+      "Write(*.pem)",
+      "Write(*.key)"
+    ]
+  }
+}
+```
+
+このパターンだと **ファイル読み取り、検索、テスト実行、lint はすべて自動承認** されるため、Claude が毎回「Read を許可しますか？」と聞いてくることがなくなります。一方で `rm -rf` や `git push --force` は deny で完全にブロックされます。
+
+### パターン B: 読み取り専用レビュー
+
+コードレビューだけを依頼するときのパターンです。書き込みを一切許可しません。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git status)"
+    ],
+    "deny": [
+      "Write",
+      "Edit",
+      "Bash(*)"
+    ]
+  }
+}
+```
+
+### パターン C: ガード付きフルオート
+
+`bypassPermissions` をベースにしつつ、危険操作だけ deny で止めるパターンです。
+
+```json
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(git push --force *)",
+      "Bash(docker rm *)",
+      "Write(.env*)",
+      "Write(*.pem)",
+      "Write(*.key)"
+    ]
+  }
+}
+```
+
+信頼度の高いプロジェクトで長時間回す場合に使います。deny リストがセーフティネットになるため、全許可よりもはるかに安全です。
+
+### 設計指針
+
+| 操作カテゴリ | 推奨 |
+|-------------|------|
+| ファイル読み取り・検索 | allow |
+| src 配下の書き込み | allow |
+| テスト・lint の実行 | allow |
+| git の読み取り系 (status, diff, log) | allow |
+| git push, git commit | ask（手動承認） |
+| rm -rf, sudo, curl, 機密ファイル書き込み | deny |
+
+## Layer 2: Hooks
+
+Hooks はハーネスエンジニアリングの核心です。`settings.json` にシェルコマンドを登録しておくと、ツール実行の前後に自動でロジックを挟めます。**モデルではなくハーネスが実行する**ため、モデルが勝手にバイパスすることはできません。
+
+### Hooks の種類
+
+| フック | タイミング | 用途 |
+|-------|-----------|------|
+| PreToolUse | ツール実行前 | 危険操作のブロック、バリデーション |
+| PostToolUse | ツール実行後 | lint チェック、コンテキスト再注入 |
+| Notification | 通知発生時 | 外部通知（Slack など） |
+
+### 実例 1: 危険コマンド防止ガード
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/protect-bash.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# .claude/hooks/protect-bash.sh
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+
+BLOCKED=(
+  "rm -rf /"
+  "DROP TABLE"
+  "DROP DATABASE"
+  "terraform destroy"
+  "git push --force"
+  "git reset --hard"
+)
+
+for b in "${BLOCKED[@]}"; do
+  if echo "$COMMAND" | grep -qi "$b"; then
+    echo '{"permissionDecision":"deny"}'
+    echo "Blocked: dangerous command '$b' detected" >&2
+    exit 2
+  fi
+done
+exit 0
+```
+
+**ポイント**: `exit 2` は `bypassPermissions` モードでも**強制ブロック**が効きます。これがパーミッション設定にはない Hooks 固有の利点です。
+
+### 実例 2: 機密ファイル保護
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/file-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# .claude/hooks/file-guard.sh
+INPUT=$(cat)
+FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path')
+
+SENSITIVE_PATTERNS=(".env" ".pem" ".key" "id_rsa" "credentials" "secrets/")
+
+for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+  if echo "$FILE" | grep -qi "$pattern"; then
+    echo '{"permissionDecision":"deny"}'
+    echo "Blocked: write to sensitive file matching '$pattern'" >&2
+    exit 2
+  fi
+done
+exit 0
+```
+
+### 実例 3: コンパクション後のコンテキスト再注入
+
+これが長時間稼働で**最も効果的**とされているテクニックです。
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat $CLAUDE_PROJECT_DIR/.claude/context-essentials.txt"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+PostToolUse の stdout は system message として注入されるため、コンパクション直後に Claude が重要ルールと進捗を再読み込みします。`context-essentials.txt` には 10〜50 行程度の情報を入れます。
+
+```text
+# Context Essentials
+- 現在のタスク: API v2 のエンドポイント実装
+- 完了済み: GET /users, POST /users
+- 次にやること: PUT /users/:id
+- 重要ルール: テストを先に書く、any型禁止、.envに触らない
+```
+
+この手法は [Dicklesworthstone/post_compact_reminder](https://github.com/Dicklesworthstone/post_compact_reminder) で公開されており、多くのプロジェクトで採用されています。
+
+### 実例 4: ファイル編集後の自動 lint
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx eslint --no-error-on-unmatched-pattern $(echo $(cat) | jq -r '.tool_input.file_path // .tool_input.path') 2>&1 | tail -20"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+ファイルを書き換えるたびに自動で lint が走り、結果が Claude にフィードバックされます。人間が「lint 通ってないよ」と指摘する必要がなくなります。
+
+## Layer 3: コンテキスト圧縮対策
+
+長時間セッションでは必ずコンテキスト圧縮（コンパクション）が発生します。圧縮されると過去の会話が要約に置き換わるため、細かいニュアンスが失われます。これを見越した対策が必要です。
+
+### テクニック一覧
+
+| テクニック | やり方 | 効果 |
+|-----------|--------|------|
+| プロアクティブ圧縮 | 自動（95%）を待たず **60% 時点で手動 `/compact`** | サマリー品質が高い |
+| カスタム指示付き圧縮 | `/compact DBスキーマとAPI設計を優先保持` | 重要情報を選択的に残す |
+| compact 後 Hook | PostToolUse で重要情報を再注入 | 確実にルールを復元 |
+| タスク分割 | 1 サブタスク完了 → `/clear` → 次のタスク | フルコンテキストで再開 |
+| CLAUDE.md に書く | コンパクション後にディスクから再読み込みされる | 恒久ルールの維持に最適 |
+
+### プロアクティブ圧縮が重要な理由
+
+自動圧縮は 95% 到達時にトリガーされますが、この時点ではすでにコンテキストがパンパンです。**60% 時点ではまだ全コンテキストにアクセスできる**ため、生成されるサマリーの品質が格段に高くなります。
+
+```text
+# 60% 時点で手動実行
+/compact API設計の決定事項とテスト戦略を優先保持
+
+# vs 95% 時点で自動実行（サマリー品質が低い）
+```
+
+### CLAUDE.md による恒久ルールの維持
+
+CLAUDE.md はコンパクション後に**ディスクから再読み込みされる**仕様です。つまり、コンパクションで何が失われようと CLAUDE.md に書いたルールは必ず復活します。これが最も信頼できるメカニズムです。
+
+```markdown
+# CLAUDE.md
+
+## Critical Rules
+- テストを書いてからコードを書く（TDD）
+- .env ファイルは絶対に読み書きしない
+- rm -rf は使わない
+- git push --force は使わない
+
+## Task Execution Protocol
+1. 各ステップ完了後にテストを実行して確認
+2. コンパクションが起きたら、まず MEMORY.md を再読する
+3. 不明点がある場合は推測せず停止する
+4. 大きな変更は小さなコミット単位に分割する
+```
+
+ただし注意点があります。CLAUDE.md は**肥大化するとルールが無視される原因**になります。公式ドキュメントの推奨は「この行を削除したら Claude がミスするか？」をすべての行に問い、No なら削除することです。
+
+## Layer 4: CLAUDE.md — 長時間安定化の指示設計
+
+CLAUDE.md はパーミッションや Hooks とは異なり、**モデルへの指示**です。適切に書くことで長時間セッションの安定性が大きく変わります。
+
+### 長時間安定化のための記述パターン
+
+**自己チェックループの強制**:
+
+```markdown
+## Before Every Commit
+1. `npm run test` が全てパスすることを確認
+2. `npm run lint` がエラーゼロであることを確認
+3. `git diff --stat` で変更範囲を確認
+4. 不要なファイルが含まれていないか確認
+```
+
+**コンテキスト不安への対策**:
+
+長時間セッションではモデルに「コンテキスト不安」（早く作業を切り上げようとする傾向）が発生することがあります。
+
+```markdown
+## Long Session Rules
+- 作業を急いで終わらせようとしないこと。品質が最優先
+- 不確かな場合はテストを書いて検証する
+- コンテキスト使用量が高くなったら、現在の進捗を記録してから /compact を実行する
+```
+
+**MEMORY.md によるセッション横断記憶**:
+
+```markdown
+## Session Memory
+- 作業開始時に MEMORY.md に現在のタスクと計画を記録
+- 各マイルストーン完了時に MEMORY.md を更新
+- コンパクション後はまず MEMORY.md を読んで現在地を把握する
+```
+
+## 5 層の統合設計
+
+ここまでの内容を統合すると、以下の 5 層構造になります。
+
+| レイヤー | 役割 | 実装 |
+|---------|------|------|
+| Layer 1: パーミッション | 安全な操作の自動承認 | settings.json の allow/deny |
+| Layer 2: Hooks | 実行前後の自動検査 | PreToolUse / PostToolUse |
+| Layer 3: コンテキスト圧縮対策 | 長時間の品質維持 | compact 後 Hook + プロアクティブ圧縮 |
+| Layer 4: CLAUDE.md | 行動ルール | 簡潔に、削除テストを通過した行のみ |
+| Layer 5: サブエージェント / MCP | 役割分担と外部連携 | Skills, Agent tool, MCP servers |
+
+## 実際のデータ
+
+Anthropic が 2026 年 2 月に公開した [Measuring AI agent autonomy in practice](https://www.anthropic.com/research/measuring-agent-autonomy) によると、以下のデータが報告されています。
+
+- 99.9 パーセンタイルのターン持続時間が **25 分未満 → 45 分超** にほぼ倍増（2025 年 10 月 → 2026 年 1 月）
+- 利用経験が増えるほどフルオート承認率が上がる（初心者 ~20% → 750 セッション超で 40% 超）
+- ハーネス設計の違いでベンチマークスコアが**最大 22 ポイント変動**する一方、モデルの入れ替えではわずか 1 ポイントしか変わらない
+
+最後のデータが象徴的です。**モデルを良くするより、ハーネスを良くする方がはるかに効果が大きい**ということです。
+
+## まとめ
+
+Claude Code の長時間自律稼働は `--dangerously-skip-permissions` で雑に全許可するものではありません。
+
+1. **パーミッション** で安全な操作だけ自動承認する
+2. **Hooks** で危険操作をガードし、compact 後にコンテキストを復元する
+3. **CLAUDE.md** で恒久ルールを維持する
+
+この 3 点セットが安定稼働の定石です。ハーネスの設計次第でエージェントの性能が大きく変わる以上、「どのモデルを使うか」よりも「ハーネスをどう設計するか」に投資する方がリターンが大きいと言えます。
+
+## 参考リンク
+
+- [My AI Adoption Journey — Mitchell Hashimoto](https://mitchellh.com/writing/my-ai-adoption-journey)
+- [Measuring AI agent autonomy in practice — Anthropic](https://www.anthropic.com/research/measuring-agent-autonomy)
+- [Long-running Claude for scientific computing — Anthropic](https://www.anthropic.com/research/long-running-Claude)
+- [Claude Code Docs — Permissions](https://code.claude.com/docs/en/permissions)
+- [Claude Code Docs — Hooks](https://code.claude.com/docs/en/hooks)
+- [Dicklesworthstone/post_compact_reminder — GitHub](https://github.com/Dicklesworthstone/post_compact_reminder)
+- [Chachamaru127/claude-code-harness — GitHub](https://github.com/Chachamaru127/claude-code-harness)
