@@ -316,6 +316,63 @@ yMapState.observeDeep(() => {
 
 ---
 
+## セッション保存：MCX フォーマット
+
+HTMLエクスポートは「共有用」だが、**途中の会議を中断して後で再開したい**ケースもある。そこで、独自のXMLベースのセッションファイル `.mcx`（Meeting Companion XML）を設計した。
+
+### フォーマット仕様
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<meeting-companion version="1" exported="2026-04-25T22:00:00Z" mode="normal">
+  <transcript>
+    <line>今日はDAU改善について議論します</line>
+    <line>オンボーディングの離脱率が高い</line>
+  </transcript>
+  <mindmap>
+    <category key="summary" label="論点">
+      <item id="1" active="true" added="1745600000000">
+        <text>DAU改善施策の議論</text>
+      </item>
+    </category>
+    <category key="claims" label="検証すべき主張">
+      <item id="2" active="true" added="1745600000000">
+        <text>離脱率が主因</text>
+        <investigation confidence="high">
+          <verdict>部分的に疑わしい</verdict>
+          <reason>複合要因の可能性</reason>
+        </investigation>
+      </item>
+    </category>
+  </mindmap>
+  <diamond phase="discover">
+    <entry phase="discover" time="1745600000000" />
+    <entry phase="define" time="1745601800000" />
+  </diamond>
+</meeting-companion>
+```
+
+保存される情報:
+
+- **transcript** — 発話テキスト（行単位）
+- **mindmap** — 4カテゴリの全ノード（テキスト、active状態、調査結果込み）
+- **diamond** — ダブルダイアモンドのフェーズ履歴（モード使用時のみ）
+
+### なぜ JSON ではなく XML か
+
+JSONでも良かったが、あえてXMLにした理由がある。
+
+1. **スキーマが自己文書化される**: タグ名と属性名を見れば構造がわかる。`<investigation confidence="high">` は `{"investigation": {"confidence": "high"}}` より意図が明確
+2. **将来的なスキーマバリデーション**: XSDやRelaxNGで厳密な検証ができる
+3. **部分読み込みが容易**: DOMParserで特定のセクションだけ読める
+4. **差分が見やすい**: gitでの差分表示がJSONより読みやすい
+
+### 使い方
+
+ヘッダーの「保存(.mcx)」ボタンでダウンロード、「読込」ボタンで `.mcx` ファイルを選択すると全状態が復元される。議事録もマインドマップも調査結果もそのまま戻るので、録音を再開すれば中断した会議の続きをそのまま分析できる。
+
+---
+
 ## コスト感
 
 Claude Sonnet 4.6 を使った場合の1会議（1時間）あたりの概算:
