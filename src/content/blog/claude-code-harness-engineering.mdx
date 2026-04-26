@@ -299,6 +299,91 @@ PostToolUse の stdout は system message として注入されるため、コ�
 
 ファイルを書き換えるたびに自動で lint が走り、結果が Claude にフィードバックされます。人間が「lint 通ってないよ」と指摘する必要がなくなります。
 
+### 実例 5: ファイル編集後の自動テスト（フィードバック hook）
+
+テスト自動実行を hook で仕込みたいところですが、言語やフレームワークによってコマンドが違うため汎用的な hook にしづらい問題があります。解決策は**プロジェクト側にテストコマンドを置いてもらう**方式です。
+
+```bash
+#!/bin/bash
+# post-edit-feedback.sh
+TEST_SCRIPT="$CLAUDE_PROJECT_DIR/.claude/test-command.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  exit 0
+fi
+
+echo "=== Auto Feedback: running project tests ==="
+OUTPUT=$(bash "$TEST_SCRIPT" 2>&1)
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
+  echo "PASSED"
+  echo "$OUTPUT" | tail -5
+else
+  echo "FAILED (exit code: $EXIT_CODE)"
+  echo "$OUTPUT" | tail -30
+  echo ""
+  echo "Fix the failing tests before making further changes."
+fi
+exit 0
+```
+
+プロジェクト側は `.claude/test-command.sh` に自分のテストコマンドを書くだけです。
+
+```bash
+# Node.js なら
+npm test
+
+# Go なら
+go test ./...
+
+# Rust なら
+cargo test
+```
+
+`.claude/test-command.sh` がなければ何も起きないため、テストがないプロジェクトでも安全に使えます。
+
+### 実例 6: diff サイズ警告
+
+長時間作業していると、変更をコミットせずに溜め込みがちです。未コミットの変更量を監視し、閾値を超えたらコミットを促す hook を入れることで、これを防止できます。
+
+```bash
+#!/bin/bash
+# post-edit-diffsize.sh
+THRESHOLD="${CLAUDE_HARNESS_DIFF_THRESHOLD:-100}"
+
+if [ ! -d "$CLAUDE_PROJECT_DIR/.git" ]; then
+  exit 0
+fi
+
+DIFF_LINES=$(cd "$CLAUDE_PROJECT_DIR" && git diff --stat 2>/dev/null | tail -1 \
+  | grep -oE '[0-9]+ insertion|[0-9]+ deletion' \
+  | grep -oE '[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)
+
+if [ "$DIFF_LINES" -ge "$THRESHOLD" ]; then
+  echo "=== Diff Size Warning ==="
+  echo "Uncommitted changes: ${DIFF_LINES} lines (threshold: ${THRESHOLD})"
+  echo "Consider committing now to create a save point."
+fi
+exit 0
+```
+
+CLAUDE.md に「適度にコミットしろ」と書くだけでなく、**実際の変更量ベースで自動的にリマインド**されるため、確実にコミットの粒度を保てます。
+
+## フィードフォワードとフィードバック
+
+ここまでの Hooks を整理すると、**フィードフォワード（事前制御）**と**フィードバック（事後制御）**の 2 種類に分類できます。
+
+| | フィードフォワード（事前） | フィードバック（事後） |
+|--|---|---|
+| **Hook 層** | PreToolUse: 危険コマンドブロック、機密ファイル保護 | PostToolUse: テスト自動実行、diff サイズ警告、compact 後再注入 |
+| **CLAUDE.md 層** | Critical Rules: 「.env 触るな」「any 型使うな」 | Feedback Protocol: 「変更したらテスト走らせろ」 |
+| **Permission 層** | deny リスト | — |
+
+フィードフォワードは**そもそもミスさせない**仕組みで、フィードバックは**ミスに気づいて直させる**仕組みです。
+
+deny / Hooks で本当にやばい操作だけ事前にブロック（最小限のフィードフォワード）し、それ以外はフィードバックで「やってみて → 確認 → 直す」のループを回すのが実用的な設計です。Claude の強みはテスト結果やエラーメッセージを読んで自己修正できることなので、フィードバック制御に乗っかるほうが自然です。
+
 ## Layer 3: コンテキスト圧縮対策
 
 長時間セッションでは必ずコンテキスト圧縮（コンパクション）が発生します。圧縮されると過去の会話が要約に置き換わるため、細かいニュアンスが失われます。これを見越した対策が必要です。
@@ -408,11 +493,16 @@ Anthropic が 2026 年 2 月に公開した [Measuring AI agent autonomy in prac
 
 Claude Code の長時間自律稼働は `--dangerously-skip-permissions` で雑に全許可するものではありません。
 
-1. **パーミッション** で安全な操作だけ自動承認する
-2. **Hooks** で危険操作をガードし、compact 後にコンテキストを復元する
-3. **CLAUDE.md** で恒久ルールを維持する
+1. **パーミッション** で安全な操作だけ自動承認する（止まらないようにする）
+2. **Hooks（フィードフォワード）** で危険操作をブロックする（壊れないようにする）
+3. **Hooks（フィードバック）** でテスト自動実行・diff サイズ警告する（品質を維持する）
+4. **compact 後 Hook + CLAUDE.md** でコンテキストを復元する（迷子にならないようにする）
 
-この 3 点セットが安定稼働の定石です。ハーネスの設計次第でエージェントの性能が大きく変わる以上、「どのモデルを使うか」よりも「ハーネスをどう設計するか」に投資する方がリターンが大きいと言えます。
+フィードフォワードは最小限に、フィードバックに重心を置くのが実用的です。Claude の強みは結果を見て自己修正できることにあるので、そこに乗っかる設計が最も効果的です。
+
+ハーネスの設計次第でエージェントの性能が大きく変わる以上、「どのモデルを使うか」よりも「ハーネスをどう設計するか」に投資する方がリターンが大きいと言えます。
+
+この記事で紹介した設定は [rikukaInoue/claude-harness](https://github.com/rikukaInoue/claude-harness) で公開しています。
 
 ## 参考リンク
 
