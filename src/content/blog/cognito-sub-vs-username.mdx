@@ -1,0 +1,169 @@
+---
+title: "Cognito の sub と cognito:username は別物 — OIDC連携で踏んだ落とし穴"
+date: 2026-04-26
+tags: ["AWS", "Cognito", "OIDC", "認証", "トラブルシューティング"]
+description: "自前OIDCプロバイダーからCognitoのAdmin APIを呼ぶ際、IDトークンのsubでAdminGetUserを叩くと失敗する。sub と cognito:username の違い、SECRET_HASHの計算対象、ローカル開発でのCognitoエミュレーター選定まで、実際に踏んだ問題を整理。"
+---
+
+自前のOIDCプロバイダー（rellf-auth）をCognito User Poolの上に構築していて、ログインが通らない問題に数時間ハマった。原因は **Cognitoの `sub` と `cognito:username` が別の値である**という仕様を正しく理解していなかったこと。
+
+この記事では、何が起きたか、なぜ起きたか、どう直したかを整理する。
+
+---
+
+## 構成
+
+```
+ブラウザ → rellf-auth (OIDC Provider / Go + Lambda)
+              → Cognito User Pool (認証バックエンド)
+              → IDトークン発行 (RS256署名)
+```
+
+rellf-authはCognitoの `InitiateAuth` でユーザーを認証し、返ってきたIDトークンからユーザー情報を取り出して、自前のOIDC IDトークンを発行する。その過程で `AdminGetUser` を呼んでユーザーのライフサイクル状態（active/suspended/deleted）を検証している。
+
+---
+
+## 問題: ログイン後に「ログインできません」
+
+Cognitoの `InitiateAuth` は成功する。トークンも返ってくる。しかしその直後の `AdminGetUser` が `UserNotFoundException` を返し、ユーザーのライフサイクル検証に失敗する。
+
+```
+InitiateAuth(email, password) → 成功、IDトークン取得
+↓
+IDトークンから sub を取得: "77f4ba88-2081-708c-a806-578cb1ac5752"
+↓
+AdminGetUser(sub) → UserNotFoundException ❌
+↓
+「ログインできません。管理者にお問い合わせください。」
+```
+
+## 原因: sub ≠ cognito:username
+
+CognitoのIDトークンには2つの異なるユーザー識別子が入っている。
+
+```json
+{
+  "sub": "77f4ba88-2081-708c-a806-578cb1ac5752",
+  "cognito:username": "13b99ebb-851c-4401-ba4e-a6aba782f139",
+  "email": "user@example.com"
+}
+```
+
+| フィールド | 値 | 用途 |
+|---|---|---|
+| `sub` | `77f4ba88-...` | OIDC標準のユーザー識別子。**不変**。外部に公開するID |
+| `cognito:username` | `13b99ebb-...` | Cognitoの内部ユーザー名。**Admin APIの識別子** |
+| `email` | `user@example.com` | エイリアス（ログイン時に使う） |
+
+**`AdminGetUser` は `cognito:username` でしか引けない。** `sub` を渡すと `UserNotFoundException` になる。
+
+### なぜ2つあるのか
+
+Cognitoでは、ユーザープール作成時に `alias-attributes email` を設定すると、メールアドレスがログイン用のエイリアスになる。この場合:
+
+- `username` はCognitoが内部で生成するUUID（`cognito:username`）
+- `sub` はOIDC標準に準拠した別のUUID
+
+通常のCognito Hosted UIを使う場合はこの違いを意識する必要がない。しかし **自前のOIDCプロバイダーを構築してAdmin APIを直接呼ぶ場合、この区別が重要になる**。
+
+---
+
+## 修正
+
+IDトークンから `cognito:username` を取得し、Admin API呼び出しにはそちらを使う。
+
+```go
+// Before (broken)
+sub := idToken.Subject()
+h.userUC.ValidateLoginState(ctx, sub)  // ← UserNotFoundException
+
+// After (fixed)
+sub := idToken.Subject()
+cognitoUsername := sub // fallback
+if v, ok := idToken.Get("cognito:username"); ok {
+    if s, ok := v.(string); ok && s != "" {
+        cognitoUsername = s
+    }
+}
+h.userUC.ValidateLoginState(ctx, cognitoUsername)  // ← OK
+```
+
+**原則:**
+- **内部処理**（AdminGetUser, AdminDisableUser 等）→ `cognito:username`
+- **外部公開**（OIDCトークンのsub, userinfo endpoint）→ `sub`
+
+---
+
+## おまけ: SECRET_HASH の計算対象
+
+同時にSECRET_HASHの計算も間違えかけた。
+
+Cognitoのクライアントシークレットが設定されている場合、`InitiateAuth` のリクエストに `SECRET_HASH` を付ける必要がある。計算方法は:
+
+```
+SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
+```
+
+ここで `username` は **`InitiateAuth` の `USERNAME` パラメータに渡す値**。つまり:
+
+- メールエイリアスでログインする場合 → **メールアドレス**で計算
+- UUIDでログインする場合 → **UUID**で計算
+
+```go
+// emailでログインするなら、emailでハッシュ計算
+AuthParameters: map[string]string{
+    "USERNAME":    email,
+    "PASSWORD":    password,
+    "SECRET_HASH": computeSecretHash(email),  // ← emailで計算
+}
+```
+
+当初「`cognito:username`（UUID）で計算すべき」と思って修正したら、逆に壊れた。CognitoはUSERNAMEパラメータに渡した値でハッシュを検証するので、emailを渡すならemailで計算するのが正しい。
+
+---
+
+## おまけ2: ローカル開発のCognitoエミュレーター
+
+この問題のデバッグ中、ローカル開発環境のCognitoエミュレーターも大量の問題を起こしていた。
+
+### LocalStack の Cognito は使い物にならない
+
+LocalStackのCognitoエミュレーションには以下の制限がある:
+
+- `sign-up` で作ったユーザーに対して `InitiateAuth` が通らない
+- `AdminGetUser` が `sub` で引けない（本番Cognitoはエイリアス解決してくれる）
+- メールエイリアスの一意制約 (`--alias-attributes email`) が効かず、同じメールで複数ユーザーが作れる
+- `AdminConfirmSignUp` が `UnsupportedOperation`
+
+### cognito-local に移行して解決
+
+[jagregory/cognito-local](https://github.com/jagregory/cognito-local) に切り替えたところ、以下が正しく動いた:
+
+- `AdminCreateUser` + `AdminSetUserPassword` → `InitiateAuth` のフロー
+- `AdminGetUser` が `sub`（UUID）でもメールでも引ける
+- JWT署名がRS256で正しく生成される
+- `cognito:groups` がトークンに含まれる
+
+```yaml
+# docker-compose.yml
+services:
+  cognito:
+    image: jagregory/cognito-local:latest
+    ports:
+      - "9229:9229"
+```
+
+ただし `sign-up` → `InitiateAuth` のフロー（`USER_PASSWORD_AUTH`）にはまだバグがある（[issue #346](https://github.com/jagregory/cognito-local/issues/346)）ため、ローカルのfixtureユーザーは `AdminCreateUser` + `AdminSetUserPassword` で作成する方式にした。
+
+---
+
+## まとめ
+
+| 落とし穴 | 対処 |
+|---------|------|
+| `sub` で `AdminGetUser` を呼ぶと失敗 | `cognito:username` を使う |
+| SECRET_HASH を UUID で計算 | USERNAME パラメータに渡す値（email）で計算 |
+| LocalStack の Cognito が不完全 | cognito-local に移行 |
+| 同じメールで複数ユーザー作成可能 | アプリ側で重複チェック + cognito-local 使用 |
+
+Cognito + 自前OIDCプロバイダーの組み合わせは、Hosted UIをそのまま使う場合には見えない地雷がいくつかある。特に `sub` vs `cognito:username` の違いはドキュメントで明示されているものの、実際に踏むまで気づきにくい。
