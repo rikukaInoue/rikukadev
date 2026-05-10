@@ -1,0 +1,349 @@
+---
+title: "GoでDDDやるなら「全部に適用しない」が正解だった"
+date: 2026-05-10
+tags: ["Go", "DDD", "アーキテクチャ", "リプレース", "設計"]
+description: "RailsのActiveRecordで育ったコードベースをGoにリプレースする際、DDDをFeature単位で部分適用するアプローチとその判断基準を実例付きで解説する。"
+---
+
+## はじめに
+
+RailsのActiveRecordで育ったコードベースをGoでリプレースすることになった。「せっかくだしDDDで設計し直そう」と意気込んだが、全体にDDDを適用しようとして痛い目を見た話。
+
+結論から言うと、**Feature単位で「リッチにやる / 素朴に書く」を切り替える**のが現実的だった。
+
+## 前提: ActiveRecordの世界
+
+Railsだとモデルがすべてを担う。
+
+```ruby
+class Tweet < ApplicationRecord
+  belongs_to :user
+  has_many :likes
+  has_many :retweets
+
+  validates :body, length: { maximum: 280 }
+
+  scope :visible, -> { where(suspended: false) }
+
+  before_save :check_spam
+  after_create :fanout_to_timeline
+
+  def can_reply?(viewer)
+    # リプライ制御のロジック
+  end
+
+  def promoted?
+    user.advertising_plan.active? && promotion_budget.positive?
+  end
+end
+```
+
+バリデーション、リレーション、永続化フック、ビジネスロジック、クエリスコープ。全部1クラスに同居している。
+
+これをGoに持っていく時に「どこまでドメインモデルとして切り出すか」が問いになる。
+
+## GoでDDDを解釈する
+
+オブジェクト指向のDDDをGoにそのまま持ち込むとツラい。Goにはクラスも継承もない。
+
+代わりに効くのは:
+
+- **unexportedフィールド + コンストラクタ** → 不正状態を作れなくする
+- **パッケージ境界** → 境界づけられたコンテキスト
+- **interface** → 依存の逆転（ドメイン層がインフラを知らない）
+
+つまり「オブジェクトにドメイン知識を閉じ込める」ではなく「**型とパッケージ境界でドメインを守る**」と読み替えるとGoらしくなる。
+
+## どこにDDDを適用するか
+
+Twitterっぽいサービスを考えた時、全部のFeatureが同じ複雑さではない。
+
+| Feature | 複雑さ | ロジック |
+|---------|--------|----------|
+| タイムライン生成 | 高 | フォロー関係×ミュート×ブロック×プロモ×時系列 |
+| ツイートの公開範囲・リプライ制御 | 高 | 公開/非公開×リプライ制限×凍結状態 |
+| プロフィール更新 | 低 | 名前とbioを保存するだけ |
+| メディアアップロード | 低 | S3に投げてURL返すだけ |
+
+**全部にAggregateとRepositoryを用意するのは過剰**。Evans本人もDDDの原典で「コアドメイン」と「サブドメイン」を明確に区別している。設計コストを払うのはCore Domainだけでいい。
+
+## Feature単位で構造を切り替える
+
+```
+internal/
+  shared/
+    user_id.go              # どのFeatureも使う識別子
+    visibility.go           # 公開/非公開/制限付き
+
+  features/
+    timeline/               # 複雑 → ドメインモデルあり
+      domain/
+        feed.go
+        ranking.go
+        filter.go
+        repository.go
+      app/
+        generate_feed.go
+      infra/
+        feed_repo.go
+
+    tweet/                  # 中くらい → 部分的にリッチ
+      domain/
+        tweet.go
+        reply_policy.go
+        repository.go
+      app/
+        post_tweet.go
+      infra/
+        repo.go
+
+    profile/                # 素朴 → sqlc直叩き
+      handler.go
+      update.go
+
+    media/                  # 素朴
+      handler.go
+      upload.go
+```
+
+## 複雑な部分: ツイートの公開範囲制御
+
+ルールが絡み合う場所にはリッチなドメインモデルを置く価値がある。
+
+```go
+package tweet
+
+type Tweet struct {
+    id          TweetID
+    authorID    shared.UserID
+    body        Body
+    visibility  shared.Visibility
+    replyPolicy ReplyPolicy
+    suspended   bool
+}
+
+func Post(author shared.UserID, body string, vis shared.Visibility, policy ReplyPolicy) (*Tweet, error) {
+    b, err := NewBody(body)
+    if err != nil {
+        return nil, err
+    }
+    return &Tweet{
+        id:          NewTweetID(),
+        authorID:    author,
+        body:        b,
+        visibility:  vis,
+        replyPolicy: policy,
+    }, nil
+}
+
+func (t *Tweet) CanView(viewer shared.UserID, isFollower bool) bool {
+    if t.suspended {
+        return false
+    }
+    switch t.visibility {
+    case shared.Public:
+        return true
+    case shared.FollowersOnly:
+        return isFollower || viewer == t.authorID
+    }
+    return false
+}
+
+func (t *Tweet) CanReply(viewer shared.UserID, isFollower bool, isMentioned bool) bool {
+    if !t.CanView(viewer, isFollower) {
+        return false
+    }
+    return t.replyPolicy.Allows(viewer, t.authorID, isFollower, isMentioned)
+}
+```
+
+`CanView` と `CanReply` のロジックがTweet自身に閉じている。「リプライ制限の条件を変えたい」時に触る場所が1箇所で済む。
+
+### Value Object: リプライポリシー
+
+```go
+package tweet
+
+type ReplyPolicy struct {
+    mode ReplyMode
+}
+
+type ReplyMode int
+
+const (
+    ReplyEveryone ReplyMode = iota
+    ReplyFollowersOnly
+    ReplyMentionedOnly
+)
+
+func (p ReplyPolicy) Allows(viewer, author shared.UserID, isFollower, isMentioned bool) bool {
+    if viewer == author {
+        return true
+    }
+    switch p.mode {
+    case ReplyEveryone:
+        return true
+    case ReplyFollowersOnly:
+        return isFollower
+    case ReplyMentionedOnly:
+        return isMentioned
+    }
+    return false
+}
+```
+
+## 素朴な部分: プロフィール更新
+
+ここにAggregateは要らない。
+
+```go
+package profile
+
+func Update(ctx context.Context, q *db.Queries, userID string, input UpdateInput) error {
+    if len([]rune(input.Bio)) > 160 {
+        return errors.New("bioは160文字以内")
+    }
+    return q.UpdateProfile(ctx, db.UpdateProfileParams{
+        UserID:      userID,
+        DisplayName: input.DisplayName,
+        Bio:         input.Bio,
+    })
+}
+```
+
+関数1個。sqlcが生成したクエリを呼ぶだけ。これで十分。
+
+## やりがちな失敗: 貧血ドメインモデル
+
+Clean Architectureの記事を読んで「層を分ければDDD」と思うとこうなる:
+
+```go
+// ❌ Entity がただの箱
+type Tweet struct {
+    ID         string
+    Body       string
+    Visibility string
+    Suspended  bool
+}
+
+// UseCase にロジックが漏れる
+func (uc *PostTweetUseCase) Execute(ctx context.Context, input PostInput) error {
+    if len(input.Body) > 280 { ... }
+    if input.Visibility == "followers" { ... }
+    tweet := &Tweet{Body: input.Body, ...}
+    return uc.repo.Save(ctx, tweet)
+}
+```
+
+interfaceとディレクトリ構造だけ立派で、Entityはpublicフィールドのstruct。どこからでも直接書き換えられるし、同じチェックが複数のUseCaseに散らばる。
+
+**構造のコストだけ払って、ドメイン保護ゼロ**。
+
+やるならEntityにルールを閉じ込める。やらないならTransaction Scriptで素直に書く。中途半端が一番コスパが悪い。
+
+## Value Object: プリミティブ型を卒業する
+
+```go
+// ❌ stringのまま — 空文字も1000文字も入る
+type Tweet struct {
+    Body string
+}
+
+// ✅ Value Object — 作れた時点で正しい
+type Body struct {
+    value string
+}
+
+func NewBody(s string) (Body, error) {
+    if s == "" {
+        return Body{}, errors.New("本文は必須")
+    }
+    if len([]rune(s)) > 280 {
+        return Body{}, errors.New("280文字以内")
+    }
+    return Body{value: s}, nil
+}
+```
+
+Value Objectは「存在すれば正しい」ことを保証する。以降どこに渡しても再バリデーション不要になる。
+
+## Repositoryの齟齬問題と対策
+
+ドメインモデルとDBテーブルを分離すると、Aggregateにフィールド追加した時にRepositoryの更新を忘れるリスクがある。コンパイラが教えてくれない。
+
+### 対策1: Reconstitute関数で引数を強制する
+
+```go
+func Reconstitute(
+    id TweetID,
+    author shared.UserID,
+    body Body,
+    vis shared.Visibility,
+    policy ReplyPolicy,
+    suspended bool,
+) *Tweet {
+    return &Tweet{
+        id: id, authorID: author, body: body,
+        visibility: vis, replyPolicy: policy, suspended: suspended,
+    }
+}
+```
+
+フィールド追加 → 引数追加 → Repository側がコンパイルエラー。これで気づける。
+
+### 対策2: ラウンドトリップテスト
+
+```go
+func TestTweetRepo_RoundTrip(t *testing.T) {
+    original := tweet.Reconstitute(id, author, body, vis, policy, false)
+    repo.Save(ctx, original)
+    restored, _ := repo.FindByID(ctx, id)
+    assert.Equal(t, original, restored)
+}
+```
+
+Save → FindByID の往復で全フィールドの一致を検証する。齟齬があれば即発覚。
+
+素朴にsqlcで書いてる部分にはこの問題が存在しない。これもDDDを全体に適用しない理由の一つ。
+
+## sharedパッケージの管理
+
+Feature横断で使う概念だけ置く。
+
+```go
+// shared/user_id.go
+type UserID struct{ value string }
+
+// shared/visibility.go
+type Visibility int
+
+const (
+    Public Visibility = iota
+    FollowersOnly
+    Private
+)
+```
+
+**肥大化したら疑う**。import元が1つのFeatureだけなら、そのFeature内に戻す。sharedが大きい = Feature間の結合が強い、というシグナル。
+
+## Railsから剥がす手順
+
+1. **Railsモデルのメソッドを仕分ける**
+   - `before_save` / `after_save` → Repositoryかコンストラクタへ
+   - `scope` → Read Model / Query Serviceへ
+   - ビジネスロジック (`can_xxx?`, `promoted?`) → Aggregateメソッドへ
+   - 表示用 (`display_name`, `formatted_xxx`) → Presenterへ
+
+2. **そのFeatureにリッチなモデルが要るか判断する**
+   - ルールが複雑 & 変更頻度が高い & 間違えた時のダメージが大きい → DDD
+   - それ以外 → 素朴に
+
+3. **DBスキーマはそのまま維持する**。ドメインモデルの形とテーブルの形が違ってもRepositoryが翻訳する。
+
+## まとめ
+
+- DDDは「アーキテクチャ全体に適用するフレームワーク」ではない
+- 複雑なFeatureにだけリッチなドメインモデルを適用し、残りは素朴に書く
+- Goでは「unexportedフィールド + コンストラクタ + パッケージ境界」がドメイン保護の手段
+- 層を分けるだけでEntityが貧血なら、構造のコストだけ背負ってドメイン保護ゼロになる
+- ActiveRecordから剥がす時は「ルールが絡み合ってる場所」を見つけて、そこだけ丁寧にやる
