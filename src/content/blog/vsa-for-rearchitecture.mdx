@@ -1,0 +1,254 @@
+---
+title: "既存システムから機能を剥がすならVSAが速い — リアーキテクチャ視点で各アーキテクチャを比較する"
+date: 2026-05-15
+tags: ["アーキテクチャ", "VSA", "DDD", "リアーキテクチャ", "Strangler Fig", "Go"]
+description: "Layered・Clean・Hexagonal・DDD・VSA・PbF+部分DDDをリアーキテクチャ視点で比較し、Strangler Figパターンとの相性からVSAが強い理由と、段階的移行の現実解を整理する。"
+---
+
+## はじめに
+
+レガシーなRailsモノリスやSpring Bootの大きなコードベースから機能を切り出す仕事をやっていると、新規プロジェクトで議論されるアーキテクチャ論とは別の景色が見えてくる。
+
+「Clean Architectureで書き直そう」と意気込んでも、既存コードと並走させた瞬間に層の境界がぐちゃぐちゃになる。Hexagonalで綺麗にポートを定義しても、剥がしたい機能が既存のActiveRecordを参照しまくっていて手が動かなくなる。
+
+そういう文脈で **Vertical Slice Architecture (VSA)** が選ばれる場面が増えている。新規開発での評判はそこまで高くないが、**「動いてる既存システムから機能を剥がす」** という制約下ではかなり強い。
+
+この記事では、リアーキ視点で各アーキテクチャを並べて、なぜVSAがstranglerに向いているのかを整理する。
+
+## 比較対象
+
+- Layered Architecture (Controller/Service/Repository)
+- Clean Architecture (Robert Martin)
+- Hexagonal Architecture (Ports & Adapters)
+- DDD (戦術設計フル適用)
+- Vertical Slice Architecture (Jimmy Bogard)
+- Package by Feature + 部分DDD ([前回記事](/blog/go-ddd-partial-application)のアプローチ)
+
+## 各アーキテクチャの構造
+
+### Layered Architecture
+
+```
+app/
+  controllers/
+    tweet_controller.go
+    profile_controller.go
+  services/
+    tweet_service.go
+    profile_service.go
+  repositories/
+    tweet_repository.go
+    profile_repository.go
+```
+
+水平に切る。直感的だが、機能変更でファイルを横断する。
+
+### Clean Architecture
+
+```
+internal/
+  entities/
+    tweet.go
+  usecases/
+    post_tweet.go
+  interface_adapters/
+    controllers/
+    presenters/
+  frameworks/
+    db/
+    web/
+```
+
+依存方向を内向きに固定する。テストしやすいが、構造のオーバーヘッドが大きい。
+
+### Hexagonal Architecture
+
+```
+internal/
+  domain/
+    tweet.go
+  ports/
+    tweet_repository.go  # interface
+  adapters/
+    primary/   # 入口（HTTP、gRPC）
+    secondary/ # 出口（DB、外部API）
+```
+
+ドメインを中心に置き、外界はadapterで翻訳する。Cleanと似ているが「ポート」の概念がより素直。
+
+### DDD (フル適用)
+
+```
+internal/
+  context_a/
+    domain/
+      aggregate/
+      value_object/
+      domain_service/
+    application/
+    infrastructure/
+  context_b/
+    ...
+```
+
+Bounded Contextごとに独立。重厚で、ドメインが本当に複雑な場合にしか元が取れない。
+
+### VSA
+
+```
+internal/
+  features/
+    post_tweet/
+      handler.go
+      validator.go
+      command.go
+    delete_tweet/
+      handler.go
+    get_timeline/
+      handler.go
+      query.go
+```
+
+**ユースケース単位**で縦に切る。各sliceは独立、内部構造は自由。CQRSと自然に合わさる。
+
+### Package by Feature + 部分DDD
+
+```
+internal/
+  features/
+    tweet/        # 中複雑度
+      domain/
+      app/
+      infra/
+    profile/      # 低複雑度
+      handler.go
+      update.go
+```
+
+Bounded Contextに近い粒度のFeature単位で切り、内部構造は複雑さに応じて変える。
+
+## 比較表
+
+| 観点 | Layered | Clean | Hexagonal | DDD | VSA | PbF+部分DDD |
+|---|---|---|---|---|---|---|
+| 学習コスト | 低 | 高 | 中 | 高 | 低 | 中 |
+| 削除容易性 | × | △ | △ | △ | ◎ | ◯ |
+| トランザクション境界 | 曖昧 | 曖昧 | 明確 | 明確(集約) | 明確(リクエスト) | 明確 |
+| 既存システムとの並走 | × | △ | ◯ | × | ◎ | ◯ |
+| Strangler Figとの相性 | × | △ | ◯ | × | ◎ | ◯ |
+| ロジックの所在 | Service | UseCase | Domain | Aggregate | Handler | 場所により |
+| 重複の発生 | 少 | 少 | 少 | 少 | 多 | 中 |
+| ドメインの一覧性 | ◯ | ◎ | ◎ | ◎ | × | △ |
+
+## なぜVSAがリアーキで強いのか
+
+### 1. Strangler Figとの相性
+
+Martin Fowlerの strangler fig pattern は、既存システムの周りに新しいシステムを「絡みつかせて」徐々に置き換える手法。VSAとの相性が圧倒的に良い。
+
+理由はシンプルで、**新sliceの追加が既存コードに一切触らない**から。
+
+```
+                [Reverse Proxy]
+                       ↓
+[POST /api/v2/tweets]  → [新Goアプリ: post_tweet slice]
+[GET  /api/v1/tweets]  → [既存Rails]
+[POST /api/v2/notify]  → [新Goアプリ: notify slice]
+```
+
+新エンドポイントを新言語で書く時、VSAなら「post\_tweet」というディレクトリを1個切るだけ。既存のドメインモデルもUseCase層も骨格を組む必要がない。
+
+Clean ArchitectureやDDDだと、最初にEntity・Repository・UseCase・interfaceの骨格を作るコストが先払いになる。1機能だけ動かすのに割に合わない。
+
+### 2. 削除コストがほぼゼロ
+
+書いた機能を消すことになった時、sliceディレクトリごと削除で終わる。
+
+これはレガシー剥がしの過程で「やっぱり要らなかった」「設計を変える」が頻繁に起きる現実を考えると重要。Cleanで剥がしたものを消すには、Entity・UseCase・Adapter・interface参照を辿って削除しないといけない。試行錯誤のコストが桁違いになる。
+
+### 3. チーム分割が物理的に強制される
+
+「決済チームは `features/payment/` 配下だけ触る」「通知チームは `features/notification/` 配下だけ触る」が自然に成立する。
+
+レガシー剥がしを複数チームで並行で走らせる時、コンフリクトが起きにくい。これが共通のドメインレイヤーを持つアーキテクチャだと、Entity1個の変更で複数チームに影響が出る。
+
+### 4. 認知負荷の局所化
+
+新メンバーが「post\_tweetを直したい」と思ったら、`features/post_tweet/` だけ読めば仕事ができる。
+
+Cleanだと `PostTweetUseCase → TweetRepository (interface) → TweetRepositoryImpl → Tweet Entity → DB接続` と辿る必要があり、ファイル5〜6個を頭に乗せないと変更できない。
+
+### 5. CQRSと自然に合わさる
+
+書き込みと読み取りでデータ構造が違うのは普通。VSAだと:
+
+```
+features/
+  post_tweet/        # Write側: ドメインモデルあり、不変条件を守る
+    command.go
+    handler.go
+    domain.go
+  get_timeline/      # Read側: SQLでJOINしてJSONに詰めるだけ
+    query.go
+    handler.go
+```
+
+Read sliceとWrite sliceで全く違う書き方をしても誰も困らない。リアーキで「読み取り系だけ先に剥がしてキャッシュ前段にする」みたいな段階的移行とも噛み合う。
+
+## VSAの弱点
+
+公平のために弱点も挙げる。
+
+### 1. 重複が増える
+
+同じバリデーションが複数sliceに書かれる。リプライ制御のロジックが `post_tweet` と `edit_tweet` で重複する、みたいなことが起きる。
+
+VSAの立場としては **「3回重複するまで抽象化しない」(Rule of Three)** が基本姿勢。早すぎる抽象化を避ける思想だが、これに耐えられないチームには合わない。
+
+### 2. ドメイン横断ルールの置き場所
+
+「ツイートの本文は280文字以内」は全sliceに書くのか、共通化するのか。共通化するなら結局 `shared/` が必要になり、ここがDDD的なドメインモデルに育っていく。
+
+→ これが **「VSA + 部分DDD」のハイブリッド** が現実解になる理由。コアドメインのルールは共通モジュールに抽出し、各sliceはそれを使う。前回記事のFeature-based構成は、ある意味で「VSAを粒度大きめにして共通ドメインを許容したもの」とも読める。
+
+### 3. ドメインの一覧性が悪い
+
+「このシステムのEntityは何か」がパッと見えない。Cleanなら `entities/` を見れば一覧できるが、VSAだと各sliceに散る。
+
+新規開発で腰を据えてドメインを設計したい場合は致命傷になることもある。逆に既存システムにドキュメント化されたドメインモデルが既にあるなら、それを参照しながらsliceを書けばいいので問題が薄まる。
+
+### 4. 集約をまたぐトランザクション
+
+VSAは「リクエスト単位」が基本なので、複数Aggregateにまたがるトランザクションをどう扱うかが曖昧になりやすい。明示的にUnit of Workを入れるか、handler内でトランザクション境界を引くかの判断が要る。
+
+## 使い分けの結論
+
+| 状況 | おすすめ |
+|---|---|
+| ゼロからの新規SaaS、ドメインが複雑 | DDD or Clean |
+| ゼロからの新規SaaS、ドメインが単純 | Layered or VSA |
+| **レガシー剥がし (Strangler)** | **VSA** |
+| マイクロサービス切り出し前段階 | **VSA** |
+| 安定運用中、機能追加メイン | PbF + 部分DDD |
+| プロトタイプ・MVP | VSA or Layered |
+
+リアーキで一番怖いのは「綺麗に作ろうとして手が動かなくなる」こと。VSAは **構造の判断を後回しにできる** ので、動かしながら正しい構造を見つけていける。これがリアーキ文脈で重宝される最大の理由だと思う。
+
+## 段階的移行のすすめ
+
+実プロジェクトでよくあるパターン:
+
+1. **初期 (剥がし開始)**: 純粋なVSA。とにかくsliceを増やす。重複歓迎。
+1. **中期 (3〜5機能剥がれた)**: 重複が3箇所以上見えてきたものを `shared/` に抽出。Value Objectや共通の不変条件が育ち始める。
+1. **後期 (主要機能が剥がれた)**: 関連の強いsliceをBounded Context単位でまとめる。前回記事の「PbF + 部分DDD」に近づく。
+
+最初からPbFやDDDで始めようとすると、剥がす機能の境界を決める前に構造を決めることになって、後で大幅にリファクタする羽目になる。VSAから始めて、**剥がし切ったあとに構造を整理する** のがリスクが低い。
+
+## まとめ
+
+- VSAはリアーキ・strangler用途で圧倒的に強い
+- 最大の利点は「新sliceの追加が既存コードに触らない」こと
+- 削除コストが極めて低く、試行錯誤しやすい
+- 弱点は重複の発生とドメインモデルの一覧性
+- 安定運用フェーズに入ったら、PbF + 部分DDDのようなハイブリッドに移行する選択肢もある
+- 大事なのは段階的アプローチ — リアーキ初期はVSA、慣性が見えたら整理する
