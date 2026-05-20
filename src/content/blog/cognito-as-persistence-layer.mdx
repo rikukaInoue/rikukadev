@@ -1,0 +1,233 @@
+---
+title: "Cognitoを永続化層として割り切る — 認証基盤の差し替え可能性を設計する"
+date: 2026-05-21
+tags: ["Go", "AWS", "Cognito", "アーキテクチャ", "リファクタリング", "認証"]
+description: "自前OIDCプロバイダーを持つGo認証サービスで、Cognitoへの依存を永続化層として抽象化した。全経路のJWT発行を自前に統一し、usecase層にCredentialStore/ProviderStore/UserRepository interfaceを切ることで、Cognitoを透過的に差し替え可能にするまでの設計と実装の記録。"
+---
+
+## 背景
+
+Go + Lambda + Cognito で構築した認証サービス (rellf-auth) がある。このサービスは Cognito をユーザーストアとして使いつつ、自前の OIDC プロバイダーも実装している。つまりトークン発行経路が2本ある:
+
+| 経路 | 発行元 | 消費者 |
+|---|---|---|
+| `POST /auth/login` | Cognito JWT | フロントエンド |
+| `POST /oidc/token` | 自前 JWT (RSA署名) | 外部 Relying Party |
+| `POST /admin/login` | Cognito JWT (cookie) | Admin UI |
+
+将来的にユーザーストアをコスト面等の理由で載せ替える可能性があるため、Cognito への依存を抽象化して差し替え可能にしたい。
+
+## 「永続化層として割り切る」とは
+
+Cognito は認証エンジン + ユーザーストア + メール送信を兼ねたフルマネージドサービスだが、自前 OIDC プロバイダーが既にある以上、Cognito が担うべき責務は:
+
+- **ユーザー CRUD** — 作成、取得、一覧、削除、有効化/無効化
+- **パスワード検証** — メール + パスワードで認証し、ユーザーの identity を返す
+- **メール送信** — 確認コード、パスワードリセットコード（Cognito の副作用として実行）
+- **外部プロバイダーリンク** — Google 等の連携
+
+トークン発行は Cognito の仕事ではなく、自前 OIDC プロバイダーの仕事。Cognito JWT を外部に露出する理由がない。
+
+## Step 1: JWT 発行の統一
+
+まず全経路のトークン発行を自前 OIDC に統一した。
+
+### AuthUseCase の導入
+
+Cognito の `InitiateAuth` は `AuthTokens` (access + id + refresh) を返す。この中の ID トークンをパースして identity を取り出すのがこれまで各 handler にベタ書きされていた。これを `AuthUseCase.Authenticate` に局所化する。
+
+```go
+type CredentialVerifier interface {
+    LoginIDToken(ctx context.Context, email, password string) (idTokenRaw string, err error)
+}
+
+type AuthUseCase struct {
+    verifier CredentialVerifier
+}
+
+func (uc *AuthUseCase) Authenticate(ctx context.Context, email, password string) (*domain.AuthenticatedUser, error) {
+    idTokenRaw, err := uc.verifier.LoginIDToken(ctx, email, password)
+    if err != nil {
+        return nil, err
+    }
+    return uc.parseIdentity(idTokenRaw)
+}
+```
+
+`parseIdentity` は Cognito ID トークンの `cognito:username` や `cognito:groups` といった固有の claim 名を解釈し、ドメイン型に変換する。Cognito の語彙がここに閉じ込められる。
+
+### 各 handler の変更
+
+```go
+// Before: Cognito JWT をそのまま返す
+tokens, err := h.auth.Login(ctx, email, password)
+c.JSON(http.StatusOK, tokens)
+
+// After: AuthUseCase で認証 → 自前 TokenIssuer で JWT 発行
+user, err := h.authUC.Authenticate(ctx, email, password)
+idToken, _ := h.issuer.SignIDToken(user.Sub, user.Email, user.Groups, ...)
+accessToken, _ := h.issuer.SignAccessToken(user.Sub, scopes, ...)
+c.JSON(http.StatusOK, AuthTokensResponse{...})
+```
+
+同じパターンを `/auth/login`, `/auth/oauth/callback`, `/admin/login`, `/oidc/authorize` の全4経路に適用。
+
+### JWT middleware の統一
+
+JWT 検証の middleware も Cognito の JWKS URL から自前の JWKS に変更。
+
+```go
+// Before: Cognito の JWKS をフェッチしてキャッシュ
+jwtMw, _ = middleware.NewJWTMiddleware(region, poolID, clientID)
+
+// After: TokenIssuer の公開鍵を直接渡す
+jwtMw = middleware.NewJWTMiddleware(tokenIssuer.JWKS(), oidcIssuer, clientID)
+```
+
+admin cookie の middleware も `cognito:groups` ではなく `groups` claim を見るように変更。
+
+## Step 2: 永続化層の抽象化
+
+JWT 統一後、Cognito が内部的にだけ使われるようになったので、残りの依存を interface で切る。
+
+### ドメイン型の導入
+
+Cognito 固有の型 (`cognito.SignUpOutput`, `cognito.LinkedProvider`) をドメイン層に移す。
+
+```go
+// domain/auth.go
+type SignUpResult struct {
+    UserConfirmed bool
+    UserSub       string
+}
+
+type LinkedProvider struct {
+    ProviderName string
+    ProviderUID  string
+}
+
+type AuthenticatedUser struct {
+    Sub      string
+    Email    string
+    Username string
+    Groups   []string
+}
+```
+
+### Interface 設計
+
+usecase 層に3つの interface を定義:
+
+```go
+// CredentialStore: ユーザー登録 + パスワード認証 + パスワードリセット
+type CredentialStore interface {
+    CredentialVerifier  // LoginIDToken
+    SignUp(ctx context.Context, email, password string) (*domain.SignUpResult, error)
+    ConfirmSignUp(ctx context.Context, email, code string) error
+    ForgotPassword(ctx context.Context, email string) error
+    ConfirmForgotPassword(ctx context.Context, email, code, newPassword string) error
+}
+
+// ProviderStore: 外部プロバイダーリンク
+type ProviderStore interface {
+    LinkProvider(ctx context.Context, username, providerName, providerUID string) error
+    UnlinkProvider(ctx context.Context, username, providerName, providerUID string) error
+    GetLinkedProviders(ctx context.Context, username string) ([]domain.LinkedProvider, error)
+}
+
+// UserRepository: ユーザー CRUD + ライフサイクル (admin 操作)
+type UserRepository interface {
+    GetUser(ctx context.Context, username string) (*UserDetail, error)
+    ListUsers(ctx context.Context, filter string, limit int32, token *string) (*UserListResult, error)
+    CreateUser(ctx context.Context, email, tempPassword string) (*UserDetail, error)
+    ConfirmUser(ctx context.Context, username string) error
+    ResetPassword(ctx context.Context, username string) error
+    DisableUser(ctx context.Context, username string) error
+    EnableUser(ctx context.Context, username string) error
+    DeleteUser(ctx context.Context, username string) error
+}
+```
+
+### Cognito Client の adapter
+
+`cognito.Client` がこれらの interface を暗黙的に満たすようにラッパーメソッドを追加:
+
+- `CredentialStore`: 既存メソッドの戻り値をドメイン型に変更するだけ
+- `ProviderStore`: 同上
+- `UserRepository`: `AdminGetUser` → `GetUser`, `AdminListUsers` → `ListUsers` 等のラッパーを追加し、内部で Admin API を呼んで型変換
+
+```go
+// cognito/user_repository.go
+func (c *Client) GetUser(ctx context.Context, username string) (*usecase.UserDetail, error) {
+    d, err := c.AdminGetUser(ctx, username)
+    if err != nil {
+        return nil, err
+    }
+    return &usecase.UserDetail{
+        Username: d.Username,
+        Email:    d.Email,
+        Status:   d.Status,
+        // ...
+    }, nil
+}
+```
+
+### Handler の依存変更
+
+```go
+// Before
+type Handler struct {
+    auth cognito.Service
+    cfg  *config.Config
+}
+
+// After
+type Handler struct {
+    creds     usecase.CredentialStore
+    providers usecase.ProviderStore
+    authUC    *usecase.AuthUseCase
+    issuer    *oidc.TokenIssuer
+    cfg       *config.Config
+}
+```
+
+## 結果
+
+### 依存方向
+
+```
+cmd/ (wire-up)
+  ↓
+cognito.Client ──implements──→ usecase.CredentialStore
+                               usecase.ProviderStore
+                               usecase.UserRepository
+
+handler/  → usecase interfaces のみ
+admin/    → usecase interfaces のみ
+oidc/     → usecase interfaces のみ
+usecase/  → domain/ のみ
+```
+
+`internal/` 配下から `cognito` パッケージの import がゼロになった。
+
+### 差し替えの実際
+
+将来 DynamoDB + argon2 に差し替える場合:
+
+1. `internal/dynamodb/` パッケージを作り、`usecase.UserRepository` + `usecase.CredentialStore` を実装
+2. `cmd/` の wire-up で `cognito.Client` の代わりに渡す
+
+既存のビジネスロジック、ドメインモデル、handler、OIDC プロバイダーには一切触らない。
+
+### トレードオフ
+
+- **Cognito の OAuth フェデレーション** (`/auth/oauth/callback` の code exchange) はまだ Cognito の token endpoint を直接叩いている。これは Cognito 固有のフローなので、差し替え時には Google OAuth を直接実装する形になる
+- **Lambda Trigger** (Pre-signup, Custom Message) は Cognito 固有のイベント駆動。差し替え時は Trigger 自体が不要になる
+- **Refresh Token** は自前 JWT で未実装。Cognito JWT を返していた時は Cognito が発行していた
+
+## まとめ
+
+- Cognito を「認証エンジン」ではなく「永続化層」として割り切ると、設計がシンプルになる
+- 自前 OIDC プロバイダーがある場合、JWT 発行を自前に統一するのが差し替え可能性の第一歩
+- usecase 層に interface を切り、ドメイン型を戻り値に使うことで、Go の暗黙的 interface satisfaction で既存実装を壊さずに抽象化できる
+- `internal/` から特定のインフラパッケージの import を消すことが、依存方向の正しさの客観的な指標になる
