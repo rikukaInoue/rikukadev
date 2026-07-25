@@ -20,6 +20,28 @@ GrowthBook はセルフホストも簡単で、`growthbook/growthbook` + MongoDB
 
 ## SSR 統合の設計
 
+全体のリクエストフローを図にするとこうなる。
+
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant S as React Router (SSR)
+    participant GB as GrowthBook CDN
+    participant GA as GA4
+
+    B->>S: GET / (Cookie: gb_anon_id?)
+    opt 初回訪問
+        S->>S: UUID 発行 → Set-Cookie
+    end
+    S->>GB: SDK ペイロード取得(30秒キャッシュ)
+    GB-->>S: features JSON
+    S->>S: バリアント評価 → HTML 描画
+    S-->>B: 確定済み HTML + payload + attributes
+    B->>B: 同一条件でハイドレート(ちらつきなし)
+    B->>GA: experiment_viewed(露出)
+    B->>GA: demo_cta_click(メトリクス)
+```
+
 ポイントは 3 つある。
 
 ### 1. feature 定義はサーバーで取得してプロセス内キャッシュ
@@ -129,6 +151,19 @@ trackingCallback: (experiment, result) => {
 ```
 
 設計判断が 1 つ: 露出はサーバー評価時とハイドレーション時の両方で発生するが、**送信はブラウザ側だけ**にした。両方から送ると 1 ページビューが 2 露出になる。ハイドレーションで必ず同じ評価が走るので、ブラウザ側だけで取りこぼしはない。gtag のインラインスタブは head で先に定義されるため、ライブラリのロード完了前でも dataLayer にキューされる。
+
+計測データが実験結果になるまでのパイプラインの全体像はこう。
+
+```mermaid
+flowchart LR
+    A["ブラウザ<br/>gtag"] -->|"experiment_viewed<br/>demo_cta_click"| B["GA4"]
+    B -->|"日次エクスポート<br/>(最大24h遅延)"| C["BigQuery<br/>analytics_*"]
+    C -->|"サービスアカウントで読取"| D["GrowthBook<br/>実験結果分析"]
+    style C stroke-dasharray: 5 5
+    style D stroke-dasharray: 5 5
+```
+
+点線部分(BigQuery 以降)が本記事執筆時点で未完の部分。初回エクスポートのラグ待ちで、これは続編で扱う。
 
 ## REST API で実験を作る
 
