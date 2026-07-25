@@ -211,6 +211,18 @@ const rawBody = post.body ?? "";
         margin: 2rem 0;
       }
 
+      /* rehype-mermaid が生成する inline SVG。ダーク背景では既定テーマの
+         文字が読めないため、明るい背景を敷く */
+      .prose :global(svg[id^='mermaid']) {
+        display: block;
+        background: #f8fafc;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 1rem;
+        margin: 1.5rem 0;
+        box-sizing: border-box;
+      }
+
       .back-link {
         display: block;
         max-width: 960px;
