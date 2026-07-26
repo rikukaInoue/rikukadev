@@ -1,0 +1,291 @@
+---
+title: "逆引き VWO → GrowthBook — ユースケース別の置き換え方"
+date: 2026-07-27
+tags: ["GrowthBook", "VWO", "ABテスト", "SEO", "計測"]
+description: "VWOでやっていた操作を起点に、GrowthBookでの同等のやり方を逆引き形式でまとめる。アーキテクチャの違いから、ビジュアル編集・ゴール設定・相互排他・SEOテストまで。"
+---
+
+## はじめに
+
+VWO から GrowthBook への移行を検討しています。移行で一番つまずくのは「VWO でやっていたあの操作、GrowthBook ではどこから触るのか」が分からないことです。両者は思想が違うため、機能が 1:1 で対応していません。
+
+この記事では **VWO でのユースケースを起点に、GrowthBook での同等のやり方を逆引き**でまとめます。
+
+## 前提: アーキテクチャの違い
+
+個々のユースケースの前に、全体像の違いを押さえておきます。ここを理解すると逆引きの大半は自然に導けます。
+
+```
+VWO（オールインワン型）
+
+  ブラウザ ── SmartCode ──> VWO サーバー
+                              ├─ 割当
+                              ├─ 計測（独自トラッキング）
+                              └─ レポート
+
+GrowthBook（ウェアハウスネイティブ型）
+
+  ブラウザ/サーバー ── SDK ──> GrowthBook（割当ルール配信のみ）
+        │
+        └─ 露出イベント ──> GA4 ──> BigQuery <── GrowthBook が読みに来る
+                                       ↑
+                          行動データ（CV、PV など）も同じ場所
+```
+
+| 観点 | VWO | GrowthBook |
+|------|-----|-----------|
+| 割当 | VWO サーバー | SDK がローカルでハッシュ計算 |
+| 計測 | 独自スニペットが自動収集 | **自分で** GA4 等に送る |
+| 指標 | UI でゴール設定 | ウェアハウス上に SQL で定義 |
+| レポート | VWO 内で完結 | BigQuery に対してクエリ |
+| 課金 | MTU（トラッキングユーザー数） | シート数（Cloud）/ 無料（OSS） |
+
+GrowthBook は**ユーザー行動を一切計測しない**、というのが最大のポイントです。割当ルールの配信と統計分析だけを担当し、データは自社のウェアハウスにあるものを使います。GA4 → BigQuery のリンクが移行の前提になるのはこのためです。
+
+## 逆引き: ユースケース別対応表
+
+まず一覧です。各項目は後述します。
+
+| VWO でやっていたこと | GrowthBook では |
+|---------------------|----------------|
+| ビジュアルエディタで A/B テスト | Visual Editor（Cloud は Pro プラン） |
+| スプリット URL テスト | URL Redirects 実験タイプ |
+| ゴール（クリック / CV）設定 | Metrics + Fact Tables（BQ 上に定義） |
+| オーディエンスターゲティング | Attributes + 条件式 + Saved Groups |
+| 相互排他グループ | Namespaces |
+| 割当の固定（一貫した体験） | Sticky Bucketing |
+| プレビュー / QA モード | Force Variation・DevTools・Archetypes |
+| anti-flicker スニペット | SSR / Edge SDK で構成的に解決 |
+| 段階的な公開 | Feature flag の Rollout ルール |
+| ヒートマップ・録画 | **無い**（Clarity 等を併用） |
+| SmartStats で結果を読む | ベイジアン統計（既定）+ SRM 自動チェック |
+
+## ビジュアルエディタで A/B テスト
+
+**VWO**: エディタで要素を書き換えてバリエーションを作る。
+
+**GrowthBook**: Experiment 作成時に実装タイプを選びます。
+
+```
+Experiment 作成
+  ├─ Feature Flag     … コードで出し分け（推奨）
+  ├─ Visual Editor    … ノーコードで DOM 書き換え
+  └─ URL Redirects    … 別 URL へ振り分け
+```
+
+Visual Editor は存在しますが、GrowthBook Cloud では Pro プラン機能です。また VWO のエディタほど多機能ではないため、複雑な変更はコード実装（Feature flag）に寄せるのが現実的です。
+
+逆に言うと、GrowthBook の主戦場は Feature flag です。バリエーションをコードで書く運用に慣れると、デザイナー・エンジニア間のレビューが Git に乗るので、長期的にはこちらの方が管理しやすいと感じています。
+
+```tsx
+const gb = useGrowthBook();
+const variant = gb.getFeatureValue("hero-copy", "control");
+
+return variant === "benefit-first"
+  ? <HeroBenefit />
+  : <HeroDefault />;
+```
+
+## スプリット URL テスト
+
+**VWO**: Split URL テストで別ページに振り分け。
+
+**GrowthBook**: URL Redirects 実験タイプ（これも Cloud では Pro）。
+
+SEO 対象ページで使う場合の注意は VWO 時代と同じです。
+
+- リダイレクトは **302**（301 にすると恒久移転と解釈される）
+- バリエーション先ページの canonical はオリジナルに向ける
+- Googlebot を特別扱いしない（クローキング判定を避ける）
+
+## ゴール設定（クリック / CV 計測）
+
+ここが移行で一番作業量が大きい部分です。
+
+**VWO**: UI でクリックゴールやページ到達ゴールをポチポチ設定。VWO のスニペットが勝手に計測。
+
+**GrowthBook**: 計測は GrowthBook の仕事ではありません。2 つの作業に分解されます。
+
+1. **イベントを自分で送る** — クリックや CV は GA4 のイベントとして実装する（既に GA4 で計測しているなら追加作業なし）
+2. **Metric として定義する** — BigQuery 上のイベントを SQL または Fact Table で指標化する
+
+```sql
+-- 例: 購入完了 Metric（GA4 エクスポートテーブル）
+SELECT
+  user_pseudo_id AS user_id,
+  TIMESTAMP_MICROS(event_timestamp) AS timestamp
+FROM `project.analytics_XXXX.events_*`
+WHERE event_name = 'purchase'
+```
+
+一度定義した Metric は全実験で使い回せます。VWO のように実験ごとにゴールを設定し直す必要がないので、指標の定義が組織で統一されるという利点もあります。
+
+もう 1 つ必須なのが**露出イベント**です。「このユーザーはこの実験のこのバリエーションを見た」という記録を SDK の `trackingCallback` から GA4 に送ります。
+
+```js
+const gb = new GrowthBook({
+  apiHost: "https://cdn.growthbook.io",
+  clientKey: "sdk-xxxx",
+  attributes: { id: userId },
+  trackingCallback: (experiment, result) => {
+    gtag("event", "experiment_viewed", {
+      experiment_id: experiment.key,
+      variation_id: result.key,
+    });
+  },
+});
+```
+
+これが BigQuery に届いていることを確認するツールが SDK Configuration → **Exposures Debugger** です。移行時の疎通確認はここを見ます。
+
+## オーディエンスターゲティング
+
+**VWO**: オーディエンス条件（新規/リピーター、流入元、デバイスなど）を UI で選択。VWO が自動で判定。
+
+**GrowthBook**: **属性は自分で渡す**方式です。SDK 初期化時に渡した Attributes に対して条件式を書きます。
+
+```js
+attributes: {
+  id: userId,
+  deviceType: "mobile",
+  loggedIn: true,
+  country: "JP",
+  path: location.pathname,
+}
+```
+
+VWO が自動で取ってくれていた「訪問回数」「流入元」のような属性は、必要なら自分で算出して渡します。ここは移行時に「VWO のどのオーディエンス条件を実際に使っていたか」を棚卸しして、使っている属性だけ実装するのがよいです。
+
+再利用したい条件セット（社内 IP 除外、特定ページ群など）は **Saved Groups** に保存して複数の実験・フラグから参照できます。
+
+## 相互排他グループ
+
+**VWO**: Mutually Exclusive Group で複数テストの同時露出を防止。
+
+**GrowthBook**: **Namespaces** です。左ナビの Experimentation → Namespaces で作成します。
+
+仕組みは「0〜1 の数直線」で、各実験に範囲を割り当てます。
+
+```
+namespace: "checkout"
+
+  0                    0.5                    1.0
+  ├─── 実験 A ──────────┼─── 実験 B ────────────┤
+
+  ユーザーはハッシュ値でどちらか片方にしか入らない
+```
+
+範囲が重なっていると排他になりません。また範囲を割り当てた分しかトラフィックが使えないため、単独実験では不要です。
+
+## 割当の固定（Sticky Bucketing)
+
+**VWO**: 基本的に自動（Cookie で割当を保持）。
+
+**GrowthBook**: 決定論的ハッシュなので、実験設定を変えない限り同じユーザーは常に同じバリエーションに入ります。ただし途中でトラフィック割合やターゲティングを変えると割当が変わり得ます。それも固定したい場合は **Sticky Bucketing** を使います。
+
+1. Settings → General で Sticky Bucketing を有効化
+2. SDK に保存先実装を渡す
+
+```js
+import { LocalStorageStickyBucketService } from "@growthbook/growthbook";
+
+const gb = new GrowthBook({
+  // ...
+  stickyBucketService: new LocalStorageStickyBucketService(),
+});
+```
+
+サーバーサイドなら Redis 実装、Express 用の Cookie 実装などがあります。有効化すると実験側で `fallbackAttribute` も指定できるようになり、「未ログイン時はデバイス ID で割当 → ログイン後も同じバリエーションを維持」というクロスセッションの一貫性が作れます。
+
+## プレビュー / QA
+
+**VWO**: プレビューモードで各バリエーションを確認。
+
+**GrowthBook**: 手段が複数あります。
+
+| 手段 | 用途 |
+|------|------|
+| Force Variation（URL パラメータ） | 特定バリエーションを強制表示 |
+| GrowthBook DevTools（Chrome 拡張） | 属性の上書き・割当の確認 |
+| Archetypes | 代表的な属性セットを保存して机上評価 |
+| Environments | dev / staging / production でフラグ状態を分離 |
+| Exposures Debugger | 露出イベントがデータソースに届いているか確認 |
+
+環境分離が最初から組み込まれているのは VWO より整理しやすい点です。staging だけでフラグを ON にして QA し、確認後に production のルールを有効化する、という運用が自然にできます。
+
+## flicker（ちらつき）対策
+
+**VWO**: anti-flicker スニペット（画面を一瞬隠す）。
+
+**GrowthBook**: スニペットで隠すのではなく、**構成で発生させない**方針です。
+
+- サーバーサイド / Edge SDK（Cloudflare Workers、Vercel Edge 等）で描画前に出し分ける
+- クライアント実験なら payload をインライン化して同期評価する
+
+割当がローカルのハッシュ計算で完結する（サーバーへの問い合わせ待ちがない）ため、SSR に載せれば flicker は原理的にゼロにできます。ここは移行で明確に良くなるポイントです。
+
+## SEO テスト（ページ群 split）
+
+VWO の枠には無い使い方ですが、SEO 文脈では重要なので触れておきます。
+
+タイトルタグやコンテンツ構成の SEO テストは「ユーザーを分ける」のではなく「**ページ群を分ける**」のが定石です。GrowthBook は hashAttribute を自由に選べるため、ユーザー ID の代わりにページパスで割当できます。
+
+```
+hashAttribute: "path" にした場合
+
+  /items/001 ──> ハッシュ ──> バリエーション A（常に）
+  /items/002 ──> ハッシュ ──> バリエーション B（常に）
+
+  誰が見ても（Googlebot が見ても）同じページには同じ表示
+```
+
+ユーザー単位で割当てるとクローラーへの表示が揺れてクローキング疑いのリスクがあるため、SEO テストではこの構成 + SSR が安全です。効果測定は GA4 → BigQuery に入るオーガニック流入後の行動指標、あるいは Search Console データを BigQuery にエクスポートして Metric 化します。
+
+## ヒートマップ・セッション録画・サーベイ
+
+**GrowthBook にはありません。** ここは移行前に合意しておくべき明確な機能差分です。
+
+| VWO の機能 | 代替 |
+|-----------|------|
+| ヒートマップ | Microsoft Clarity(無料) / Hotjar |
+| セッション録画 | 同上 |
+| フォーム分析 | GA4 イベント設計で代替 |
+| サーベイ | 別ツール |
+
+GrowthBook は「フラグ管理 + 実験 + 統計分析」に特化したツールです。オールインワンをバラして、それぞれ得意なツールに分担させる構成になります。
+
+## 結果の読み方
+
+**VWO**: SmartStats（ベイジアン）。「Chance to Beat」で判断。
+
+**GrowthBook**: デフォルトがベイジアンなので読み方の感覚は近く、「Chance to Beat Control」ベースで判断できます。加えて:
+
+- frequentist（逐次検定）への切り替えも可能
+- **SRM チェックが自動**で走る（サンプル比率が設定と乖離していたら警告）
+- 分析はいつでも再実行できる（データがウェアハウスにあるため、Metric 定義を直して過去の実験を引き直せる）
+
+最後の点は地味に強力です。VWO では計測設定をミスった実験はデータごと捨てるしかありませんでしたが、GrowthBook では生イベントが BigQuery に残っているので、指標定義を修正して再集計できます。
+
+## 移行の進め方
+
+実験データそのものは移行できないため、「走っている実験は VWO で完了させ、新規は GrowthBook で開始」が基本方針です。
+
+```
+1. GA4 → BigQuery リンクを整備
+2. GrowthBook に BigQuery データソースを接続
+3. 主要指標を Metrics として定義
+4. SDK 導入 + 露出イベントの疎通を Exposures Debugger で確認
+5. VWO と無関係なページで小さい実験を 1 本試験運用
+6. VWO の実験を順次完了 → 新規は GrowthBook のみ → VWO 解約
+```
+
+並行期間中は同じページを両ツールで触らないルールにしておかないと、変更が重なって両方の計測が汚れます。
+
+## まとめ
+
+- VWO → GrowthBook は機能の 1:1 対応ではなく、**「計測を GA4/BigQuery に寄せ、GrowthBook は割当と分析だけ担う」**というアーキテクチャの組み替え
+- 作業量が大きいのはゴール → Metrics の移行と、属性の受け渡し実装
+- ヒートマップ系は無いので別ツールで補完
+- 引き換えに得られるのは、MTU 課金からの解放、SSR/Edge による flicker ゼロ、指標定義の統一、過去実験の再集計可能性
+
+「貼るだけで全部動く」VWO に比べると初期構築は重いですが、データが自社ウェアハウスに揃う構成は実験以外（ダッシュボード、他ツール連携）にも効いてきます。
