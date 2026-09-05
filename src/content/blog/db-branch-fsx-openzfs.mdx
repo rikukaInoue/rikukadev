@@ -1,5 +1,5 @@
 ---
-title: "FSx for OpenZFS で db-branch を作り直したら、reset の設計が変わった"
+title: "FSx for OpenZFS で MySQL のデータベースブランチ環境を作る — クローン 60 秒・restore 10 分の実測記録"
 date: 2026-09-05
 tags: ["AWS", "FSx", "ZFS", "MySQL", "NFS", "データベース", "PoC"]
 description: "EC2ローカルZFSで1.3秒だったMySQLブランチ複製をFSx for OpenZFSで作り直した検証記録。クローン52〜71秒・restore10分超・delete6分という『分の世界』のコントロールプレーンを実測し、resetは restore API ではなく新クローン+付け替えが正解形という結論に。復元中ボリュームへ mysqld を起動して datadir を壊した事故の記録も。"
