@@ -1,5 +1,6 @@
 ---
 import Gallery from "../../components/Gallery";
+import Analytics from "../../components/Analytics.astro";
 import photoData from "../../data/photo-data.json";
 
 const photos = photoData;
@@ -12,6 +13,7 @@ const photos = photoData;
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>rikuka.dev — Photography</title>
+    <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
     <style>

@@ -1,5 +1,6 @@
 ---
 import { getCollection, render } from 'astro:content';
+import Analytics from '../../components/Analytics.astro';
 
 export async function getStaticPaths() {
   const posts = await getCollection('blog');
@@ -21,6 +22,7 @@ const rawBody = post.body ?? "";
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>{post.data.title} — rikuka.dev</title>
+    <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
     <style>
