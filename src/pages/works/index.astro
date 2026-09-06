@@ -17,6 +17,7 @@ const photos = photoData;
     <Seo
       title="rikuka.dev — Photography"
       description="rikukaの写真作品ページ。中判・大判フィルムで撮影した写真を掲載しています。"
+      ogImage="/og.png"
     />
     <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -321,6 +322,6 @@ const photos = photoData;
 
     <Gallery client:load photos={photos} />
 
-    <footer>© rikuka.dev — All rights reserved</footer>
+    <footer>© rikuka.dev — All rights reserved · <a href="/privacy" style="color: inherit;">プライバシーポリシー</a></footer>
   </body>
 </html>

@@ -29,6 +29,7 @@ const rawBody = post.body ?? "";
       ogType="article"
       publishedDate={post.data.date}
       tags={post.data.tags}
+      ogImage={`/blog/${post.id}/og.png`}
     />
     <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -328,7 +329,7 @@ const rawBody = post.body ?? "";
 
     <a href="/" class="back-link">&larr; Back to all posts</a>
 
-    <footer>&copy; rikuka.dev &mdash; All rights reserved</footer>
+    <footer>&copy; rikuka.dev &mdash; All rights reserved &middot; <a href="/privacy" style="color: inherit;">プライバシーポリシー</a></footer>
 
     <script>
       document.getElementById('copy-md-btn')?.addEventListener('click', async () => {

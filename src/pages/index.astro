@@ -17,6 +17,7 @@ const posts = (await getCollection('blog'))
     <Seo
       title="Blog — rikuka.dev"
       description="rikukaの個人テックブログ。AWS・認証認可・インフラ設計などの技術記事を書いています。"
+      ogImage="/og.png"
     />
     <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -192,6 +193,6 @@ const posts = (await getCollection('blog'))
       )}
     </section>
 
-    <footer>&copy; rikuka.dev &mdash; All rights reserved</footer>
+    <footer>&copy; rikuka.dev &mdash; All rights reserved &middot; <a href="/privacy" style="color: inherit;">プライバシーポリシー</a></footer>
   </body>
 </html>
