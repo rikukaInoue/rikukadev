@@ -1,0 +1,156 @@
+---
+import Analytics from '../components/Analytics.astro';
+import Seo from '../components/Seo.astro';
+---
+
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>プライバシーポリシー — rikuka.dev</title>
+    <Seo
+      title="プライバシーポリシー — rikuka.dev"
+      description="rikuka.dev のプライバシーポリシー。アクセス解析ツールの使用と収集するデータについて説明します。"
+    />
+    <Analytics />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      :root {
+        --bg: #0a0a0a;
+        --border: #222;
+        --text: #f0f0f0;
+        --muted: #888;
+        --accent: #93928b;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Inter', sans-serif;
+        font-weight: 300;
+      }
+
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1.2rem 2.5rem;
+        background: rgba(10,10,10,0.85);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .logo {
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--text);
+        text-decoration: none;
+      }
+
+      .header-nav { display: flex; gap: 1.5rem; }
+
+      .nav-link {
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 0.9rem;
+      }
+
+      .nav-link:hover { color: var(--text); }
+
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 3rem 1.5rem 5rem;
+        line-height: 1.9;
+      }
+
+      h1 {
+        font-size: 1.6rem;
+        font-weight: 600;
+        margin-bottom: 2.5rem;
+      }
+
+      h2 {
+        font-size: 1.15rem;
+        font-weight: 600;
+        margin: 2.5rem 0 0.8rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--border);
+      }
+
+      p { margin-bottom: 1rem; color: #ccc; }
+
+      a { color: var(--text); text-underline-offset: 4px; }
+
+      .updated { color: var(--muted); font-size: 0.85rem; margin-top: 3rem; }
+
+      footer {
+        padding: 2rem;
+        text-align: center;
+        color: var(--muted);
+        font-size: 0.8rem;
+        border-top: 1px solid var(--border);
+      }
+
+      footer a { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="/" class="logo">rikuka.dev</a>
+      <nav class="header-nav">
+        <a href="/" class="nav-link">Blog</a>
+        <a href="/works" class="nav-link">Works</a>
+      </nav>
+    </header>
+
+    <main>
+      <h1>プライバシーポリシー</h1>
+
+      <h2>基本方針</h2>
+      <p>
+        rikuka.dev(以下「当サイト」)は、訪問者のプライバシーを尊重し、
+        個人情報の取り扱いに関して以下のとおり定めます。
+      </p>
+
+      <h2>アクセス解析ツールについて</h2>
+      <p>
+        当サイトでは、Google LLC が提供するアクセス解析ツール「Google アナリティクス」を使用しています。
+        Google アナリティクスはトラフィックデータの収集のために Cookie を使用します。
+        このデータは匿名で収集されており、個人を特定するものではありません。
+      </p>
+      <p>
+        収集されるデータの詳細は
+        <a href="https://policies.google.com/technologies/partner-sites?hl=ja" target="_blank" rel="noopener noreferrer">Google のポリシーと規約</a>
+        をご覧ください。Cookie を無効にすることでデータ収集を拒否できるほか、
+        <a href="https://tools.google.com/dlpage/gaoptout?hl=ja" target="_blank" rel="noopener noreferrer">Google アナリティクス オプトアウト アドオン</a>
+        を利用することもできます。
+      </p>
+
+      <h2>免責事項</h2>
+      <p>
+        当サイトに掲載する情報の正確性には努めていますが、その内容の完全性・正確性・有用性を保証するものではありません。
+        当サイトの情報を利用したことによって生じたいかなる損害についても、当サイトは責任を負いません。
+      </p>
+
+      <h2>著作権</h2>
+      <p>
+        当サイトに掲載されている文章・写真等の著作権は当サイト運営者に帰属します。
+        記事の引用は出典を明記のうえ、適切な範囲で行ってください。
+      </p>
+
+      <p class="updated">制定日: 2026年9月6日</p>
+    </main>
+
+    <footer>&copy; rikuka.dev &mdash; All rights reserved &middot; <a href="/privacy">プライバシーポリシー</a></footer>
+  </body>
+</html>
