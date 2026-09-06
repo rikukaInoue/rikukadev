@@ -1,18 +1,23 @@
 ---
 import Gallery from "../../components/Gallery";
 import Analytics from "../../components/Analytics.astro";
+import Seo from "../../components/Seo.astro";
 import photoData from "../../data/photo-data.json";
 
 const photos = photoData;
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>rikuka.dev — Photography</title>
+    <Seo
+      title="rikuka.dev — Photography"
+      description="rikukaの写真作品ページ。中判・大判フィルムで撮影した写真を掲載しています。"
+    />
     <Analytics />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
