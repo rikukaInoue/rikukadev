@@ -11,6 +11,8 @@ description: "ZFS の CoW クローンで MySQL を git のブランチのよう
 2. これを**製品化して `sashiki` という OSS にし、v0.2.0 で公開した**。PR を開くと数秒で本物データ入りの MySQL プレビューが `pr-123.example.dev` のようなサブドメインで開くところまで AWS 実機で組んだ
 3. その過程で **proxy の DB 転送バグ・接続の half-close** という「実運用でしか出ないバグ」を炙り出した——という記録。設計の学びと、正直な汎用性の限界も書く
 
+> 📦 リポジトリ: **[github.com/rikukaInoue/sashiki](https://github.com/rikukaInoue/sashiki)**(Apache-2.0)
+
 ## PoC は「動く」、製品は「壊れても安全」
 
 前々回・前回で「ZFS のクローンで DB ブランチが作れる」ことは実証しました。シェルスクリプト 100 行で `create foo` が動く。ではそれを毎日 PR プレビューで回せるかというと、全然別の話です。
