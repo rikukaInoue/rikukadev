@@ -1,0 +1,47 @@
+/* サイト共通のテーマ変数。デフォルト(=data-theme未設定/dark)はダーク。
+   ライトは ThemeInit のインラインスクリプトが <html data-theme> を立てて有効化する */
+:root {
+  color-scheme: dark;
+  --bg: #0a0a0a;
+  --surface: #111;
+  --border: #222;
+  --text: #f0f0f0;
+  --text-soft: #ccc;
+  --muted: #888;
+  --accent: #93928b;
+  --accent-contrast: #000;
+  --header-bg: rgba(10, 10, 10, 0.85);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #faf9f7;
+  --surface: #f0efec;
+  --border: #e2e1dd;
+  --text: #1c1c1a;
+  --text-soft: #3d3d3a;
+  --muted: #75746f;
+  --accent: #7a796f;
+  --accent-contrast: #fff;
+  --header-bg: rgba(250, 249, 247, 0.85);
+}
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--muted);
+  transition: color 0.2s;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+}
+
+/* ダーク時は太陽(ライトへ切替)、ライト時は月を見せる */
+.theme-toggle .moon { display: none; }
+:root[data-theme='light'] .theme-toggle .moon { display: block; }
+:root[data-theme='light'] .theme-toggle .sun { display: none; }

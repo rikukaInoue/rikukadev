@@ -15,6 +15,10 @@ export default defineConfig({
       type: 'shiki',
       excludeLangs: ['mermaid'],
     },
+    shikiConfig: {
+      themes: { light: 'github-light', dark: 'github-dark' },
+      defaultColor: false,
+    },
     rehypePlugins: [
       [rehypeMermaid, { strategy: 'inline-svg' }],
     ],

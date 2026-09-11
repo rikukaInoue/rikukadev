@@ -2,6 +2,9 @@
 import Gallery from "../../components/Gallery";
 import Analytics from "../../components/Analytics.astro";
 import Seo from "../../components/Seo.astro";
+import ThemeInit from "../../components/ThemeInit.astro";
+import ThemeToggle from "../../components/ThemeToggle.astro";
+import "../../styles/theme.css";
 import photoData from "../../data/photo-data.json";
 
 const photos = photoData;
@@ -13,6 +16,7 @@ const photos = photoData;
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <ThemeInit />
     <title>rikuka.dev — Photography</title>
     <Seo
       title="rikuka.dev — Photography"
@@ -24,15 +28,6 @@ const photos = photoData;
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
     <style>
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-      :root {
-        --bg: #0a0a0a;
-        --surface: #111;
-        --border: #222;
-        --text: #f0f0f0;
-        --muted: #888;
-        --accent: #93928b;
-      }
 
       body {
         background: var(--bg);
@@ -49,7 +44,7 @@ const photos = photoData;
         align-items: center;
         justify-content: space-between;
         padding: 1.2rem 2.5rem;
-        background: rgba(10,10,10,0.85);
+        background: var(--header-bg);
         backdrop-filter: blur(12px);
         border-bottom: 1px solid var(--border);
       }
@@ -135,7 +130,7 @@ const photos = photoData;
       :global(.filter-btn.active) {
         background: var(--accent);
         border-color: var(--accent);
-        color: #000;
+        color: var(--accent-contrast);
         font-weight: 600;
       }
 
@@ -312,6 +307,7 @@ const photos = photoData;
       <nav class="header-nav">
         <a href="/" class="nav-link">Blog</a>
         <a href="/works" class="nav-link active">Works</a>
+        <ThemeToggle />
       </nav>
     </header>
 

@@ -2,6 +2,9 @@
 import { getCollection, render } from 'astro:content';
 import Analytics from '../../components/Analytics.astro';
 import Seo from '../../components/Seo.astro';
+import ThemeInit from '../../components/ThemeInit.astro';
+import ThemeToggle from '../../components/ThemeToggle.astro';
+import '../../styles/theme.css';
 
 export async function getStaticPaths() {
   const posts = await getCollection('blog');
@@ -22,6 +25,7 @@ const rawBody = post.body ?? "";
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <ThemeInit />
     <title>{post.data.title} — rikuka.dev</title>
     <Seo
       title={`${post.data.title} — rikuka.dev`}
@@ -36,15 +40,6 @@ const rawBody = post.body ?? "";
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
     <style>
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-      :root {
-        --bg: #0a0a0a;
-        --surface: #111;
-        --border: #222;
-        --text: #f0f0f0;
-        --muted: #888;
-        --accent: #93928b;
-      }
 
       body {
         background: var(--bg);
@@ -61,7 +56,7 @@ const rawBody = post.body ?? "";
         align-items: center;
         justify-content: space-between;
         padding: 1.2rem 2.5rem;
-        background: rgba(10,10,10,0.85);
+        background: var(--header-bg);
         backdrop-filter: blur(12px);
         border-bottom: 1px solid var(--border);
       }
@@ -216,6 +211,62 @@ const rawBody = post.body ?? "";
         border: 1px solid var(--border);
       }
 
+      /* Shiki dual theme: defaultColor:false なので span の色は CSS 変数で当てる */
+      .prose :global(.astro-code span) {
+        color: var(--shiki-dark);
+      }
+
+      :root[data-theme='light'] .prose :global(.astro-code span) {
+        color: var(--shiki-light);
+      }
+
+      /* コピー用スクリプトが pre を .code-block でラップする(JS 生成要素なので :global) */
+      .prose :global(.code-block) {
+        position: relative;
+        margin-bottom: 1.5rem;
+      }
+
+      .prose :global(.code-block > pre) {
+        margin-bottom: 0;
+      }
+
+      .prose :global(.code-block[data-language])::before {
+        content: attr(data-language);
+        position: absolute;
+        top: 0.55rem;
+        right: 4.2rem;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        font-size: 0.7rem;
+        color: var(--muted);
+        letter-spacing: 0.05em;
+        user-select: none;
+      }
+
+      .prose :global(.code-copy) {
+        position: absolute;
+        top: 0.45rem;
+        right: 0.6rem;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        font-size: 0.7rem;
+        color: var(--muted);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.15rem 0.5rem;
+        cursor: pointer;
+        opacity: 0.6;
+        transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+      }
+
+      .prose :global(.code-block:hover .code-copy) {
+        opacity: 1;
+      }
+
+      .prose :global(.code-copy:hover) {
+        color: var(--text);
+        border-color: var(--accent);
+      }
+
       .prose :global(hr) {
         border: none;
         border-top: 1px solid var(--border);
@@ -298,6 +349,7 @@ const rawBody = post.body ?? "";
       <nav class="header-nav">
         <a href="/" class="nav-link active">Blog</a>
         <a href="/works" class="nav-link">Works</a>
+        <ThemeToggle />
       </nav>
     </header>
 
@@ -356,6 +408,29 @@ const rawBody = post.body ?? "";
             btn.classList.remove('copied');
           }, 2000);
         }
+      });
+    </script>
+    <script>
+      document.querySelectorAll<HTMLPreElement>('.prose pre.astro-code').forEach((pre) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'code-block';
+        const lang = pre.dataset.language;
+        if (lang && lang !== 'plaintext') wrap.dataset.language = lang;
+        pre.parentNode?.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+
+        const btn = document.createElement('button');
+        btn.className = 'code-copy';
+        btn.type = 'button';
+        btn.textContent = 'copy';
+        btn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(pre.innerText);
+            btn.textContent = 'copied!';
+            setTimeout(() => (btn.textContent = 'copy'), 1500);
+          } catch {}
+        });
+        wrap.appendChild(btn);
       });
     </script>
   </body>

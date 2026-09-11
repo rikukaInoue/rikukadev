@@ -1,6 +1,9 @@
 ---
 import Analytics from '../components/Analytics.astro';
 import Seo from '../components/Seo.astro';
+import ThemeInit from '../components/ThemeInit.astro';
+import ThemeToggle from '../components/ThemeToggle.astro';
+import '../styles/theme.css';
 ---
 
 <!doctype html>
@@ -9,6 +12,7 @@ import Seo from '../components/Seo.astro';
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <ThemeInit />
     <title>プライバシーポリシー — rikuka.dev</title>
     <Seo
       title="プライバシーポリシー — rikuka.dev"
@@ -19,14 +23,6 @@ import Seo from '../components/Seo.astro';
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
     <style>
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-      :root {
-        --bg: #0a0a0a;
-        --border: #222;
-        --text: #f0f0f0;
-        --muted: #888;
-        --accent: #93928b;
-      }
 
       body {
         background: var(--bg);
@@ -43,7 +39,7 @@ import Seo from '../components/Seo.astro';
         align-items: center;
         justify-content: space-between;
         padding: 1.2rem 2.5rem;
-        background: rgba(10,10,10,0.85);
+        background: var(--header-bg);
         backdrop-filter: blur(12px);
         border-bottom: 1px solid var(--border);
       }
@@ -87,7 +83,7 @@ import Seo from '../components/Seo.astro';
         border-top: 1px solid var(--border);
       }
 
-      p { margin-bottom: 1rem; color: #ccc; }
+      p { margin-bottom: 1rem; color: var(--text-soft); }
 
       a { color: var(--text); text-underline-offset: 4px; }
 
@@ -110,6 +106,7 @@ import Seo from '../components/Seo.astro';
       <nav class="header-nav">
         <a href="/" class="nav-link">Blog</a>
         <a href="/works" class="nav-link">Works</a>
+        <ThemeToggle />
       </nav>
     </header>
 

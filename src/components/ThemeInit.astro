@@ -1,0 +1,11 @@
+<script is:inline>
+  // 描画前にテーマを確定させる(ちらつき防止のため head 内で同期実行)
+  (() => {
+    let theme;
+    try {
+      theme = localStorage.getItem('theme');
+    } catch {}
+    theme ??= matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
