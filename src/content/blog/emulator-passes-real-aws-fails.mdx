@@ -1,5 +1,5 @@
 ---
-title: "逆引き: ローカルでは通るのに実機で死ぬ — CFN タグの invalid characters・moto が検証しないこと・macOS の 5000 番・go-sql-driver の panic"
+title: "motoで通って実AWSで落ちる検証の穴"
 date: 2026-09-12
 tags: ["AWS", "CloudFormation", "moto", "テスト", "MySQL", "macOS", "逆引き"]
 description: "moto に対する結合テストが全部 green のまま、実 AWS・実機に載せた途端に連続で死んだ記録の逆引き。CFN タグ値に JSON は入らない(moto は文字種を検証しない)、macOS の AirPlay がポート 5000 を占有して 403 を返す、古いプロキシで go-sql-driver が readColumns panic。症状から原因と対処へ引ける形でまとめる。"
