@@ -1,5 +1,5 @@
 ---
-title: "OIDCの信頼ポリシーが正しいのに拒否される理由"
+title: "信頼ポリシーが正しいのにOIDCが拒否される"
 date: 2026-09-12
 tags: ["GitHub Actions", "OIDC", "AWS", "IAM", "CloudTrail", "逆引き"]
 description: "教科書どおりの信頼ポリシーなのに GitHub Actions からの AssumeRole が拒否される。CloudTrail で実トークンを見たら、新しめの org では sub クレームが repo:owner@ID/repo@ID:* という ID 入り形式だった。実クレームの確認手順(CloudTrail)と、両形式を併記する信頼ポリシー、gh api での ID 取得までの逆引きメモ。"

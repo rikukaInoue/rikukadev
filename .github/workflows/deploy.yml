@@ -22,6 +22,9 @@ jobs:
 
       - run: npm ci
 
+      - name: 記事タイトル検査(新規記事は20字以内)
+        run: node scripts/check-title-length.mjs
+
       - name: Install Playwright Chromium (for Mermaid rendering)
         run: npx playwright install --with-deps chromium
 
