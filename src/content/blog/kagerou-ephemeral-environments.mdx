@@ -2,7 +2,7 @@
 title: "PR ごとに現れて消える環境を OSS にした — kagerou(陽炎)の設計と、実機で踏んだ罠"
 date: 2026-09-12
 tags: ["kagerou", "sashiki", "AWS", "OSS", "プレビュー環境", "Lambda", "OIDC"]
-description: "Vercel の PR プレビューを自分の AWS アカウントで再現する OSS「kagerou」を作った記録。ステートレス CLI + タグが真実の源 + TTL 必須という設計、sashiki と名前の規約だけで繋がる話、そして実機ドッグフーディングで踏んだ罠(GitHub 新 org の OIDC sub・CFN タグに JSON が入らない・moto をすり抜ける契約バグ)まで。"
+description: "Vercel の PR プレビューを自分の AWS アカウントで再現する OSS「kagerou」を作った記録。ステートレス CLI + タグが真実の源 + TTL 必須という設計、sashiki と名前の規約だけで繋がる話、検証アプリ 2 つのドッグフーディングが validate / post_up / url_template を生んで契約を鍛えるまで。"
 ---
 
 ## 今北産業
@@ -13,9 +13,8 @@ description: "Vercel の PR プレビューを自分の AWS アカウントで�
 2. 設計は**ステートレス CLI + AWS タグが真実の源 + TTL 必須**。
    [sashiki](/blog/db-branch-sashiki-oss/)(DB ブランチ)とはコードの依存ゼロ、
    **名前の規約だけ**で繋がる
-3. 実機ドッグフーディングで踏んだ罠 — GitHub 新 org の OIDC sub クレーム、
-   CFN タグに JSON が入らない、moto をすり抜けた契約バグ — が、そのまま契約
-   (CONTRACT.md)を鍛えた、という記録
+3. 検証アプリ 2 つのドッグフーディングで出た摩擦が `validate` / `post_up` /
+   `url_template` を生み、そのまま契約(CONTRACT.md)を鍛えた、という記録
 
 ## 動機: preview.yml が 260 行あった
 
@@ -89,47 +88,10 @@ username routing(固定エンドポイントに `dev@pr-42` で繋ぐとブラ�
 DB を使わないアプリ、共有 RDS、SQLite 同梱 — kagerou から見ればどれも
 「env の出どころが違うだけ」です。
 
-## 実機で踏んだ罠 3 連発
-
-設計より、ここからが本題かもしれません。検証アプリを実 AWS にデプロイして
-初めて出た問題たちです。
-
-### 罠 1: GitHub 新 org の OIDC sub クレームは ID 入り
-
-GitHub Actions から AssumeRole が `Not authorized` で落ち続け、信頼ポリシーは
-教科書どおり。CloudTrail で実トークンの sub を見て判明しました:
-
-```
-repo:rikukadev@328009292/kagerou-ssr-demo@1366497913:pull_request
-```
-
-**新しめの org は sub クレームに不変 ID が入ります**(名前再利用攻撃への対策)。
-`repo:owner/repo:*` の従来形式ではマッチしません。古いアカウントは従来形式のままなので、
-「昔作ったロールの真似をしたのに動かない」という罠になります。kagerou の
-セットアップスクリプトは、`gh api` で ID を取って**両形式の sub を信頼ポリシーに並べる**
-ことで吸収しました。
-
-### 罠 2: CFN のタグ値に JSON は入らない
-
-環境の出自を `kagerou:source` タグに opaque JSON で入れる契約にしていたら、
-実 AWS で `Tag contained invalid characters` に。CFN のタグ値は英数字と
-` +-=._:/@` のみで、`{` も `"` も入りません。**ローカルテストに使っていた moto は
-文字種を検証しない**ので、テストは全部通っていました。
-
-契約を URI 形式の文字列(`github_pr://owner/repo/42`)に変更し、moto が見ない
-文字種検証を kagerou 側の事前バリデーションに落とし込みました。エミュレータの
-「通る」は本物の「通る」ではない、を体で覚えた回です。
-
-### 罠 3: 古いプロキシと go-sql-driver の readColumns panic
-
-sashiki 連携の E2E で、Lambda からの DB クエリが 30 秒タイムアウト。ログを見ると
-go-sql-driver が `readColumns` で `slice bounds out of range [3:2]` の panic でした。
-実は sashiki 側で修正済みのプロトコルバグ(クライアント capability 追従)で、
-検証機のデーモンが古かっただけ。リリース版に更新して解消 — 図らずも sashiki の
-リグレッション確認になりました。
-
-(おまけの罠: macOS で moto をポート 5000 に立てると **AirPlay Receiver が先に
-5000 を掴んでいて** 403 が返ります。エミュレータ以前の問題)
+実 AWS に載せる過程では、ローカルでは出ない罠をいくつも踏みました。デバッグの
+過程ごと逆引き記事に分けてあります:
+[GitHub Actions OIDC の ID 入り sub クレーム](/blog/github-actions-oidc-id-sub-claim/)と、
+[エミュレータでは通るのに実機で死ぬやつら](/blog/emulator-passes-real-aws-fails/)。
 
 ## ドッグフーディングが契約を鍛えた
 

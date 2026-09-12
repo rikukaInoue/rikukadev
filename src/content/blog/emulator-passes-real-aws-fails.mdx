@@ -1,0 +1,118 @@
+---
+title: "逆引き: ローカルでは通るのに実機で死ぬ — CFN タグの invalid characters・moto が検証しないこと・macOS の 5000 番・go-sql-driver の panic"
+date: 2026-09-12
+tags: ["AWS", "CloudFormation", "moto", "テスト", "MySQL", "macOS", "逆引き"]
+description: "moto に対する結合テストが全部 green のまま、実 AWS・実機に載せた途端に連続で死んだ記録の逆引き。CFN タグ値に JSON は入らない(moto は文字種を検証しない)、macOS の AirPlay がポート 5000 を占有して 403 を返す、古いプロキシで go-sql-driver が readColumns panic。症状から原因と対処へ引ける形でまとめる。"
+---
+
+## 今北産業
+
+1. moto への結合テストは**全部 green** のまま、実 AWS・実機に載せた途端に連続で死んだ
+2. 犯人は「**本物でしか検証されないもの**」— CFN タグの文字種、ポートの先客、
+   ワイヤープロトコルの互換性
+3. 教訓: **エミュレータの「通る」は本物の「通る」ではない**。差分は「どこで検証されるか」を
+   特定して、自前の事前バリデーション(=単体テスト)に写し取る
+
+前提: [kagerou](https://github.com/rikukadev/kagerou)(PR ごとのプレビュー環境 OSS)の
+実機検証での出来事。テスト戦略は「ユニット / moto 結合 / 実 AWS e2e」の 3 層で、
+この記事は 2 層目と 3 層目の**すき間**に落ちたものたちです。GitHub OIDC の罠は
+スコープが違うので[別記事](/blog/github-actions-oidc-id-sub-claim/)に。
+
+## 症状 1: `ValidationError: Tag [kagerou:source] contained invalid characters`
+
+### 何が起きたか
+
+リソースの出自を記録するタグに opaque JSON を入れる設計にしていました:
+
+```
+kagerou:source = {"type":"github_pr","repo":"rikukadev/todo","ref":"42"}
+```
+
+moto に対する結合テストは通過。実 AWS の CreateStack で初めて 400 が返りました。
+
+### 原因
+
+**CFN のタグ値に使える文字は英数字と ` +-=._:/@` のみ**。`{` も `"` も `,` も
+入りません。つまりタグに JSON は構造的に入らない。そして **moto はタグ値の文字種を
+検証しない**ので、ローカルでは何も起きません。
+
+### 対処
+
+値の設計を URI 風の文字列に変更しました。人間が AWS コンソールで読める副作用つき:
+
+```
+kagerou:source = github_pr://rikukadev/todo/42
+```
+
+あわせて、moto が見てくれない検証を**自前の事前バリデーションに写経**しました。
+文字種の正規表現チェックを API 呼び出しの前に置けば、以後は単体テストの守備範囲です。
+
+```go
+var tagValueRe = regexp.MustCompile(`^[a-zA-Z0-9 +\-=._:/@]*$`)
+```
+
+## 症状 2: moto に繋いだはずが 403(RequestID が空)
+
+### 何が起きたか
+
+`docker run -p 5000:5000 motoserver/moto` を立てて `AWS_ENDPOINT_URL` を向けたのに、
+DescribeStacks が `StatusCode: 403, RequestID: , api error UnknownError`。
+
+### 原因
+
+**macOS では AirPlay Receiver がポート 5000 を先に掴んでいます**(7000 も)。
+リクエストは moto ではなく AirPlay の HTTP サーバーに届いて 403 が返っていました。
+RequestID が空なのは AWS 系サーバーの応答ではないから — これが手掛かりです。
+
+### 対処
+
+ホスト側のポートをずらすだけです:
+
+```bash
+docker run -p 5001:5000 motoserver/moto
+AWS_ENDPOINT_URL=http://127.0.0.1:5001 go test ./...
+```
+
+CI(Linux)は 5000 のままで問題ないので、Makefile のローカルターゲットだけ
+5001 にしてコメントで理由を残しました。「403 なのに RequestID が空」は
+エミュレータ以前にポートの先客を疑う、が逆引きの結論です。
+
+## 症状 3: `http: panic serving ...: runtime error: slice bounds out of range` in go-sql-driver readColumns
+
+### 何が起きたか
+
+Lambda(VPC 内)から MySQL プロキシ経由のクエリが 30 秒でタイムアウトして 502。
+`/healthz` は 200 なのでプロセスは生きている。CloudWatch Logs を見ると:
+
+```
+panic serving 127.0.0.1:45318: runtime error: slice bounds out of range [3:2]
+github.com/go-sql-driver/mysql.(*mysqlConn).readColumns
+```
+
+### 原因
+
+接続先が自作の MySQL プロトコルプロキシ([sashiki](https://github.com/rikukadev/sashiki))で、
+検証機に入っていたデーモンが**クライアント capability 追従を修正する前の古いビルド**でした。
+プロキシがプロトコル上の嘘(capability と実際のパケット構造の不一致)をつくと、
+クライアントは防御的には書かれていないので、パケットのパース中に即 panic します。
+
+### 対処と教訓
+
+デーモンを修正済みのリリース版に更新して解消。教訓は 2 つ:
+
+- **プロトコルを偽装する層(プロキシ)は、クライアント実装を複数並べた E2E で殴る**。
+  go-sql-driver / PyMySQL / mysql2 で挙動が全部違う
+- 直った後も最初の 1 リクエストだけ 502 が出ることがある。**Lambda の再利用コンテナが
+  壊れた接続をプールに抱えている**ためで、数リクエストで入れ替わる。「再起動直後の
+  1 発目だけ失敗」はアプリではなく接続プールを疑う
+
+## まとめ: すき間の埋めかた
+
+3 件に共通するのは、**エミュレータ(moto)の守備範囲の外**で死んでいることです。
+moto はタグの文字種を見ないし、ポートの先客も、ワイヤープロトコルの互換性も
+関知しません。
+
+やることは「エミュレータを信じない」ではなく、**差分がどこで検証されるかを特定して、
+安い層に写し取る**ことだと思っています。CFN タグの文字種は正規表現 1 本で単体テストに
+落ちました。プロトコル互換は実クライアントを並べた e2e にしか落ちません。落ちる先が
+高い層しかないものだけが、本当に「実機でしか分からないこと」です。
