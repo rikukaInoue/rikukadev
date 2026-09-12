@@ -1,5 +1,5 @@
 ---
-title: "Cognito で3キャリア + Google のアカウント統合を設計する"
+title: "Cognitoで4社のIDを1アカウントに統合"
 date: 2026-04-26
 tags: ["AWS", "Cognito", "OIDC", "OpenID", "認証", "設計", "ドコモ", "au", "ソフトバンク"]
 description: "ドコモ(OIDC)・au(OpenID 2.0)・ソフトバンク(Yahoo! JAPAN OIDC)・Google・メール+パスワードの5つのログイン方法を、Cognitoの1ユーザーに統合する設計。各キャリアのIdP仕様の違い、SECRET_HASHの計算、opaque IDの扱い、PreSignUp Lambdaによる自動リンクまで。"

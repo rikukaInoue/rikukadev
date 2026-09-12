@@ -1,5 +1,5 @@
 ---
-title: "PoC から OSS へ — MySQL のデータベースブランチ基盤『sashiki』を作って公開した"
+title: "MySQLブランチ基盤sashikiをOSS公開"
 date: 2026-09-07
 tags: ["sashiki", "ZFS", "MySQL", "PRプレビュー", "AWS", "Lambda", "OSS", "データベース"]
 description: "ZFS の CoW クローンで MySQL を git のブランチのように扱う話を、PoC(1.3秒)→ FSx(分の世界)と検証してきた続編。今回はそれを製品化して sashiki という OSS にし、v0.2.0 で公開した。PR を開くと数秒で本物データ入りの MySQL プレビューがサブドメインで開くところまで AWS 実機で組み、その過程で proxy の DB 転送バグ・half-close といった『実運用でしか出ないバグ』を炙り出した記録。設計レビューで何が変わったか、汎用性はどこまであるかも正直に。"

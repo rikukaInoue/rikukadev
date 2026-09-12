@@ -1,10 +1,9 @@
 // 記事タイトルの長さ検査。全角 1 字・半角 0.5 字換算で上限 20 字。
-// 既存記事は対象外(CUTOFF 以降の date の記事にだけ適用する)。
+// 全記事に適用(2026-09-12 に既存記事も含めて全タイトルを揃えた)。
 import { readdirSync, readFileSync } from "node:fs";
 
 const DIR = "src/content/blog";
 const LIMIT = 20;
-const CUTOFF = process.env.TITLE_RULE_CUTOFF || "2026-09-13";
 
 const width = (s) =>
   [...s].reduce((n, ch) => n + (ch.charCodeAt(0) <= 0x7f ? 0.5 : 1), 0);
@@ -14,8 +13,7 @@ for (const f of readdirSync(DIR).filter((f) => f.endsWith(".mdx"))) {
   const src = readFileSync(`${DIR}/${f}`, "utf8");
   const fm = src.match(/^---\n([\s\S]*?)\n---/);
   const title = fm?.[1].match(/^title:\s*"(.*)"\s*$/m)?.[1];
-  const date = fm?.[1].match(/^date:\s*(\S+)/m)?.[1];
-  if (!title || !date || date < CUTOFF) continue;
+  if (!title) continue;
   const w = width(title);
   if (w > LIMIT) {
     console.error(

@@ -1,5 +1,5 @@
 ---
-title: "Cognitoを永続化層として割り切る — 認証基盤の差し替え可能性を設計する"
+title: "Cognitoは永続化層と割り切る"
 date: 2026-05-21
 tags: ["Go", "AWS", "Cognito", "アーキテクチャ", "リファクタリング", "認証"]
 description: "自前OIDCプロバイダーを持つGo認証サービスで、Cognitoへの依存を永続化層として抽象化した。全経路のJWT発行を自前に統一し、usecase層にCredentialStore/ProviderStore/UserRepository interfaceを切ることで、Cognitoを透過的に差し替え可能にするまでの設計と実装の記録。"
