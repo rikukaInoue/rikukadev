@@ -1,0 +1,307 @@
+---
+title: "プレビュー環境の入口はこう選ぶ"
+date: 2026-09-14
+tags: ["AWS", "アーキテクチャ", "ALB", "API Gateway", "CloudFront", "Lambda", "ECS", "プレビュー環境"]
+description: "Web アプリをプレビュー環境として立てるとき、入口(配信の形)は static / Lambda / API Gateway / ALB / CloudFront+Lambda@Edge のどれを選ぶべきか。課金形態・タイムアウト上限・認証方式・ルーティングの単位という4つの軸で決まる理由を、実測値と判定フローで整理する。"
+---
+
+## 今北産業
+
+1. プレビュー環境の入口は 5 通りあるが、選択は **課金形態・タイムアウト上限・認証方式・ルーティングの単位** の 4 つでほぼ決まる
+2. とくに **「ベースを共有すべきか」は入口の課金形態が決める**。ALB は固定費があるので共有必須、CloudFront と API Gateway は固定費が無いので共有しなくてよい
+3. この判定はリポジトリを読めば 8 割自動化できる。実際に判定を純関数として実装し、`kagerou diagnose` として切り出した
+
+## 前提: 何を作ろうとしているのか
+
+PR ごと・E2E ごとに**使い捨ての環境**を AWS に立てる、という話をする。本番と違って
+以下の性質があるので、本番構成をそのまま縮小コピーするのは最適ではない。
+
+- **短命**(数時間〜数日)。TTL で勝手に消える
+- **同時に何個も**立つ(PR の数だけ)
+- **アイドルが長い**。レビュアーが見る数分以外は誰も触らない
+- **社内限定**が普通。公開したくない
+
+この 4 つが、後で効いてくる。
+
+## 入口は 5 通り
+
+```mermaid
+graph LR
+    subgraph なし["compute なし"]
+        S["static<br/>S3 + CloudFront"]
+    end
+    subgraph 単一["compute あり・単一"]
+        L["Lambda + Web Adapter"]
+    end
+    subgraph 複数["compute あり・複数コンテナ"]
+        A["API Gateway<br/>+ VPC Link + ECS"]
+        B["共有 ALB + ECS"]
+    end
+    subgraph 認証["認証を前段で"]
+        E["CloudFront<br/>+ Lambda@Edge"]
+    end
+    E -.->|"オリジンは何でもよい"| L
+    E -.-> A
+    E -.-> S
+```
+
+実測を並べるとこうなる(東京リージョン、環境 1 つあたり)。
+
+| 入口 | 固定費 | 環境作成 | 環境削除 | リクエスト上限 |
+|---|---|---|---|---|
+| static(S3+CloudFront) | なし | 数十秒 | 数秒 | — |
+| Lambda + LWA | なし | 2〜3 分 | 2〜3 分 | 15 分 |
+| API Gateway + ECS | なし | 3 分 40 秒 | 2 分 18 秒 | **30 秒** |
+| 共有 ALB + ECS | **約 18 ドル/月** | 2 分 46 秒 | 3〜4 分 | 4000 秒 |
+| CloudFront + Lambda@Edge | なし | (前段のみ) | — | 約 60 秒 |
+
+## 軸 1: 課金形態が「共有すべきか」を決める
+
+ここが一番大きい。**固定費があるかどうかで、ベース(共通基盤)の設計が反転する。**
+
+```mermaid
+graph TB
+    Q{"入口に固定費はあるか"}
+    Q -->|"ある(ALB)"| SH["共有が必須<br/>PR ごとに作ると PR 5 本で月 90 ドル<br/>環境が作るのはリスナールールと<br/>ターゲットグループだけ(無料)"]
+    Q -->|"ない(CloudFront / API Gateway)"| PER["共有しなくてよい<br/>アプリごと・環境ごとに作っても<br/>費用はほとんど増えない"]
+```
+
+CloudFront は従量課金、ACM は無料、Route53 レコードは事実上ゼロ。**per-app でベースを
+増やしても増えるのは初回の証明書検証 + 配信作成の待ち時間(約 15 分)だけ**で、
+月額はほぼ変わらない。だから「アプリごとに 1 つ」が既定でよい。
+
+ALB は逆で、置いておくだけで課金される。プレビュー環境と両立させるには
+**ALB・証明書・DNS・ECS クラスタを共有**し、環境が作るのはリスナールールと
+ターゲットグループ(どちらも無料)だけにする。
+
+```mermaid
+graph TB
+    subgraph 共有ベース["共有ベース(1 回だけ作る)"]
+        ALB["ALB(固定費)"]
+        C["ワイルドカード証明書"]
+        R53["Route53 *.example.com"]
+        CL["ECS クラスタ"]
+    end
+    subgraph env1["環境 pr-42(CFN スタック 1 個)"]
+        R1["リスナールール<br/>host = pr-42.…"]
+        T1["ターゲットグループ"]
+        S1["ECS サービス(Fargate)"]
+    end
+    subgraph env2["環境 pr-43"]
+        R2["リスナールール"]
+        T2["ターゲットグループ"]
+        S2["ECS サービス"]
+    end
+    ALB --- R1 --- T1 --- S1
+    ALB --- R2 --- T2 --- S2
+```
+
+## 軸 2: タイムアウト上限が構成を殺すことがある
+
+意外に見落としやすいのがこれ。**WebSocket や長い処理があると、入口の候補が一気に減る。**
+
+| 入口 | 上限 | WebSocket |
+|---|---|---|
+| API Gateway HTTP API | **30 秒** | 実質不可(別途 WebSocket API が要る) |
+| CloudFront | 約 60 秒(オリジン応答) | 通せるが長時間は不利 |
+| ALB | 4000 秒まで設定可 | ✅ |
+| Lambda | 15 分 | 単一コンテナなら可 |
+
+つまり **WebSocket / SSE / 長いバッチ API があるなら、固定費を払ってでも ALB**、という
+判断になる。逆にリクエストが常に短いなら、固定費ゼロ側を選ばない理由が無い。
+
+## 軸 3: 認証方式 — プレビューは社内限定が普通
+
+「Google Workspace の社員だけ入れる」はよくある要件で、**これが入口の選択を一番強く
+縛る**。ブラウザのログインリダイレクト(OIDC の認可コードフロー)を誰が担うかが
+入口ごとに違うからだ。
+
+```mermaid
+sequenceDiagram
+    participant U as ブラウザ
+    participant E as 入口
+    participant G as Google
+    participant A as アプリ
+    U->>E: GET /
+    E-->>U: 302 → Google
+    U->>G: ログイン
+    G-->>U: code
+    U->>E: code
+    E->>G: token 交換 + ID トークン検証
+    E-->>U: セッション Cookie
+    U->>E: GET /(Cookie あり)
+    E->>A: 転送(+ claims をヘッダで)
+```
+
+この「E」を誰がやるか:
+
+| 入口 | ブラウザのログイン | 実装量 |
+|---|---|---|
+| **ALB** | `authenticate-oidc` アクションで**標準搭載** | **コード 0 行**(設定のみ) |
+| **CloudFront + Lambda@Edge** | viewer-request で自前実装 | コードあり。ただし **static も守れる** |
+| API Gateway HTTP API | **できない**(JWT オーソライザーはトークン検証のみ) | 前段に CloudFront が要る |
+| S3 単体 | できない | 同上 |
+
+ALB の月 18 ドルは、この文脈では **「認証をコード 0 行で買う値段」** という意味を持つ。
+一方 Lambda@Edge は固定費ゼロで、**静的配信にも同じ認証をかけられる**唯一の選択肢。
+代わりに環境変数が使えない(シークレットをコードに焼くか SSM から読む)、
+デプロイ伝播が数分かかる、という運用コストを払う。
+
+### `hd` はヒントであって強制ではない
+
+Google の OIDC で「Workspace のドメインだけ」を実現するとき、認可リクエストに
+`hd=example.com` を付ける方法がよく紹介される。**これは UI のヒントで、強制ではない。**
+きちんと締めるなら **ID トークンの `hd` クレームを検証する**。ALB なら
+`x-amzn-oidc-data`(署名付き JWT)がアプリに渡ってくるので、そこを見る。
+
+## 軸 4: ルーティングの単位 — URL を変えないために
+
+プレビューの URL をパス型にすると、アプリ側に影響が出る。
+
+```
+https://preview.example.com/pr-42/...   ← basePath 対応、Cookie スコープ、
+                                           SPA ルーティングが全部影響を受ける
+https://pr-42.app.example.com/...       ← 本番とほぼ同じ挙動
+```
+
+**Host ベースにするのが基本**。ここで入口ごとの制約が出る:
+
+- **ALB**: リスナールールの条件に **host-header** が使える → 1 本の ALB を共有しつつ
+  Host で環境を分けられる
+- **API Gateway HTTP API**: ルートキーは **メソッド + パス**で、**Host を見ない**。
+  1 つの API を共有すると全環境が `ANY /{proxy+}` を取り合って衝突する →
+  **環境ごとに API を持つ**(固定費ゼロなので問題ない)
+- **CloudFront + Lambda@Edge**: origin-request で Host を見てオリジンを差し替えられる →
+  1 つの配信で何環境でも捌ける
+
+```mermaid
+graph TB
+    subgraph ALBの場合["ALB: 1 本を共有し Host で分岐"]
+        A1["ALB"] --> AR1["rule: pr-42.…"] --> AT1["env pr-42"]
+        A1 --> AR2["rule: pr-43.…"] --> AT2["env pr-43"]
+    end
+    subgraph APIGWの場合["API Gateway: 環境ごとに API"]
+        AP1["API(pr-42)"] --> AE1["env pr-42"]
+        AP2["API(pr-43)"] --> AE2["env pr-43"]
+    end
+```
+
+ちなみにワイルドカード証明書は **1 ラベルしか覆えない**。`*.example.com` は
+`pr-42.example.com` に一致するが `pr-42.todo.example.com` には**一致しない**。
+1 つのドメインを複数アプリで共有したいなら、`todo--pr-42.example.com` のように
+**project を同じラベルに畳む**か、アプリを足すたびに証明書へ SAN を追加することになる。
+
+## 判定フロー
+
+以上をまとめると、こうなる。
+
+```mermaid
+graph TB
+    Start["リポジトリを読む"] --> HasServer{"サーバはあるか"}
+    HasServer -->|"無い(ビルド成果物だけ)"| AuthS{"認証は要るか"}
+    AuthS -->|"不要"| Static["static<br/>S3 + CloudFront"]
+    AuthS -->|"必要"| Edge1["CloudFront + Lambda@Edge<br/>(ALB は S3 を守れない)"]
+
+    HasServer -->|"ある"| Auth{"認証は要るか"}
+    Auth -->|"必要"| RT2{"WebSocket / 長い処理"}
+    RT2 -->|"ある"| ALB1["共有 ALB<br/>authenticate-oidc はコード 0 行"]
+    RT2 -->|"ない"| Fixed{"固定費を許容できるか"}
+    Fixed -->|"はい / 既に ALB がある"| ALB2["共有 ALB"]
+    Fixed -->|"いいえ"| Edge2["CloudFront + Lambda@Edge"]
+
+    Auth -->|"不要"| RT{"WebSocket / 長い処理"}
+    RT -->|"ある"| ALB3["共有 ALB<br/>30 秒・60 秒の壁を越える唯一の道"]
+    RT -->|"ない"| Multi{"サービスは複数か"}
+    Multi -->|"複数"| APIGW["API Gateway + ECS"]
+    Multi -->|"単一"| Lambda["Lambda + Web Adapter"]
+```
+
+原則は **「安くて早い方から降り、その構成では無理な理由があるときだけ次へ」**。
+プレビュー環境は本番と同じ構成である必要がないので、本番が ALB でもプレビューは
+API Gateway で足りることは多い。
+
+## リポジトリから何が分かるか
+
+この判定の入力は、実はほとんどリポジトリから取れる。
+
+| 判定に要る事実 | どこから読むか |
+|---|---|
+| サーバがあるか | Dockerfile / `EXPOSE` / compose の ports |
+| サービス数 | compose の services / `cmd/*/main.go` / Dockerfile の数 |
+| WebSocket / SSE | `gorilla/websocket`, `socket.io`, `EventSource` などの依存 |
+| listen ポート | `EXPOSE`(マルチステージなら最後)/ compose |
+| DB を使うか | `mysql2`, `pg`, `go-sql-driver/mysql` などの依存 |
+
+逆に**リポジトリからは絶対に分からないこと**もある。
+
+- ALB の固定費を許容できるか(組織の事情)
+- 社内限定にする必要があるか
+- ドメインをどこまで使ってよいか
+
+だから **自動判定ではなく「検出で既定を決める推薦」** にするのが正しい。
+機械が決めるのは既定値だけで、決められない部分は聞く。そして**選ばなかった選択肢の
+理由を見せる**ことが大事で、「なぜ Lambda ではなく ECS なのか」が分からないまま
+生成されるより、1 行の理由がある方がずっといい。
+
+## 実装: 判定を純関数として切り出す
+
+[kagerou](https://github.com/rikukadev/kagerou)(PR ごとのプレビュー環境を作る OSS)に
+これを実装した。構造はこう分けてある。
+
+```mermaid
+graph LR
+    R["リポジトリ"] --> Scan["appscan.Scan<br/>ファイルを読むだけ<br/>stdlib のみ"]
+    Scan --> Facts["Facts<br/>(事実)"]
+    Facts --> Rec["recommend.Entry<br/>純関数<br/>AWS も設定も触らない"]
+    Opt["Options<br/>(認証が要るか等)"] --> Rec
+    Rec --> Choice["Choice<br/>既定 + 選ばなかった理由"]
+    Choice --> W["ウィザード(既定値として使う)"]
+    Choice --> D["diagnose(表示するだけ)"]
+```
+
+**事実の収集・判定・実行を分けておく**と、判定だけを単体で使える。実際
+`kagerou diagnose` は、どのリポジトリでも**ファイルを 1 つも書かず AWS も呼ばずに**
+実行できる:
+
+```
+$ kagerou diagnose --dir ../some-app
+kagerou diagnose  acme/shop
+
+detected
+  framework    go
+  services     3
+  port         8080
+  dockerfile   yes
+
+recommended
+❯ apigateway  複数サービスを固定費ゼロで動かせる(リクエストは 30 秒まで)
+  alb         上限は無いが、月 18 ドル前後の固定費がかかる
+  lambda      単一コンテナ向け(複数サービスを検出)
+
+no files were written and no AWS calls were made.
+```
+
+仮定を変えて試せるのも実用的で、`--auth` を付けると既定が入れ替わる:
+
+```
+$ kagerou diagnose --dir ../some-app --auth
+❯ edge        固定費ゼロ。static も同じ認証で守れる(認証は自前実装)
+  alb         認証はコード 0 行だが、月 18 ドル前後の固定費がかかる
+  apigateway  ブラウザのログインリダイレクトができない
+```
+
+判定が純関数なので、テストは表で書ける。これが一番の利点だと思う——
+「WebSocket があるなら API Gateway を既定にしない」のような**設計判断そのものを
+テストで固定**できる。
+
+## まとめ
+
+- 入口の選択は **課金形態・タイムアウト上限・認証方式・ルーティングの単位** で決まる
+- **固定費の有無がベースを共有すべきかを決める**。ALB だけが共有必須
+- **タイムアウト上限は静かに構成を殺す**。WebSocket があるだけで候補が 1 つに絞られる
+- **認証を前提にすると ALB と Lambda@Edge の一騎打ち**になる。「コード 0 行」と
+  「固定費ゼロ + static も守れる」のトレードオフ
+- 判定は**事実の収集 → 判定 → 実行**に分けると、判定だけを単体で使える
+
+関連: [PR ごとに現れて消える環境を OSS にした](/blog/kagerou-ephemeral-environments/)、
+[信頼ポリシーが正しいのに OIDC が拒否される](/blog/github-actions-oidc-id-sub-claim/)
