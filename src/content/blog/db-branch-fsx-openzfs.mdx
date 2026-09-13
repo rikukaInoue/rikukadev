@@ -5,7 +5,7 @@ tags: ["AWS", "FSx", "ZFS", "MySQL", "NFS", "データベース", "PoC"]
 description: "EC2ローカルZFSで1.3秒だったMySQLブランチ複製をFSx for OpenZFSで作り直した検証記録。クローン52〜71秒・restore10分超・delete6分という『分の世界』のコントロールプレーンを実測し、resetは restore API ではなく新クローン+付け替えが正解形という結論に。復元中ボリュームへ mysqld を起動して datadir を壊した事故の記録も。"
 ---
 
-## 今北産業
+## TL;DR
 
 1. ZFS のスナップショット/クローン(CoW)を使うと、MySQL のデータベースを **git のブランチのように「複製・壊す・巻き戻す・捨てる」できる**([MonotaRO Tech Blog の手法](https://tech-blog.monotaro.com/entry/2026/09/03/090000))
 2. [前回](/blog/db-branch-zfs-mysql-poc/)、EC2 ローカルの ZFS で最小再現して **create 1.3 秒・コピーのディスク消費ほぼゼロ**を実測した

@@ -5,7 +5,7 @@ tags: ["GA4", "Search Console", "Google Cloud", "CLI", "Route53", "ブログ"]
 description: "静的ブログへの GA4 導入と Search Console 登録を Analytics Admin API / Site Verification API でほぼ CLI 完結させた実践記録。gcloud 標準クライアントが analytics スコープでブロックされる問題、API 作成プロパティ特有の『データ収集の確認』ハマり、Measurement Protocol の 204 が成功を意味しない話まで。"
 ---
 
-## 今北産業
+## TL;DR
 
 1. GA4 のプロパティ作成〜測定 ID 取得、Search Console のドメイン登録〜sitemap 送信は**全部 API で完結できる**(Analytics Admin API / Site Verification API / Search Console API)
 2. ただし `gcloud auth` に analytics スコープを足す王道ルートは**「このアプリはブロックされます」で死ぬ**。正解形は**サービスアカウントを GA に招待する**方式
