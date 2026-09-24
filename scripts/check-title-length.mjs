@@ -1,9 +1,11 @@
-// 記事タイトルの長さ検査。全角 1 字・半角 0.5 字換算で上限 20 字。
+// 記事タイトルの長さ検査。全角 1 字・半角 0.5 字換算で上限 32 字。
 // 全記事に適用(2026-09-12 に既存記事も含めて全タイトルを揃えた)。
+// 上限は 20 字だったが、サービス名が長いものが収まらないため 32 字に緩めた
+// (2026-09-24)。
 import { readdirSync, readFileSync } from "node:fs";
 
 const DIR = "src/content/blog";
-const LIMIT = 20;
+const LIMIT = 32;
 
 const width = (s) =>
   [...s].reduce((n, ch) => n + (ch.charCodeAt(0) <= 0x7f ? 0.5 : 1), 0);
