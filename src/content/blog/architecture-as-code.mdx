@@ -66,6 +66,12 @@ CONSTRAINT fk FOREIGN KEY (gear_item_id) REFERENCES gear.items(id)
 依存検査ツールも同じ思想だ。ここで言いたいのは、それを特別な儀式ではなく
 **ふつうの CI ジョブとして日常に置く**と、アーキテクチャ文書の性格が変わるということ。
 
+用語としての "Architecture as Code" 自体も既にある。大きく2系統で、
+Structurizr / C4 のように**アーキテクチャのモデルをコードで記述する**系
+（diagrams as code の延長。FINOS の Architecture as Code イニシアチブ = CALM も
+機械可読モデル + 検証という形でこちら寄り）と、fitness function のように
+**制約をテストで強制する**系。この記事で言っているのは後者だ。
+
 ## 検査は「常に通る側」に倒れる
 
 ただし強制層には固有の罠がある。**検査自体のバグは、ほぼ必ず「通る側」に倒れる**。
@@ -97,7 +103,9 @@ CONSTRAINT fk FOREIGN KEY (gear_item_id) REFERENCES gear.items(id)
 
 Infrastructure as Code がインフラの**状態**を宣言としてコード化したのに対して、
 これは**不変条件**を検査としてコード化する。IaC は「望む姿」を書く。こちらは
-「破ってはいけない線」を書く。名前を付けるなら architecture as code だと思う。
+「破ってはいけない線」を書く。architecture as code という既存の言葉に乗るなら、
+この記事の主張は「制約強制系の AaC に、**証拠（実測）と判断（ADR）を束ねて
+1つの成果物にする**」という変奏で、新しいのはせいぜいその束ね方だけだ。
 
 3点のどれが欠けても弱い。判断だけ（ADR だけ）だと最初の実例のように1行で破られる。
 強制だけだと、なぜその検査があるのか分からなくなった頃に消される。
