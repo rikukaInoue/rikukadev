@@ -24,6 +24,30 @@ kagerou:owner       arn:…:role/…    作成者。他人の環境への同名 
 kagerou:url         https://…       作成前に確定した URL
 ```
 
+環境 1 つの全体像はこうなる。共有ベース(CloudFront / DNS / バケット)は全環境で 1 組しかなく、環境の増分は「タグ付きの極小スタック」と「S3 のプレフィックス」だけだ。
+
+```mermaid
+graph TB
+    subgraph shared["共有ベース(全環境で 1 組・固定費はここに集約)"]
+        DNS["Route53<br/>*.spa-demo.rikuka.dev"]
+        CF["CloudFront"]
+        B["S3 バケット"]
+        DNS --> CF --> B
+    end
+    subgraph env1["環境 demo-cli(増分はこれだけ)"]
+        ST1["メタ CFN スタック<br/>kagerou:name = demo-cli<br/>kagerou:expires-at = …<br/>kagerou:owner = …"]
+        P1["S3 プレフィックス<br/>demo-cli/"]
+    end
+    subgraph env2["環境 pr-42"]
+        ST2["メタ CFN スタック"]
+        P2["pr-42/"]
+    end
+    B --- P1
+    B --- P2
+    ST1 -. "台帳(list / reap が読む)" .-> P1
+    ST2 -.-> P2
+```
+
 この設計の含意は 2 つある。第一に、**kagerou 自身が落ちても壊れる状態が無い**。`list` も `reap` も AWS への問い合わせだけで再構成できる。第二に、環境の発見・回収・期限判定がすべて「タグを読む」に還元されるので、コンポーネント間の契約が小さい。
 
 面白いのは compute を持たない static driver でもスタックを作ることだ。S3 のプレフィックスに直接タグは打てないので、**タグの担い手として実リソースをほぼ持たない極小スタックを作る**。「環境 = スタック 1 個」という不変条件を守ると、list / reap / TTL のコードパスが driver に依らず共通になる。例外を作らないためのダミーである。
@@ -39,7 +63,22 @@ demo-cli	ready	https://demo-cli.spa-demo.rikuka.dev
 kagerou up  … 33.994 total
 ```
 
-順に分解する。
+順に分解する。全体の流れを先に図にすると:
+
+```mermaid
+sequenceDiagram
+    participant U as kagerou up
+    participant CFN as CloudFormation
+    participant H as post_up フック
+    participant S3 as S3(共有バケット)
+    Note over U: (1) url_template から URL 確定<br/>(AWS を呼ぶ前)
+    U->>CFN: (2) メタスタック作成(タグ + owner)
+    CFN-->>U: ready
+    U->>H: (3) KAGEROU_NAME / URL / Outputs を渡す
+    H->>H: dist/config.json を環境の値で書く
+    U->>S3: (4) dist/ を demo-cli/ へ同期
+    Note over S3: 同期 = 公開
+```
 
 ### (1) URL の確定 — 作る前に決まっている
 
@@ -82,6 +121,20 @@ demo-cli	ready	2026-10-01T14:02:24Z	https://demo-cli.spa-demo.rikuka.dev
 1. **イベント駆動**: PR close → `kagerou down`
 2. **時間駆動**: cron の `kagerou reap` が `expires-at + grace` を過ぎた環境を回収
 
+```mermaid
+graph LR
+    subgraph event["イベント駆動(即時性)"]
+        C["PR close"] --> D["kagerou down"]
+    end
+    subgraph time["時間駆動(最終保証)"]
+        CR["cron(6h ごと)"] --> R["kagerou reap"]
+        R --> Q{"expires-at + grace<br/>を過ぎている?"}
+        Q -- yes --> D2["down"]
+        Q -- no --> S["skip"]
+    end
+    C -. "落ちても(workflow 失敗 / fork PR)" .-> R
+```
+
 1 だけだと close イベントの取りこぼし(workflow の失敗、fork PR、手動作成)で環境が漏れる。2 だけだと消えるまで最大 TTL ぶん待つ。両方あると、1 が普段の即時性を、2 が最終保証を持つ。`--grace 1h` は「作成直後の環境を期限判定の境界で巻き込まない」ための猶予だ。
 
 常設したい環境(後述の peer の供給源など)は `--ttl none` を明示する。既定を無期限にしないのは意図的で、**例外(消えない環境)を作る側に宣言コストを払わせる**設計になっている。
@@ -96,6 +149,18 @@ $ aws s3 ls s3://…/demo-cli/
 ```
 
 残骸ゼロ。ここには順序の議論がある。消すものは「S3 プレフィックス」と「メタスタック」の 2 つで、**S3 が先、スタックが後**でなければならない。
+
+```mermaid
+graph TB
+    subgraph bad["スタック先行(だめ): 部分失敗で孤児が生まれる"]
+        B1["スタック削除 ✓"] --> B2["S3 削除 ✗ 失敗"]
+        B2 --> B3["公開オブジェクトは生きているのに<br/>台帳(タグ)が無い<br/>= list にも reap にも見えない"]
+    end
+    subgraph good["S3 先行(こちら): 失敗しても台帳が残る"]
+        G1["S3 削除 ✗ 失敗"] --> G2["スタック削除まで進まない"]
+        G2 --> G3["環境は『消し残しあり』として<br/>見え続ける → 次の reap が再試行"]
+    end
+```
 
 逆(スタック先行)だと、S3 の削除が途中で失敗したときに致命的な状態になる。公開オブジェクトは生きているのに、環境を発見する唯一の台帳であるスタック(のタグ)が消えている。`list` にも `reap` にも出てこないので、以後どの自動処理からも見えない。**公開されたまま、誰にも見つけられない孤児**だ。
 
@@ -127,6 +192,21 @@ ALB のような固定費のかかる入口は環境ごとに作らず、**共�
 
 ```
 ValidationError: Parameters: [EnvRulePriority] must have values
+```
+
+```mermaid
+graph LR
+    subgraph base["共有ベース(一度だけ deploy)"]
+        ALB["ALB + リスナー"]
+    end
+    SSM["SSM Parameter Store<br/>/kagerou/base/&lt;project&gt;/alb_listener_arn"]
+    subgraph up["環境の up"]
+        K["kagerou"] --> RES["空き優先度を自動確保"]
+        RES --> CFN2["EnvRulePriority に注入"]
+    end
+    ALB -- "ARN を書く" --> SSM
+    SSM -- "読む" --> RES
+    ALB -. "ベースを消すと SSM ごと消え<br/>確保が静かに不発 →<br/>遠い場所(CFN 検証)で落ちる" .-x RES
 ```
 
 実際に踏んだもので、因果はこうなる。ALB のリスナールールには一意な優先度が要り、kagerou はテンプレートが `EnvRulePriority` を宣言していて値が来ていないとき、**共有リスナーの空き優先度を自動確保して埋める**。その確保はリスナー ARN を SSM から引けることが前提。ベースが消えると SSM ごと消え、自動確保が静かに不発になり、CloudFormation のパラメータ検証という遠い場所でエラーになる。
