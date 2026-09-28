@@ -1,0 +1,187 @@
+---
+title: "34秒で生えて31秒で消えるプレビュー環境"
+date: 2026-09-28
+tags: ["kagerou", "AWS", "preview", "CloudFormation", "S3", "GitHub Actions"]
+description: "自作 OSS kagerou でプレビュー環境を 1 周(diagnose → up → 検証 → down)する手順を、実測の出力ごと残す。URL が作成前に確定する理由、TTL がすべての環境に付く理由、消したあとに残骸がゼロになる仕組みまで。"
+---
+
+## はじめに
+
+[kagerou](https://github.com/rikukadev/kagerou) は PR ごとの使い捨て環境を作る自作 OSS で、[設計の話は以前書いた](/blog/kagerou-ephemeral-environments)。今回は使い方に絞る。1 コマンドずつ、実際の出力と所要時間ごと残す。
+
+題材は [kagerou-spa-demo](https://github.com/rikukadev/kagerou-spa-demo)。ビルドすると `dist/` が出てくるだけの、サーバを持たない SPA だ。
+
+## 0. インストール
+
+リリースのバイナリを置くだけ。npm(`npx kagerou`)でも入る。
+
+```console
+$ curl -fsSLo k.tar.gz https://github.com/rikukadev/kagerou/releases/download/v0.18.2/kagerou_0.18.2_darwin_arm64.tar.gz
+$ tar -xzf k.tar.gz kagerou
+$ ./kagerou version
+kagerou 0.18.2+f99e3c5
+```
+
+## 1. diagnose — 何が起きるかを先に見る
+
+いきなり作らない。`diagnose` は**読み取り専用**で、ファイルも書かないし AWS も呼ばない。「このリポジトリで up したら何が起きるか」の下見だけをする。
+
+```console
+$ kagerou diagnose
+kagerou diagnose  rikukadev/kagerou-spa-demo
+
+detected
+  framework    node
+  services     0
+
+recommended
+❯ static      サーバが見つからない。最安・最速(環境は S3 プレフィックスだけ)
+  lambda      compute が要らないので不要
+
+architecture
+  Browser
+  │
+  ▼
+  CloudFront    共有ベース。全環境で 1 本(環境ごとには作らない)
+  │
+  ▼
+  S3  <name>/   node の静的成果物。環境ぶんは S3 のプレフィックスだけ
+
+no files were written and no AWS calls were made.
+```
+
+リポジトリを読んで「サーバが無い」ことを検出し、compute を持たない `static` driver を推薦している。この場合、環境 1 つの実体は **S3 のプレフィックス 1 つ**だ。Lambda も ECS も作らないので、生やすのも消すのも速く、環境あたりの追加コストはほぼゼロになる。
+
+初回はこのあと `kagerou init` が設定と workflow 一式を書き出すが、このリポジトリは導入済みなので次へ。
+
+## 2. kagerou.yaml — 環境の定義はこれだけ
+
+```yaml
+project: spa-demo
+driver: static
+region: ap-northeast-1
+name_prefix: spa-demo-
+ttl: 72h
+url_template: "https://{name}.spa-demo.rikuka.dev"
+static:
+  dist: dist
+  bucket: kagerou-base-spa-demo-199410355960
+hooks:
+  post_up: ./scripts/write-config.sh
+```
+
+読むときの勘所は 3 つ。
+
+**`ttl: 72h`** — kagerou の環境は全部 TTL 必須。イベント駆動の削除(PR close)が失敗しても、cron の `reap` が期限切れを回収する。「消し忘れた環境が残り続ける」という状態が構造的に存在しない。
+
+**`url_template`** — URL が**環境を作る前に確定**する。`https://{name}.spa-demo.rikuka.dev` の `{name}` は環境名で、DNS はワイルドカードで受けている。「スタックを作るまで URL が分からない」と、CORS の許可元や OAuth のコールバックをテンプレートに書けず、循環参照との戦いになる。先に決まっていればただのパラメータだ。
+
+**`hooks.post_up`** — 静的サイトはビルド時に環境を知らない。環境ごとに違う値(API の URL とか)は、up の後・同期の前にフックで `config.json` として差し込む。ビルド成果物そのものは全環境で同一に保つ。
+
+## 3. ビルド — kagerou はビルドしない
+
+```console
+$ npm ci && npm run build
+✓ built in 396ms
+```
+
+kagerou は「ビルド済みの成果物を環境にする」道具で、ビルドには関与しない。ここは責務の境界で、フレームワークが何であろうと `dist/` が出てくれば同じに扱える。
+
+## 4. up — 34 秒
+
+```console
+$ kagerou up --name demo-cli
+kagerou: creating spa-demo-demo-cli (30s)
+kagerou: creating spa-demo-demo-cli done (30s)
+wrote dist/config.json for demo-cli
+demo-cli	ready	https://demo-cli.spa-demo.rikuka.dev
+
+kagerou up  0.03s user 0.06s system 0% cpu 33.994 total
+```
+
+やっていることは 3 つ。
+
+1. **メタ CloudFormation スタックを作る。** static driver ではリソースをほぼ持たない極小スタックで、役目はタグ(`kagerou:name` / `kagerou:expires-at` など)と URL の担い手。kagerou は専用の状態ストアを持たず、このタグが真実の源になる
+2. `post_up` フックが `dist/config.json` を環境の値で書く
+3. `dist/` を `s3://<bucket>/demo-cli/` へ同期する
+
+## 5. 検証 — 生きているか、環境固有か
+
+```console
+$ curl -so /dev/null -w '%{http_code} %{time_total}s\n' https://demo-cli.spa-demo.rikuka.dev/
+200 0.938696s
+
+$ curl -s https://demo-cli.spa-demo.rikuka.dev/config.json
+{
+  "env": "demo-cli",
+  "apiBaseUrl": "https://api.github.com/repos/rikukadev/kagerou",
+  "builtAt": "2026-09-28T14:02:55Z",
+  "commit": "local"
+}
+```
+
+`"env": "demo-cli"` — 同一ビルドなのに環境ごとの値が返っている。フックの仕組みが働いている証拠だ。
+
+```console
+$ kagerou list
+demo-cli	ready	2026-10-01T14:02:24Z	https://demo-cli.spa-demo.rikuka.dev
+```
+
+一覧には **TTL の期限**(72 時間後)が出る。ここで手を止めて忘れても、この日時を過ぎれば reap が消す。
+
+## 6. down — 31 秒、残骸ゼロ
+
+```console
+$ kagerou down --name demo-cli
+kagerou: deleting spa-demo-demo-cli done (30s)
+
+$ kagerou list
+(空)
+$ curl -so /dev/null -w '%{http_code}\n' https://demo-cli.spa-demo.rikuka.dev/index.html
+403
+$ aws s3 ls s3://kagerou-base-spa-demo-199410355960/demo-cli/
+(空)
+```
+
+スタックも S3 も残らない。順序は **S3 を先、スタックを後**。逆だと S3 の削除が失敗したときに「公開オブジェクトは生きているのに、環境を追跡する台帳(スタック)だけ消えている」状態になり、以後どの定期処理からも見えない孤児になる。この順なら失敗しても台帳が残るので、次の reap が再試行する。
+
+`DeleteObjects` は HTTP 200 でも要素ごとの失敗を返すので、そこも検査している。消えていないものを消したことにすると、down では公開物が残り、sync では古いファイルが公開され続ける。
+
+## 7. CI に載せる — 同じことを PR に紐付けるだけ
+
+手元でやった up / down を、PR の open / close に紐付けたものが pr-preview になる。
+
+```yaml
+# .github/workflows/kagerou-preview.yml(抜粋)
+- run: npm ci && npm run build
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+- uses: rikukadev/kagerou/action@v0
+  with:
+    name: pr-${{ github.event.pull_request.number }}
+```
+
+PR を開くと `https://pr-42.spa-demo.rikuka.dev` が生え、URL が PR にコメントされ、閉じると消える。close イベントが落ちても TTL + reap が拾う。
+
+## つまずいた前提を 2 つ
+
+チュートリアルはここまでだが、実際に別のデモ(SNS/SQS で繋がる 2 アプリの [pub](https://github.com/rikukadev/kagerou-pub-demo)/[sub](https://github.com/rikukadev/kagerou-sub-demo))を最小権限で通したとき、環境そのものではなく**前提**で 2 回つまずいた。記録しておく。
+
+**共有ベースは環境より寿命が長い。** ALB のような固定費のかかる入口は環境ごとに作らず、共有ベースとして一度だけ deploy して SSM に接続情報を書く。このベースをコスト整理で消すと、環境側は `EnvRulePriority must have values` のような**一見無関係なエラー**で落ちる(ALB のリスナー ARN が SSM から引けず、ルール優先度の自動確保が働かないため)。エラーの出る場所と原因の場所が離れているタイプ。
+
+**常設環境には `ttl: none` を明示する。** peer 連動(相手アプリの `main` 環境に繋ぐ)を使うなら、供給源になる `main` は常設でなければならない。ところが TTL は全環境に付くので、何もしないと **main も 72 時間で reap される**。作り直してもまた消える。`--ttl none` で作った環境だけが期限を持たない。
+
+どちらも「全部に TTL が付く」「固定費は共有ベースに寄せる」という設計の裏面で、道具が正しく動いた結果として起きる。設計の性質は、例外を作るときに牙を剥く。
+
+## まとめ
+
+| 操作 | 実測 |
+|---|---|
+| `kagerou up`(static) | 34 秒 |
+| `kagerou down` | 31 秒、残骸ゼロ |
+| PR プレビュー(Lambda コンテナ + SNS/SQS) | 3 分前後 |
+
+1 周が 1 分強で終わるので、「環境を作る」ことの心理的な重さがほぼ消える。E2E のターゲットにも、レビュー用の実物にも、その場のデモにも同じ 3 コマンドで届く。
+
+設計の背景は[前の記事](/blog/kagerou-ephemeral-environments)と [docs/DESIGN.md](https://github.com/rikukadev/kagerou/blob/main/docs/DESIGN.md)、外部が依存してよい契約は [docs/CONTRACT.md](https://github.com/rikukadev/kagerou/blob/main/docs/CONTRACT.md) にある。
