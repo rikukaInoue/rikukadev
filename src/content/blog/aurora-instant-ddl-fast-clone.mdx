@@ -1,0 +1,91 @@
+---
+title: "Aurora MySQLでINSTANT DDLとfast cloneを実測した"
+date: 2026-09-30
+tags: ["AWS", "Aurora", "MySQL", "マイグレーション", "検証"]
+description: "使い捨てのAuroraクラスタを立て、オンラインマイグレーション規約のDDLをALGORITHM明示で実測した。判定はMySQL 8.4と完全一致(ADD CHECKだけCOPY)。fast cloneは2M行を5分34秒で複製し、書き込みの独立も確認。cloneはデプロイの部品でなくリハーサル用。"
+---
+
+[検証リポジトリ](https://github.com/rikukaInoue/greenfield)のマイグレーション規約は
+「デプロイに同梱する DDL は `ALGORITHM=INSTANT` で通る形に揃える。通らない変更は
+例外として個別計画する」という形にしてある。根拠はローカルの MySQL 8.4.11 での実測で、
+たとえば NULL 許容の列追加は INSTANT で通り、CHECK 制約の追加は INSTANT も INPLACE も
+不可（ERROR 1845）で COPY しかない。
+
+この規約を Aurora MySQL に持ち込んだとき、判定は同じなのか。あわせて、
+フィーチャーフラグとオンラインマイグレーションで運用するとき Aurora の fast clone が
+どこで要るのかを、使い捨てのクラスタを立てて測った。
+
+## 交絡を消す: Aurora にも 8.4 互換版がある
+
+Aurora MySQL の主流はバージョン 3 系（MySQL 8.0 互換）だが、それを選ぶと測定結果の差が
+「Aurora の差」なのか「8.0 と 8.4 の差」なのか切り分けられない。エンジン一覧を見ると
+**8.4 互換の `8.4.mysql_aurora.8.4.8`** が存在したので、これを選んで
+Aurora だけを変数にした。比較対象は手元の MySQL 8.4.11（コンテナ）。
+
+構成は Terraform 約170行の使い捨てスタック（VPC + Aurora db.t4g.medium 1台 +
+one-off ECS タスク）。DB は非公開のままにして、SQL は VPC 内の one-off タスク
+（mysql:8.4 イメージ、スクリプトを base64 で command に渡す）で流す。
+apply → 計測 → destroy を当日で回し、費用は $0.3 前後だった。
+
+## 実測1: ALGORITHM の判定は完全一致
+
+2,097,152 行のテーブルに、マイグレーション規約が扱う典型の DDL を
+ALGORITHM 明示で適用した。明示するのは、通らない方式なら ERROR 1845 で
+**判定そのものが結果として返る**ため:
+
+| DDL | Aurora 8.4.8 | MySQL 8.4.11 |
+|---|---|---|
+| ADD COLUMN（NULL 許容）INSTANT | ok 48ms | ok 58ms |
+| ADD KEY INPLACE | ok 8.6s | ok 2.9s |
+| ALTER COLUMN … SET DEFAULT INSTANT | ok 41ms | ok 35ms |
+| ADD CHECK INSTANT | ERROR 1845 | ERROR 1845 |
+| ADD CHECK INPLACE | ERROR 1845 | ERROR 1845 |
+| ADD CHECK COPY, LOCK=SHARED | ok **56.4s** | ok 7.0s |
+| DROP COLUMN INSTANT | ok 124ms | ok 44ms |
+
+**どの方式が通るかは1行も違わなかった。** INSTANT で通る形に揃えるマイグレーション
+規約は、RDS MySQL でも Aurora でもそのまま成り立つ。
+
+所要時間の絶対値はハードが違うので横の比較はできない（手元は Apple Silicon、
+向こうは db.t4g.medium）。読む価値があるのは COPY の絶対値の方で、
+**2M 行で 56 秒**なら1億行では 45 分超の見積もりになる。「ADD CHECK は COPY のみ」は
+本番規模では gh-ost / pt-online-schema-change か保守時間の計画対象、という判断が
+Aurora でも変わらないことが確認できた。
+
+## 実測2: fast clone は5分34秒、待ちの8割はインスタンス
+
+Aurora の fast clone（`restore-db-cluster-to-point-in-time --restore-type
+copy-on-write`）で、2M 行入りのクラスタを複製した:
+
+| 区間 | 所要 |
+|---|---|
+| clone クラスタが available になるまで | 60 秒 |
+| clone 内の DB インスタンスが available になるまで | 274 秒 |
+| **合計（接続可能になるまで）** | **5 分 34 秒** |
+
+ストレージの複製は copy-on-write なので、最初の 60 秒は**データ量に依存しない**。
+残りはインスタンスのプロビジョニングで、これもデータ量と無関係の固定費。つまり
+fast clone の所要時間は、データが 2M 行でも 2 億行でもおおむねこの水準に留まる。
+
+独立性も確認した。clone は 2,097,152 行をそのまま継承し、clone へ INSERT した行は
+元クラスタに現れない（行数・当該行とも波及なし）。
+
+## 位置づけ: clone はデプロイの部品ではなくリハーサル用
+
+測る前の問いは「フィーチャーフラグとオンラインマイグレーションで運用するなら
+Aurora clone が要るのか」だった。数字が出ると答えは素直で:
+
+- デプロイのたびに clone を作る運用は、毎回 5〜6 分 + clone 側インスタンスの課金が
+  乗る。デプロイ側の答えは Blue/Green・カナリアとマイグレーションの失敗ゲート
+  （[ECS ネイティブの実測](/blog/ecs-native-bluegreen-canary/)）であって、clone ではない
+- clone の出番は**リハーサル**にある。本番同等データで COPY 系 DDL の所要時間を
+  事前に測る、壊す予行をする、という用途なら、データ量に依存せず5分半で
+  本番同等の使い捨て DB が出てくるのは十分に速い
+
+## まとめ
+
+- Aurora MySQL 8.4 互換版と MySQL 8.4.11 で、ALGORITHM の判定は完全一致。
+  INSTANT 前提のマイグレーション規約はそのまま持ち込める
+- ADD CHECK は Aurora でも COPY のみ。2M 行 56 秒という絶対値が計画の材料になる
+- fast clone は接続可能まで 5 分 34 秒、所要はデータ量にほぼ依存しない。
+  デプロイの部品ではなく、本番同等データでのリハーサル用
