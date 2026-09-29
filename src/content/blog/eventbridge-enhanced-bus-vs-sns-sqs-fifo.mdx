@@ -25,7 +25,29 @@ description: "2026-09-24 に GA した EventBridge の enhanced custom event bus
 | 再生の正は outbox | SQS は replay できないため、outbox から再 publish する管理コマンドを持つ |
 | ローカル代替 | LocalStack（FIFO の順序・重複排除・可視性タイムアウト・DLQ・ファンアウトを実測して採用） |
 
-ポイントは最後の 2 つです。「再生の正はバスに置かない」「ローカルで同じ経路を組めること」は、機能表には出てこないが設計の成立条件になっている要件です。
+現行構成を図にするとこうです。
+
+```mermaid
+graph LR
+    subgraph 送り手サービス
+        UC["usecase<br/>業務データ + outbox を<br/>同一トランザクションで確定"]
+        OB[("outbox<br/>再生の正")]
+        RELAY["relay<br/>未送信をポーリング"]
+        UC -- "同一 tx" --> OB
+        OB --> RELAY
+    end
+    RELAY -- "Publish<br/>MessageGroupId=集約ID<br/>DeduplicationId=イベントID" --> SNS["SNS FIFO<br/>トピック"]
+    SNS --> Q1["SQS FIFO<br/>受け手Aのキュー"]
+    SNS --> Q2["SQS FIFO<br/>受け手Bのキュー"]
+    subgraph 受け手サービスA
+        C1["consumer"]
+        IB1[("inbox<br/>重複排除の主防御")]
+        Q1 --> C1 -- "同一 tx" --> IB1
+    end
+    Q2 --> C2["受け手B（同構造）"]
+```
+
+ポイントは物差しの最後の 2 つです。「再生の正はバスに置かない」「ローカルで同じ経路を組めること」は、機能表には出てこないが設計の成立条件になっている要件です。
 
 ## enhanced custom event bus とは
 
@@ -36,6 +58,27 @@ description: "2026-09-24 に GA した EventBridge の enhanced custom event bus
 - 発行は `PutEvents`（JSON）または `PutRawEvents`（Avro / Protobuf / 任意バイナリ）
 - 購読は **Subscriber** という新リソース。フィルタ・変換（JSONata）・リトライ・DLQ を 1 リソースに束ね、コンシューマ側のアカウントでセルフサービス作成できる
 - 課金は per-GB（ingress $0.18/GB、egress $0.05/GB/購読者）で、**発行側と購読側で請求が分かれる**
+
+モデルを図にするとこうです。SNS の「トピック + サブスクリプション」に似ていますが、フィルタ・変換・リトライ・DLQ・開始位置がぜんぶ Subscriber という 1 リソースに寄っているのが特徴です。
+
+```mermaid
+graph LR
+    P1["発行者<br/>PutEvents / PutRawEvents<br/>EventGroupId・DeduplicationId"] --> BUS
+    subgraph BUS["event-busv2（retention 1〜365日）"]
+        DEDUP["重複排除<br/>5分窓 → DEDUPLICATED"]
+        LOG[("イベントログ<br/>POINT_IN_TIME から再読可")]
+        DEDUP --> LOG
+    end
+    BUS --> S1
+    BUS --> S2
+    subgraph 購読側アカウントA["購読側アカウントA（egress 課金）"]
+        S1["Subscriber (FIFO)<br/>filter + JSONata 変換<br/>retry + DLQ + 開始位置"]
+        S1 --> T1["ターゲット<br/>SQS / Lambda / HTTP /<br/>Kinesis / SFn / aws-sdk 直"]
+    end
+    subgraph 購読側アカウントB
+        S2["Subscriber (標準)"] --> T2["ターゲット"]
+    end
+```
 
 ## 物差しとの突き合わせ
 
@@ -83,16 +126,26 @@ LocalStack には「EventBridge v2 provider」（`PROVIDER_OVERRIDE_EVENTS=v2`�
 
 ## 乗り換えるとしたら、差分はどれくらいか
 
-意味論が同型なので、実は差分がとても小さいことも分かりました。
+意味論が同型なので、実は差分がとても小さいことも分かりました。想定アーキテクチャを現行と並べます。
 
+```mermaid
+graph LR
+    subgraph 現行["現行: SNS FIFO"]
+        R1["relay"] -- "Publish<br/>MessageGroupId<br/>MessageDeduplicationId" --> SNS1["SNS FIFO"]
+        SNS1 --> Q1a["SQS FIFO"] --> C1a["consumer + inbox"]
+    end
 ```
-relay → PutRawEvents(event-busv2,
-          EventGroupId = 集約ID,
-          DeduplicationId = イベントID)
-      → FIFO Subscriber
-      → SQS FIFO（SqsParameters で
-          MessageGroupId = {% $events.SystemMetadata.EventGroupId %}）
-      → 既存 consumer（無変更）
+
+```mermaid
+graph LR
+    subgraph 想定["想定: enhanced bus（変わるのは色付きの2箇所だけ）"]
+        R2["relay<br/>（送信アダプタのみ差し替え）"] -- "PutRawEvents<br/>EventGroupId=集約ID<br/>DeduplicationId=イベントID" --> EB["event-busv2"]
+        EB --> SUB["FIFO Subscriber<br/>SqsParameters:<br/>MessageGroupId =<br/>&#123;% $events.SystemMetadata.EventGroupId %&#125;"]
+        SUB --> Q2a["SQS FIFO"] --> C2a["consumer + inbox<br/>（無変更）"]
+    end
+    style R2 fill:#7c3aed,color:#fff
+    style EB fill:#7c3aed,color:#fff
+    style SUB fill:#7c3aed,color:#fff
 ```
 
 Subscriber のターゲットには SQS を指定でき、JSONata で `EventGroupId` を SQS FIFO の `MessageGroupId` に写せます。つまり **受信側（SQS ポーリング + inbox）は 1 行も変えず**、送信アダプタ 1 つと IaC の差し替えで済む。SNS FIFO が座っていた場所に EventBridge が入るだけです。
