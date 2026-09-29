@@ -25,6 +25,46 @@ description: "同じ「壊れた版」を、テストトラフィックの昇格
 
 この「healthz は緑、でも壊れている」が要点です。現実の障害はたいていこの形をしています — プロセスは起動する、ポートは開く、でも DB への経路やマイグレーション前提が壊れている。ヘルスチェックだけを信じるデプロイ機構は、この版を平気で昇格させます。
 
+## 前提: ECS ネイティブ B/G の仕組み
+
+2025-10 から、ECS は CodeDeploy なしで Blue/Green・Canary・Linear デプロイをネイティブにサポートしています。仕組みの中心は **ALB のリスナールールと2枚のターゲットグループ（TG）を ECS が掛け替える**ことです。
+
+```mermaid
+graph TB
+    subgraph ALB
+        PL["本番リスナー :80<br/>ルール → TG を forward"]
+        TL["テストリスナー :8081<br/>ルール → TG を forward"]
+    end
+    PL --> TGB["TG blue<br/>(現行タスク)"]
+    TL -.->|"TEST_TRAFFIC_SHIFT 中"| TGG
+    PL -.->|"切替/カナリアで掛け替え"| TGG["TG green<br/>(新タスク)"]
+    subgraph "ECS service"
+        TGB --- TB["旧タスク"]
+        TGG --- TG2["新タスク"]
+    end
+    ECS["ECS(デプロイ制御)"] -->|"ルールの forward 先を書き換え"| PL
+    ECS -->|"同上"| TL
+    ECS -->|"フック呼び出し"| L["Lambda フック<br/>hookStatus を返す"]
+    CW["CloudWatch アラーム"] -->|"ALARM でロールバック"| ECS
+```
+
+サービス定義に次の3点を渡すと、この形が動きます。
+
+- `loadBalancers[].advancedConfiguration`: 2枚目の TG（`alternateTargetGroupArn`）、本番用リスナールール、**テスト用リスナールール**、ECS が ALB を操作するためのロール
+- `deploymentConfiguration.strategy`: `BLUE_GREEN` / `CANARY` / `LINEAR`（B/G と CANARY は**別 strategy** で、API が排他を強制します）
+- `deploymentConfiguration.lifecycleHooks / alarms`: 後述のゲートとアラーム連動
+
+デプロイは次の段階（ライフサイクルステージ）を進みます。今回使うのは太字の3つです。
+
+| 段階 | 何が起きるか |
+|---|---|
+| SCALE_UP | 新版タスクを起動（トラフィックなし） |
+| **TEST_TRAFFIC_SHIFT** | **テストリスナーの forward 先だけ**を新版へ。本番は旧版 100% のまま |
+| POST_TEST_TRAFFIC_SHIFT | ここに**フック**を置ける。FAILED を返すとロールバック |
+| PRODUCTION_TRAFFIC_SHIFT | 本番リスナーを掛け替え（CANARY なら n% → 100% の2段） |
+| **BAKE_TIME** | 新旧が併走したまま監視する猶予。**アラーム**はこの間も効く |
+| CLEAN_UP | 旧版を落として完了 |
+
 ## 観測口を先に作る: どの版が応答したか
 
 分割・切替・ロールバックの検証には、**「いまどの版が応答したか」を外から見る手段**が先に必要です。同じイメージから起動した新旧2つのタスクは、応答からは区別できません。
@@ -82,14 +122,44 @@ graph LR
 
 ECS ネイティブ B/G には `TEST_TRAFFIC_SHIFT` というライフサイクル段階があります。**本番トラフィックを1件も流す前に**、ALB のテストリスナー（別ポート）経由で green にテストトラフィックを 100% 当て、Lambda フックが検証して `hookStatus: SUCCEEDED / FAILED` を返す仕組みです。
 
-フックの中身が勝負どころでした。
+組み立ては3点セットです。①ALB にテストリスナー（:8081）とルールを足す、②検証用 Lambda と「ECS がそれを呼ぶためのロール」を作る、③サービスにフックを取り付ける。
+
+```hcl
+# ① テストリスナー。本番と同じ ALB の別ポート
+resource "aws_lb_listener" "test" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 8081
+  protocol          = "HTTP"
+  default_action { # 実トラフィックはルールが運ぶ(ECS はルールを書き換えるため default では管理できない)
+    type = "fixed-response"
+    fixed_response { status_code = "404" content_type = "text/plain" message_body = "no rule" }
+  }
+}
+
+# ③ フックは deploymentConfiguration に載せる(update-service の JSON)
+"deploymentConfiguration": {
+  "strategy": "BLUE_GREEN",
+  "bakeTimeInMinutes": 2,
+  "lifecycleHooks": [{
+    "hookTargetArn": "arn:aws:lambda:...:function:gate-hook",
+    "roleArn":       "arn:aws:iam::...:role/hook-invoke",   // ecs.amazonaws.com を信頼し lambda:InvokeFunction を許可
+    "lifecycleStages": ["POST_TEST_TRAFFIC_SHIFT"]
+  }]
+}
+```
+
+フックの中身が勝負どころでした。Lambda は `hookStatus` を返す契約です。
 
 ```python
 # healthz だけでは PHOTO_FAULT(書き込みのみ壊れる)を素通しするので、書き込みまでやる
 def check():
     for _ in range(3):
-        urlopen(base + "/healthz")          # 到達性
+        urlopen(base + "/healthz")          # 到達性(base はテストリスナー :8081)
     POST(base + "/v2/photos", ...)          # 書き込み(DB 経路まで通す)
+
+def handler(event, context):                # event には lifecycleStage と対象リビジョンが入る
+    ok = check()
+    return {"hookStatus": "SUCCEEDED" if ok else "FAILED"}
 ```
 
 壊れた版をデプロイした結果:
@@ -107,7 +177,31 @@ healthz だけを見るフックなら、この版は素通りしていました
 
 ### 層② カナリア + アラーム自動ロールバック
 
-次に、ゲートを外して（= テストトラフィックでは検知できない壊れ方の代役）、同じ壊れた版を CANARY 20% + ALB 5xx アラーム連動で流しました。
+次に、ゲートを外して（= テストトラフィックでは検知できない壊れ方の代役）、同じ壊れた版を CANARY 20% + ALB 5xx アラーム連動で流しました。設定は2つ: CloudWatch アラームを1本作り、デプロイ設定で名前を渡すだけです。
+
+```hcl
+# 「ユーザーに 5xx が漏れているか」そのものを見る。green/blue の TG は入れ替わるので ALB 単位
+resource "aws_cloudwatch_metric_alarm" "target_5xx" {
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  dimensions          = { LoadBalancer = aws_lb.main.arn_suffix }
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 3
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+}
+```
+
+```json
+"deploymentConfiguration": {
+  "strategy": "CANARY",
+  "canaryConfiguration": { "canaryPercent": 20.0, "canaryBakeTimeInMinutes": 3 },
+  "bakeTimeInMinutes": 2,
+  "alarms": { "alarmNames": ["target-5xx"], "enable": true, "rollback": true }
+}
+```
 
 ```
 20:13:22 デプロイ開始
@@ -138,6 +232,8 @@ reason: "Service deployment rolled back by user."
 | 検知するもの | テストで再現できる壊れ方 | 実トラフィックでしか出ない壊れ方 | 人間にしか分からない異変 |
 | 復旧 | 103秒 | 4分50秒 | 反応速度次第 + 32秒 |
 
+（条件は同一ではありません: 手動列はローカル予行でカナリア 10%・切り戻しは即時に人間が実行、実機2列はカナリア 20%・4rps。比べているのは比率と「復旧が何に依存するか」です。）
+
 3つの層は代替関係ではなく**直列**です。
 
 1. **テストで落とせる壊れ方は、本番に1件も触らせない**（ゲート）
@@ -152,6 +248,15 @@ reason: "Service deployment rolled back by user."
 - **IaC が知らない設定は IaC に剥がされる**。ライフサイクルフックやアラーム連動を CLI で付けた場合、Terraform がサービスを管理していると次の apply で黙って消える。どちらを正にするか決めてから運用に入る（今回は取り付けの正を API に置き、デプロイのたびに明示で渡した）
 - **ロードバランサの「重み 0」は表現できないことがある**。Caddy の weight は正整数のみで、cutover は upstream から外す形になる。ECS ネイティブ B/G も切替は重みでなくターゲットグループの掛け替えなので、意味論はむしろこちらが近い
 - **プロセスを kill する検証は事故のもと**（予行で実感）。kill したはずの旧コンシューマや、可視性タイムアウトで戻ってくる in-flight リクエストが結果を静かに汚す。今回 ECS 実機で「gear 停止中」が必要な場面では、**起動順**で自然に作れる状態を使い、プロセス操作を避けた
+
+## 自分のサービスで始めるなら
+
+全部を一度に組む必要はありません。効果の大きい順に:
+
+1. **リビジョンヘッダ**（数行）。これが無いと何も観測できない
+2. **アラーム連動**（アラーム1本 + デプロイ設定に3行）。ECS ネイティブ B/G/CANARY を使っているなら、これだけで「全量事故」が「n% の事故」になる
+3. **昇格ゲート**（テストリスナー + Lambda + ロール）。デプロイ頻度が高い・書き込みが壊れると痛いサービスから。検証は必ず**業務の書き込みまで**通すこと
+4. `stopDeployment` は組むものではなく**知っておくもの**。bake を数分取っておけば、いつでも 30 秒で戻れる
 
 ## まとめ
 
