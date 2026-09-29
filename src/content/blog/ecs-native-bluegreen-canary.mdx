@@ -15,7 +15,7 @@ Phase 7（AWS 検証。使い捨て前提、予算上限を決めてから立て
 - **アプリコードの変更 0 行・イメージのリビルド 0 回**で ECS に載った
 - ECS ネイティブ（CodeDeploy なし）の Blue/Green は**リクエスト503件で非200ゼロ**の無停止
 - カナリア 20% の重みを ALB ルール上で実測（`200/800`）
-- そして **BLUE_GREEN と CANARY は「B/G のオプション」ではなく別の strategy** だった
+- そして **Terraform provider は無効なデプロイ設定を黙って捨てる**（plan も apply も成功し、カナリアだけが静かに消える）——これが今回いちばんの収穫だった
 
 ## 前提: ECS ネイティブデプロイの仕組み
 
@@ -117,23 +117,24 @@ resource "aws_ecs_service" "photo" {
 | ALB ルールの重み | `100/0` → `0/100`（ターゲットグループの掛け替え） |
 | bake | 2分後に SUCCESSFUL（この間は即時ロールバック可能） |
 
-## 発見: BLUE_GREEN と CANARY は別物
+## 罠: 無効なデプロイ設定を provider が黙って捨てる
 
-「B/G のカナリアオプション」のつもりで `strategy = "BLUE_GREEN"` に
-`canary_configuration` を書いたが、何度サンプリングしても 20% の重みが出ない。
-CLI で直接設定して原因が確定した:
+つまらないミスから入る。`strategy = "BLUE_GREEN"` のまま
+`canary_configuration` を書いてしまった。B/G とカナリアが別のデプロイ戦略なのは
+当たり前で、API はちゃんと排他を強制している（CLI で直接設定すると即座に返る）:
 
 ```
 InvalidParameterException: Canary configuration can only be present
 with CANARY deployment strategy
 ```
 
-**カナリアは B/G の設定項目ではなく、独立した strategy** だった。
-さらに厄介なのは Terraform provider（aws 6.x 系）の挙動で、この**無効な組を
-黙って受理して canary だけを落とす**。plan も apply も成功し、AWS 側は null、
-tf state にも残らない。[fail open](/blog/checks-fail-open/) の典型で、
-「設定できなかった」が「成功」として出てくる。3秒間隔のサンプリングで
-重みが出ないことからしか気づけなかった。
+問題は、**Terraform provider（aws 6.x 系）がこの無効な組を黙って受理して
+canary だけを落とす**ことだ。plan も apply も成功し、AWS 側は null、
+tf state にも残らない。API なら1秒で弾かれるミスが、tf を経由すると
+「成功」として通ってしまう。[fail open](/blog/checks-fail-open/) の典型で、
+気づく手段は**挙動の観測だけ** — 3秒間隔のサンプリングで 20% の重みが
+一度も出ないことからしか発覚しなかった。設定ミス自体は誰でも直せるが、
+「ミスが成功として報告される」経路は、観測を持っていない限り貫通する。
 
 `strategy = "CANARY"` に直して再デプロイした実測:
 
@@ -171,7 +172,7 @@ one-off タスクの exit code がそのままゲートになる。
 ## 自分のサービスで始めるなら
 
 1. **前提を満たす**: TG をもう1枚、ALB の default_action でなく**リスナールール**でルーティング、ECS インフラロール（`AmazonECSInfrastructureRolePolicyForLoadBalancers`）。既存サービスならこの3点の追加だけ
-2. **strategy を選ぶ**: まず `BLUE_GREEN` + bake 数分。カナリアが要るなら `CANARY` は**別 strategy** であることを忘れずに（B/G に canary_configuration を足しても黙って無視される）
+2. **strategy を選ぶ**: まず `BLUE_GREEN` + bake 数分。カナリアなら strategy ごと `CANARY` に（tf 経由だと無効な組み合わせが黙って無視されるので、設定後に重みの実測まで見る）
 3. **完了判定は tf の終了でなく API で**: `aws ecs list-service-deployments` の status を見る（provider は CANARY の完了を待たない）
 4. アプリ側は「ポートで HTTP を受ける・設定は env・migrate はサブコマンド」を守っていれば変更ゼロで載る
 
@@ -191,7 +192,8 @@ migrate はサブコマンド」という形を守っていれば、compose の�
 ジョブグラフ（migrate → release → healthcheck）は ECS の one-off タスク +
 サービス更新に構造ごと写像できる。
 
-そして今回も、一番の収穫は予想外の側にある。ドキュメントを読むだけなら
-「B/G とカナリア」をオプションの関係だと思い込んだままだったし、
-provider が無効な設定を黙って落とすことには一生気づかなかった。
-重みが出ないという**観測**だけが、思い込みと実装のずれを教えてくれた。
+そして今回も、一番の収穫は予想外の側にある。設定ミスそのものは恥ずかしいだけの
+話だが、**そのミスを provider が「成功」として通す**ことは、観測を持たない限り
+一生気づけない。重みが出ないという実測だけが、設定と実態のずれを教えてくれた。
+デプロイ機構を組むときは、機構より先に「効いていることを観測する手段」を持つべき、
+というのが持ち帰りになる。
