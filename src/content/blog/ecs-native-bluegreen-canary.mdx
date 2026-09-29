@@ -17,11 +17,39 @@ Phase 7（AWS 検証。使い捨て前提、予算上限を決めてから立て
 - カナリア 20% の重みを ALB ルール上で実測（`200/800`）
 - そして **BLUE_GREEN と CANARY は「B/G のオプション」ではなく別の strategy** だった
 
+## 前提: ECS ネイティブデプロイの仕組み
+
+CodeDeploy を使わない ECS ネイティブのデプロイ（2025-10 GA）は、**ALB のリスナールールの forward 先を、ECS 自身が2枚のターゲットグループ（TG）の間で掛け替える**ことで成立しています。
+
+```mermaid
+graph LR
+    U["利用者"] --> R["ALB リスナールール<br/>(ECS が forward 先を書き換える)"]
+    R -->|"デプロイ前 100%"| TGB["TG blue → 旧タスク"]
+    R -.->|"切替後 / カナリア n%"| TGG["TG green → 新タスク"]
+    ECS["ECS デプロイ制御"] -->|操作| R
+```
+
+用語を2つだけ。**strategy** はデプロイの進め方（`BLUE_GREEN` = 一斉切替 / `CANARY` = n% → 100% の2段 / `LINEAR` = 等分で段階的）。**bake** は切替後も旧タスクを落とさずに併走させる監視時間で、この間なら旧 TG に戻すだけで即ロールバックできます。
+
+この仕組みが分かっていると、後述の「必要な部品が多い」理由も読めます — TG が2枚要るのは掛け替えの両側だから、明示のリスナールールが要るのは ECS が**ルールを**書き換える設計だから、専用ロールが要るのは ECS が ELB API を叩くからです。
+
 ## 7.1: 使い捨ての最小構成
 
 Terraform 約300行で、単一 VPC + ALB + ECS Fargate + RDS MySQL 8.4 + S3 + ECR。
 使い捨てなので state はローカル、`apply → 検証 → destroy` を当日で回す。
 ランレートは実測で **約 $0.06/h**（ALB + Fargate 256/512 + db.t4g.micro）。
+
+```mermaid
+graph LR
+    OP["手元<br/>terraform / aws cli"] --> ALB
+    subgraph VPC["VPC(パブリックサブネット×2、NAT なし)"]
+        ALB["ALB :80"] -->|"SG: ALB からのみ"| F["Fargate photo<br/>256/512 ARM64"]
+        F -->|"SG: app からのみ"| DB["RDS MySQL 8.4<br/>db.t4g.micro 非公開"]
+        T["one-off タスク<br/>(DB 初期化 / migrate)"] --> DB
+    end
+    F --> S3["S3(画像)"]
+    OP -->|"run-task + exitCode 判定"| T
+```
 
 コスト・形の設計判断は3つ。
 
@@ -139,6 +167,16 @@ one-off タスクの exit code がそのままゲートになる。
 `terraform destroy` 一発で30リソース削除。ALB / RDS / VPC の残存ゼロを実測で確認
 （残るのは INACTIVE のタスク定義のみ。ECS の仕様上削除できず、課金もない）。
 ここまでの費用は **$1 未満**。
+
+## 自分のサービスで始めるなら
+
+1. **前提を満たす**: TG をもう1枚、ALB の default_action でなく**リスナールール**でルーティング、ECS インフラロール（`AmazonECSInfrastructureRolePolicyForLoadBalancers`）。既存サービスならこの3点の追加だけ
+2. **strategy を選ぶ**: まず `BLUE_GREEN` + bake 数分。カナリアが要るなら `CANARY` は**別 strategy** であることを忘れずに（B/G に canary_configuration を足しても黙って無視される）
+3. **完了判定は tf の終了でなく API で**: `aws ecs list-service-deployments` の status を見る（provider は CANARY の完了を待たない）
+4. アプリ側は「ポートで HTTP を受ける・設定は env・migrate はサブコマンド」を守っていれば変更ゼロで載る
+
+この構成の続きとして、テストトラフィックの昇格ゲート（ライフサイクルフック）・CloudWatch アラーム連動の自動ロールバック・`stopDeployment` を同じスタックで実測した記事が
+[カナリアは失敗を消さない — ECS 3層防衛の実測](/blog/ecs-deployment-gates-measured/) です。
 
 ## まとめ
 

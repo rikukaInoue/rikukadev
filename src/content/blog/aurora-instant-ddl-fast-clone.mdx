@@ -15,6 +15,20 @@ description: "使い捨てのAuroraクラスタを立て、オンラインマイ
 フィーチャーフラグとオンラインマイグレーションで運用するとき Aurora の fast clone が
 どこで要るのかを、使い捨てのクラスタを立てて測った。
 
+## 前提: オンライン DDL の3方式と、ALGORITHM を明示する理由
+
+MySQL 8 系の `ALTER TABLE` には3つの実行方式があり、**どれで実行されるかで本番影響が桁で変わります**。
+
+| 方式 | 何をするか | 所要とロック |
+|---|---|---|
+| **INSTANT** | メタデータの書き換えのみ。行データに触らない | 数十 ms。行数に依存しない |
+| **INPLACE** | テーブルを再構築するが、多くは並行の読み書きを許す | 行数に比例。DML は概ね継続可 |
+| **COPY** | テーブルを丸ごと作り直してコピー | 行数に比例して長い。並行 DML は制限される |
+
+方式は DDL の種類ごとに決まっていて、指定しなければ MySQL が「通る中で一番軽いもの」を選びます。これが罠で、**軽い方式で通るつもりだった DDL が黙って COPY に落ちても、成功してしまう**。だからマイグレーション規約では `ALGORITHM=INSTANT` を明示します。通らない方式を明示すると `ERROR 1845` で**失敗する** — つまり「この DDL はどの方式か」という判定そのものがエラーの有無として返ってきます。本記事の測定でもこの性質をそのまま使っています。
+
+もうひとつの前提として、リポジトリのマイグレーションは expand / contract の2系統に分かれています（新旧アプリが同居できる形に先に広げ、旧が消えてから縮める）。デプロイに同梱されるのは expand 側で、そこに置いてよい DDL を「INSTANT で通る形」に制限している、というのが冒頭の規約です。
+
 ## 交絡を消す: Aurora にも 8.4 互換版がある
 
 Aurora MySQL の主流はバージョン 3 系（MySQL 8.0 互換）だが、それを選ぶと測定結果の差が
@@ -22,9 +36,36 @@ Aurora MySQL の主流はバージョン 3 系（MySQL 8.0 互換）だが、そ
 **8.4 互換の `8.4.mysql_aurora.8.4.8`** が存在したので、これを選んで
 Aurora だけを変数にした。比較対象は手元の MySQL 8.4.11（コンテナ）。
 
+8.4 互換版があるかは、エンジン一覧を CLI で引くと分かります。
+
+```sh
+aws rds describe-db-engine-versions --engine aurora-mysql   --query 'DBEngineVersions[].EngineVersion' | grep 8.4
+# → "8.4.mysql_aurora.8.4.8" が居る
+```
+
 構成は Terraform 約170行の使い捨てスタック（VPC + Aurora db.t4g.medium 1台 +
 one-off ECS タスク）。DB は非公開のままにして、SQL は VPC 内の one-off タスク
 （mysql:8.4 イメージ、スクリプトを base64 で command に渡す）で流す。
+
+```mermaid
+graph LR
+    OP["手元<br/>terraform / aws cli"] -->|"run-task<br/>(SQL を base64 で command に)"| T["one-off ECS タスク<br/>mysql:8.4"]
+    subgraph VPC["VPC(非公開)"]
+        T -->|3306| A["Aurora writer<br/>8.4.mysql_aurora.8.4.8"]
+    end
+    OP -->|"wait tasks-stopped<br/>→ exitCode で成否判定"| T
+```
+
+DB を公開せずに済み、測定の成否は one-off タスクの exit code で機械判定できます。
+測定 DDL はこの形で流しました。
+
+```sql
+-- 2,097,152 行のテーブルに対して。通らない方式なら ERROR 1845 が返る
+ALTER TABLE t ADD COLUMN c INT NULL, ALGORITHM=INSTANT;
+ALTER TABLE t ADD CONSTRAINT ck CHECK (c >= 0), ALGORITHM=INPLACE; -- → 1845
+ALTER TABLE t ADD CONSTRAINT ck CHECK (c >= 0), ALGORITHM=COPY, LOCK=SHARED;
+```
+
 apply → 計測 → destroy を当日で回し、費用は $0.3 前後だった。
 
 ## 実測1: ALGORITHM の判定は完全一致
@@ -54,8 +95,32 @@ Aurora でも変わらないことが確認できた。
 
 ## 実測2: fast clone は5分34秒、待ちの8割はインスタンス
 
-Aurora の fast clone（`restore-db-cluster-to-point-in-time --restore-type
-copy-on-write`）で、2M 行入りのクラスタを複製した:
+fast clone は Aurora 固有の複製機能です。Aurora はストレージ層が計算ノードから
+分離されているため、clone は**ストレージを物理コピーしない**。元クラスタと同じ
+ストレージページを共有したまま新クラスタを作り、どちらかが書いた時点で
+そのページだけ分岐します（copy-on-write）。
+
+```mermaid
+graph TB
+    subgraph 共有ストレージ層
+        P["共有ページ群<br/>(clone 時点のデータ)"]
+        PB["元の新規書き込みページ"]
+        PC["clone の新規書き込みページ"]
+    end
+    SRC["元クラスタ<br/>writer"] --> P
+    SRC --> PB
+    CL["clone クラスタ<br/>writer(新規プロビジョニング)"] --> P
+    CL --> PC
+```
+
+つまり「複製の速さ」はデータ量に依存せず、待ち時間の正体は**クラスタ作成と
+インスタンスのプロビジョニング**になるはず。それを確かめるため、2M 行入りの
+クラスタを実際に clone して区間ごとに計った:
+
+```sh
+aws rds restore-db-cluster-to-point-in-time   --source-db-cluster-identifier greenfield-74   --db-cluster-identifier greenfield-74-clone   --restore-type copy-on-write --use-latest-restorable-time ...
+aws rds create-db-instance --db-cluster-identifier greenfield-74-clone ...
+```
 
 | 区間 | 所要 |
 |---|---|
@@ -67,8 +132,9 @@ copy-on-write`）で、2M 行入りのクラスタを複製した:
 残りはインスタンスのプロビジョニングで、これもデータ量と無関係の固定費。つまり
 fast clone の所要時間は、データが 2M 行でも 2 億行でもおおむねこの水準に留まる。
 
-独立性も確認した。clone は 2,097,152 行をそのまま継承し、clone へ INSERT した行は
-元クラスタに現れない（行数・当該行とも波及なし）。
+独立性も確認した。clone 側で `SELECT COUNT(*)` → 2,097,152 行をそのまま継承。
+clone へ目印の行を INSERT → 元クラスタには現れない（行数・当該行とも波及なし）。
+copy-on-write の「読みは共有・書きは分岐」がそのまま観測できる。
 
 ## 位置づけ: clone はデプロイの部品ではなくリハーサル用
 
@@ -81,6 +147,12 @@ Aurora clone が要るのか」だった。数字が出ると答えは素直で:
 - clone の出番は**リハーサル**にある。本番同等データで COPY 系 DDL の所要時間を
   事前に測る、壊す予行をする、という用途なら、データ量に依存せず5分半で
   本番同等の使い捨て DB が出てくるのは十分に速い
+
+## 自分の環境で確かめるなら
+
+1. **規約の判定表を作る**: 自分のマイグレーションに出てくる DDL の種類を列挙し、開発 DB で `ALGORITHM=INSTANT` 明示で流す。1845 が返るものが「例外として個別計画する」対象
+2. **COPY の絶対値を測る**: 対象テーブルの本番行数に近いデータで COPY 系を1回流し、保守時間に収まるか見積もる（この記事の 2M 行 56 秒が起点になる）
+3. **本番規模での見積もりは fast clone で**: 本番と同じデータ量の使い捨て DB が約5分半で出てくる。DDL リハーサル・壊す予行はここでやる。終わったら clone クラスタごと削除（インスタンス課金だけが乗る）
 
 ## まとめ
 
