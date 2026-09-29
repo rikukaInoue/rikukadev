@@ -1,0 +1,167 @@
+---
+title: "カナリアは失敗を消さない — ECS の3つの防衛層を同じ壊れた版で測る"
+date: 2026-09-30
+tags: ["AWS", "ECS", "デプロイ", "カナリア", "設計"]
+description: "同じ「壊れた版」を、テストトラフィックの昇格ゲート・カナリア+アラーム・手動切り戻しの3通りでデプロイして被弾数を実測した。0/1679、69/2880、6/60。数字が教えてくれたのは「層の順序」だった。Caddy でのローカル予行から ECS ネイティブ機能の実機まで。"
+---
+
+## はじめに
+
+「カナリアデプロイを入れたので安心です」— 本当でしょうか。カナリア中に新版へ流れたリクエストは、新版が壊れていれば**失敗します**。カナリアはその失敗を消してくれません。
+
+では何のためにあるのか。それを言葉ではなく数字で確かめるため、**同じ壊れた版**を3つの防衛層でデプロイして、それぞれの被弾数を測りました。先に結果を出します。
+
+| 防衛層 | 被弾（失敗/総リクエスト） | 復旧まで |
+|---|---|---|
+| テストトラフィックの昇格ゲート | **0 / 1,679** | 103秒（自動） |
+| カナリア 20% + アラーム自動ロールバック | **69 / 2,880（2.4%）** | 4分50秒（自動） |
+| カナリア 10% + 手動切り戻し（ローカル予行） | 6 / 60（10%） | 人間の反応速度に依存 |
+
+この差の理由と、測る過程で踏んだ罠を書きます。
+
+## 検証対象の「壊れた版」
+
+検証用のマイクロサービス基盤（Go + ECS Fargate + ALB + RDS）に、失敗注入の仕組みを仕込んであります。環境変数 `PHOTO_FAULT=before_commit` を与えると、**ヘルスチェックは正常のまま、書き込み系 API だけが確実に 500 を返す**版になります。
+
+この「healthz は緑、でも壊れている」が要点です。現実の障害はたいていこの形をしています — プロセスは起動する、ポートは開く、でも DB への経路やマイグレーション前提が壊れている。ヘルスチェックだけを信じるデプロイ機構は、この版を平気で昇格させます。
+
+## 観測口を先に作る: どの版が応答したか
+
+分割・切替・ロールバックの検証には、**「いまどの版が応答したか」を外から見る手段**が先に必要です。同じイメージから起動した新旧2つのタスクは、応答からは区別できません。
+
+全応答にデプロイ識別子のヘッダを載せる変更を入れました。
+
+```go
+// リビジョンは全応答に載せる(healthz・401 含む)。認証より外に置くのは、
+// カナリア検証がまさに「認証前に落ちる応答」も含めてどちらの版かを見るため
+r.Use(func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+        w.Header().Set("X-Service-Revision", revision) // SERVICE_REVISION env から
+        next.ServeHTTP(w, req)
+    })
+})
+```
+
+ECS ではタスク定義の env にリビジョンを渡すだけで、ローカルの Caddy 予行でも実機でも同じ観測口が使えます。これが無いと、検証は「重みを**設定した**」で止まります。設定と実測は別物です。
+
+## まずローカルで予行する（Caddy weighted_round_robin）
+
+いきなり AWS に行く前に、Caddy の重み付きロードバランシングで photo サービスを blue/green 並走させ、切替の観測方法と検査項目を固めました。
+
+```mermaid
+graph LR
+    LG["loadgen<br/>(エラー1件で exit 1)"] --> C["Caddy<br/>weighted_round_robin"]
+    C -->|"重み 9"| B["photo-blue<br/>X-Service-Revision: blue"]
+    C -->|"重み 1"| G["photo-green<br/>X-Service-Revision: green"]
+```
+
+| 予行の測定 | 結果 |
+|---|---|
+| B/G 一斉切替をまたぐ 239 リクエスト | 非200 ゼロ |
+| 重み 9:1 で 400 リクエスト | green ちょうど 10% |
+| 壊れた green へ 9:1 で 60 書き込み | **6 件失敗（10%）**、切り戻しで 0 に |
+
+ここで出た「6/60 は消せない」が、実機検証の問いになりました。**この 6 件をゼロにする層はあるのか？**
+
+## 実機: 3つの防衛層
+
+ECS は 2025〜2026 年でデプロイ機構が大きく進化しています。CodeDeploy 不要のネイティブ Blue/Green・Canary（2025-10 GA）、デプロイライフサイクルフック、`stopDeployment` API。この 3 つを順に測りました。
+
+```mermaid
+graph LR
+    D["新版デプロイ"] --> T["①テストトラフィック<br/>TEST_TRAFFIC_SHIFT<br/>本番0%のまま検証"]
+    T -->|"フック FAILED"| R1["ロールバック<br/>被弾 0"]
+    T -->|"通過"| CA["②カナリア 20%<br/>+ CloudWatch アラーム"]
+    CA -->|"アラーム発火"| R2["自動ロールバック<br/>被弾 = 発火までの分"]
+    CA -->|"通過"| BK["③bake<br/>新旧併走で温存"]
+    BK -->|"人間が異変に気づく"| R3["stopDeployment<br/>32秒で復帰"]
+    BK --> DONE["完了"]
+```
+
+### 層① 昇格ゲート: TEST_TRAFFIC_SHIFT + Lambda フック
+
+ECS ネイティブ B/G には `TEST_TRAFFIC_SHIFT` というライフサイクル段階があります。**本番トラフィックを1件も流す前に**、ALB のテストリスナー（別ポート）経由で green にテストトラフィックを 100% 当て、Lambda フックが検証して `hookStatus: SUCCEEDED / FAILED` を返す仕組みです。
+
+フックの中身が勝負どころでした。
+
+```python
+# healthz だけでは PHOTO_FAULT(書き込みのみ壊れる)を素通しするので、書き込みまでやる
+def check():
+    for _ in range(3):
+        urlopen(base + "/healthz")          # 到達性
+    POST(base + "/v2/photos", ...)          # 書き込み(DB 経路まで通す)
+```
+
+壊れた版をデプロイした結果:
+
+```
+verdict: create 500
+status: ROLLBACK_SUCCESSFUL
+reason: "... POST_TEST_TRAFFIC_SHIFT lifecycle hook(s) failed.
+         Lifecycle hook target ... returned FAILED status."
+```
+
+デプロイ全体をまたいで 4rps の実 API 負荷（認証付き読み書き）を流し続けましたが、**本番 1,679 リクエスト、エラー 0**。開始からロールバック完了まで 103 秒。
+
+healthz だけを見るフックなら、この版は素通りしていました。**ゲートの価値は検証の深さで決まります**。テストトラフィックで書き込みまでやるから、「healthz は緑だが壊れている」を本番前に落とせる。
+
+### 層② カナリア + アラーム自動ロールバック
+
+次に、ゲートを外して（= テストトラフィックでは検知できない壊れ方の代役）、同じ壊れた版を CANARY 20% + ALB 5xx アラーム連動で流しました。
+
+```
+20:13:22 デプロイ開始
+20:17:44 アラーム OK→ALARM、同刻に ROLLBACK_IN_PROGRESS
+20:18:28 ROLLBACK_SUCCESSFUL
+reason: "Service deployment rolled back because of one or more active alarms."
+```
+
+被弾は **69 / 2,880 リクエスト（2.4%）**。アラーム発火とロールバック開始が同刻だったのは収穫で、ECS はアラーム状態を即応で拾っています。遅延の内訳はほぼ「メトリクス集計の 60 秒周期 + ALB 計測の遅延」。**被弾 69 件の正体は検知の窓そのもの**で、縮めたければアラームの period を縮めるしかありません。
+
+### 層③ stopDeployment: 人間用の非常ブレーキ
+
+最後に、健全な新版を bake 長めでデプロイし、bake 中に 1 API で止めました。
+
+```
+20:27:33 aws ecs stop-service-deployment --stop-type ROLLBACK
+20:28:05 本番の X-Service-Revision が旧版に戻る（32秒）
+reason: "Service deployment rolled back by user."
+```
+
+32 秒で戻れるのは、bake 中は旧タスクが生きているからです。ロールバック = ターゲットグループの向き先変更だけで済む。**bake 時間はロールバック先を温存する保険料**という理解が実測で腑に落ちました。
+
+## 数字が教える「層の順序」
+
+| | 昇格ゲート | カナリア+アラーム | 手動 |
+|---|---|---|---|
+| 被弾 | 0 / 1,679 | 69 / 2,880 | 6 / 60（10%） |
+| 検知するもの | テストで再現できる壊れ方 | 実トラフィックでしか出ない壊れ方 | 人間にしか分からない異変 |
+| 復旧 | 103秒 | 4分50秒 | 反応速度次第 + 32秒 |
+
+3つの層は代替関係ではなく**直列**です。
+
+1. **テストで落とせる壊れ方は、本番に1件も触らせない**（ゲート）
+2. ゲートを抜けた壊れ方だけを、カナリアが「全量事故」から「2.4% の事故」に縮める
+3. どちらも抜けたら、人間が 1 API で 32 秒で戻す
+
+カナリアだけ入れて安心するのは、①を省略して 69 件を受け入れる選択です。逆にゲートだけだと、テストトラフィックで再現しない壊れ方（実データ依存・負荷依存）が全量に届きます。**どの層が何を守るかを数字で知ってから、どこまで組むかを決める**のが正しい順序でした。
+
+## 踏んだ罠
+
+- **ヘルスチェックを信じすぎない**。healthz が返すのは「プロセスが起動してポートが開いている」まで。デプロイゲートの検証は業務の書き込みまで通すこと
+- **IaC が知らない設定は IaC に剥がされる**。ライフサイクルフックやアラーム連動を CLI で付けた場合、Terraform がサービスを管理していると次の apply で黙って消える。どちらを正にするか決めてから運用に入る（今回は取り付けの正を API に置き、デプロイのたびに明示で渡した）
+- **ロードバランサの「重み 0」は表現できないことがある**。Caddy の weight は正整数のみで、cutover は upstream から外す形になる。ECS ネイティブ B/G も切替は重みでなくターゲットグループの掛け替えなので、意味論はむしろこちらが近い
+- **プロセスを kill する検証は事故のもと**（予行で実感）。kill したはずの旧コンシューマや、可視性タイムアウトで戻ってくる in-flight リクエストが結果を静かに汚す。今回 ECS 実機で「gear 停止中」が必要な場面では、**起動順**で自然に作れる状態を使い、プロセス操作を避けた
+
+## まとめ
+
+- ECS ネイティブのデプロイ機構（B/G・Canary・ライフサイクルフック・stopDeployment）は、CodeDeploy なしで「昇格ゲート → カナリア → 非常ブレーキ」の3層をそのまま組める状態になっている
+- 3層は直列であり、それぞれ守るものが違う。**被弾 0/1,679 と 69/2,880 の差**が、ゲート層を省略するコストの実測値
+- 検証はローカル予行（Caddy + リビジョンヘッダ）で観測方法を固めてから実機に行くと、実機側は差分（アラーム連動・フック・stopDeployment）だけに集中できる。今回の AWS 費用は **$0.1 程度**（1.5 時間で destroy）
+
+## 参考
+
+- [Amazon ECS built-in Linear and Canary deployments](https://aws.amazon.com/about-aws/whats-new/2025/10/amazon-ecs-built-in-linear-canary-deployments)（2025-10）
+- [Gradual deployments in Amazon ECS with linear and canary strategies](https://aws.amazon.com/blogs/containers/gradual-deployments-in-amazon-ecs-with-linear-and-canary-strategies/)
+- [Amazon ECS canary deployments — lifecycle stages](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/canary-deployment.html)
+- [Amazon ECS real-time deployment observability](https://aws.amazon.com/about-aws/whats-new/2026/09/amazon-ecs-console-deployment-observability/)（2026-09）
