@@ -1,8 +1,8 @@
 ---
 title: "認証と認可を混ぜない。M2Mも人間と同じ枠に載せる"
 date: 2026-09-30
-tags: ["認証", "認可", "ReBAC", "OIDC", "設計"]
-description: "「ログインしているか」のifから始めると認証と認可が混ざる。質問を3つ（誰か・してよいか・何が見えるか）に分け、ReBACの関係導出とscopeの役割分担、M2Mを人間と同じ検証経路に載せる形まで、検証リポジトリで実測した構成を整理する。"
+tags: ["認証", "認可", "ReBAC", "OIDC", "Go"]
+description: "認証・認可・M2Mを、公開している検証リポジトリの実物で追う。ネットワーク構成、JWT検証のコード、関係タプルのDDLとFGAモデル、Can/ListAccessibleの実装2種、401/403の実測、トークン付与とトレース伝播を束ねたRoundTripperまで。"
 ---
 
 認証まわりの設計が崩れるときは、たいてい「ログインしているか」という if から
@@ -12,100 +12,160 @@ description: "「ログインしているか」のifから始めると認証と�
 2. **この操作をしてよいか**（認可 / Authorization）
 3. **何が見えるか**（認可付きの一覧）
 
-検証用のリポジトリでこの3つを分けて組み、人間のログインと M2M
-（サービス間のマシン認証）を同じ枠に載せるところまで実測した。その整理。
-例は前の記事と同じ写真投稿サービス（写真の所有者・公開範囲・運営者がいる）。
+この3つを分けて組み、人間のログインと M2M（サービス間のマシン認証）を
+同じ枠に載せる構成を、[公開している検証リポジトリ](https://github.com/rikukaInoue/greenfield)
+で実装・実測した。概念の説明ではなく、**実物のコード・スキーマ・測定結果**で追う。
 
-## 認証: 「誰か」だけを確定させる
+## 全体の構成
 
-認証の出力は**主体（Principal）1個**に絞る。
+登場するのは、業務サービス2つ（photo: 写真投稿、gear: 撮影機材）、
+認証を担う Keycloak（OIDC の OP）、認可を担う自作の authz サービス + OpenFGA。
+
+```
+ ブラウザ ──Cookie──▶ SSR ──┐
+                            │ Bearer(人間のトークン)
+     │ ログイン/トークン取得   ▼
+     ▼                    photo :8080 external ─┐
+ Keycloak :8180 ◀─────────photo :8082 admin  ──┤ 認可の質問
+ (OIDC OP)   ▲            photo :8081 internal │ Can / ListAccessible
+     ▲       │ JWKS取得        ▲               ▼
+     │       │ (署名検証用)     │ Bearer      authz :8100 ──▶ OpenFGA :8280
+     │       └────────────────│ (M2Mトークン │ (check /        (関係グラフ)
+     │ client_credentials      │  + scope)    │  list-objects)
+     └──────────────────── gear :8090-8092 ───┘
+                                                     photo/gear/authz とも
+                                                     ストレージは MySQL
+```
+
+読み取ってほしいのは3点。
+
+- トークンの**発行元は Keycloak の1箇所**。人間も M2M も同じ OP から出る
+- 各サービスは Keycloak から**公開鍵（JWKS）だけ**を取り、検証は自分でやる。
+  リクエストのたびに OP へ問い合わせない
+- 認可は authz サービスに**質問として**投げる。関係データを各サービスが
+  直接読むことはない
+
+## 認証: トークンの実物と、検証のコード
+
+まず M2M トークンの実物。gear が `client_credentials` で取得したトークンの
+ペイロードはこうなっている（ローカル環境で実際に発行したもの）。
+
+```json
+{
+  "iss": "http://auth.localhost/realms/greenfield",
+  "sub": "4881ce76-91c9-481a-b29f-c5b39ce0dec1",
+  "exp": 1790699471,
+  "azp": "svc-gear",
+  "scope": "internal:photo email profile",
+  "typ": "Bearer",
+  "preferred_username": "service-account-svc-gear"
+}
+```
+
+人間（`alice`）のトークンも構造は同じで、`sub` がユーザーの識別子になり、
+`scope` に `internal:photo` が**入らない**。この差が後で 403 として効いてくる。
+
+受け取る側の検証コード。外部の JWT ライブラリを使わず、stdlib の RSA 検証で
+書いてある。検証対象を「既知の issuer が RS256 で署名したトークン」に固定すると、
+JWT ライブラリが持つ危険な自由度（alg の取り違え）ごと消えるからだ。
+
+```go
+// alg は RS256 に固定する。ここを可変にすると none / HS256 混同の類が全部戻ってくる
+if header.Alg != "RS256" {
+	return nil, fmt.Errorf("alg %q は受け付けない（RS256 のみ）", header.Alg)
+}
+key, err := a.keyFor(ctx, header.Kid)   // JWKS から kid で公開鍵を引く（キャッシュ済み）
+if err != nil {
+	return nil, err
+}
+sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sig); err != nil {
+	return nil, errors.New("署名が一致しない")
+}
+// このあと exp と iss を検査して Principal{Subject, Kind, Scopes} に落とす
+```
+
+`alg` の検査が**先頭**にあるのが要点で、これが可変だと「`alg: none` を受け付ける」
+「HS256 と混同して公開鍵を共有鍵として使う」という既知の攻撃系が全部復活する。
+
+認証の出力は Principal 1個だけ。
 
 ```go
 type Principal struct {
-	Subject string   // OP が発行した識別子。解析しない・意味を持たせない
-	Kind    Kind     // user | service
+	Subject string // OP が発行した識別子。解析しない・意味を持たせない
+	Kind    PrincipalKind // PrincipalUser | PrincipalService
 	Scopes  []string
 }
 ```
 
-検証は OIDC の標準に乗る: issuer のディスカバリから公開鍵（JWKS）を引き、
-JWT の署名・有効期限・`iss` を検査して Principal に落とす。ここで重要なのは、
-**認証はリソースのことを何も知らない**こと。「この写真を見てよいか」は
-認証の仕事ではない。誰かが分かったら、それ以降の質問は全部認可に渡す。
+人間と M2M は**トークン取得の儀式が違うだけ**（人間: Authorization Code + PKCE、
+サービス: client_credentials）で、検証はこの1本の経路を通り、`Kind` が変わるだけ。
+受信側に「人間用」「サービス用」の2系統を作らない。
 
-そして M2M。サービス間の呼び出しでは、呼び出し元サービス自身が主体になる。
-トークンの**取得の儀式**は人間と違う（人間は Authorization Code + PKCE で
-ログイン画面を経由し、サービスは client_credentials で ID とシークレットを
-直接交換する）が、**受け取る側の検証はまったく同じ JWT 検証1本**だ。
-違いは Principal の `Kind` が `service` になることと、`Subject` の代わりに
-クライアント ID が入ることだけ。受信側に「人間用の認証」「サービス用の認証」
-という2系統を作らない。これが「M2M を同じ枠に載せる」の意味で、
-検証経路が1本だと、後述の 401/403 の意味論も1つで済む。
+## 認可のデータモデル: 権限は関係の行
 
-## 認可の質問は2つある
+認可の中身は「主体とリソースの関係」のグラフで、実体は3列のテーブルに落ちる。
+開発用のローカル実装（本番は OpenFGA）の DDL がこれだ。
 
-認可には形の違う質問が2つあり、実装も分ける必要がある。
+```sql
+CREATE TABLE relation_tuples (
+    subject  VARCHAR(255) NOT NULL COMMENT 'user:<sub> / service:<client_id>',
+    relation VARCHAR(64)  NOT NULL COMMENT 'owner / operator / ...',
+    object   VARCHAR(255) NOT NULL COMMENT 'photo:<id> / platform:main',
+    PRIMARY KEY (subject, relation, object),
+    KEY idx_tuples_object (object, relation)
+);
+```
 
-**質問1: この操作をしてよいか（Can）**
+中に入る行はこういうもの。
+
+| subject | relation | object | 意味 |
+|---|---|---|---|
+| `user:alice` | owner | `photo:42` | alice は写真42の所有者 |
+| `user:bob` | operator | `platform:main` | bob は運営者 |
+
+**viewer / editor の行が無い**ことに注目してほしい。「見てよい」「編集してよい」は
+行として保存せず、モデルの導出規則から計算する。OpenFGA に投入している
+モデル定義（実物の抜粋）:
+
+```json
+{
+  "type": "photo",
+  "relations": {
+    "parent": {"this": {}},
+    "owner":  {"this": {}},
+    "viewer": {"union": {"child": [
+      {"computedUserset": {"relation": "owner"}},
+      {"tupleToUserset": {"tupleset": {"relation": "parent"},
+                          "computedUserset": {"relation": "operator"}}}
+    ]}}
+  }
+}
+```
+
+日本語にすると「photo の viewer とは、その photo の **owner**、または
+photo の **parent（= platform）の operator**」。導出を図にする:
+
+```
+user:alice ──owner──▶ photo:42          alice は owner 経由で viewer
+user:bob ──operator──▶ platform:main
+                          ▲
+photo:42 ──parent────────┘              bob は operator 経由で viewer
+```
+
+この設計の利点は2つ。**剥奪が漏れない**（「見せる」を配って回らず、
+所有・運営という事実だけを書く。事実が消えれば権利も消える）。
+**運営者に専用機構が要らない**（「admin なら通す」の if を書く代わりに、
+parent → operator の導出で運営者の閲覧・編集が普通の認可判定になる）。
+
+## Can の実装: 同じ interface に2つの実体
+
+プロダクト側が使う語彙は `photo.view` のような action で、
+relation への対応表は認可サービスの中に閉じる（実物）:
 
 ```go
-Can(ctx, Request{Action: "photo.edit", ResourceType: "photo", ResourceID: "42"})
-// → Allowed: true / false
-```
-
-**質問2: 何が見えるか（ListAccessible）**
-
-一覧はこちらで、Can のループでは書けない。全件取ってから1件ずつ Can を聞くと
-N+1 になるうえ、**先に件数を絞ってから認可で落とすと取りこぼす**（LIMIT 20 で
-取った20件のうち5件しか見えなければ、画面には15件しか出ない）。
-
-正しい形は「見える ID の集合を先にもらい、SQL の WHERE IN で絞る」。
-
-```go
-ids, _ := authz.ListAccessible(ctx, "photo.view", "photo") // 認可サービスに聞く
-// SELECT ... FROM photos WHERE id IN (?) AND status = 'ready' ORDER BY ... LIMIT ?
-// 公開範囲や件数の絞り込みは SQL 側でやる（Go 側で絞ると同じ取りこぼしが起きる）
-```
-
-一覧の直後に「作成した本人が自分の一覧を見る」ケースがあるので、
-認可サービスの読み取りには一貫性ヒント（作成直後も見える強めの読み）を
-透過させる。ここは実測して「作成直後可視」を確かめた。
-
-## 権限は関係（Relation）で表す
-
-「誰が何をできるか」を権限テーブルで持ち始めると、運営者・共有・組織と
-増えるたびに列が増える。ReBAC（Relationship-Based Access Control）は
-これを**主体とリソースの関係のグラフ**で表す。
-
-このリポジトリの最小モデルは3型だけ。
-
-```
-user
-platform
-  operator: [user]          ← 運営者は platform への関係として1回だけ書く
-photo
-  parent: [platform]
-  owner:  [user]
-  viewer: owner または parent の operator   ← 直接割り当てない。導出する
-  editor: owner または parent の operator
-```
-
-設計の要点は2つ。
-
-- **viewer / editor は直接割り当てない。** owner という事実と、
-  platform の operator という事実から**導出**する。「見せる」を配って回ると
-  剥奪が漏れる。事実（所有・運営）だけを書き、権利は計算で出す
-- **運営者の権限に専用機構を作らない。** 管理画面の「admin なら通す」if を
-  書く代わりに、`photo の parent は platform` `platform の operator は運営者` の
-  2本の関係で、運営者の閲覧・編集が普通の認可判定として導出される。
-  権限の特例が if 文でなくモデルの中にあるので、監査で追える
-
-もう1つ、語彙の境界がある。プロダクト側のコードが使うのは
-`photo.view` のような **action の語彙だけ**で、それが viewer という relation に
-対応することは認可サービスの中に閉じる。
-
-```go
-var mapping = map[string]string{
+var DefaultMapping = map[string]string{
 	"photo.view":       "viewer",
 	"photo.edit":       "editor",
 	"photo.publish":    "editor",   // 公開も編集権で判定する、という判断がここに残る
@@ -113,85 +173,158 @@ var mapping = map[string]string{
 }
 ```
 
-relation の設計を変えても、プロダクトのコードは1行も変わらない。
-
-## scope は権限ではなく「呼び出し文脈の枠」
-
-混同しやすいのが scope の位置づけだ。scope はリソースへの権限ではない。
-**このトークンでどの面（API 群）に入れるか**という、呼び出し文脈の枠である。
-
-写真サービスには3つの面がある: 一般ユーザー向け、運営向け、サービス間。
-サービス間の面には `internal:photo` という scope を要求する。すると:
-
-| 呼び出し | 結果 | 理由 |
-|---|---|---|
-| トークンなしで内部 API | **401** | 誰か分からない（認証の失敗） |
-| 人間のトークンで内部 API | **403** | 誰かは分かるが、このトークンは内部面の枠外（認可の失敗） |
-| M2M でも scope なし | **403** | サービスであることと、枠を持つことは別 |
-| M2M + `internal:photo` | 200 | 枠の中。この先でさらにリソース認可が走る |
-
-401 と 403 を使い分けるのは呼び手のためだ。401 は「トークンを取り直せ」、
-403 は「取り直しても無駄。権限の問題」を意味する。ここが混ざっていると、
-クライアントは失敗時に何をリトライすべきか判断できない。
-
-整理すると、認可判断は**二段**になっている。
-
-```
-scope 検査     … このトークンはこの面に入れるか（文脈の枠。粗い）
-関係の判定     … この主体はこのリソースに何ができるか（細かい）
-```
-
-scope で関係の判定を代用しようとすると `photos:read:own` のような
-擬似リソース権限が scope に増殖していく。逆に関係だけで面を守ろうとすると
-「内部 API に人間のトークンで入れてしまう」穴が開く。両方要る。
-
-## M2M の認可: サービスの権限と、ユーザーの代理
-
-サービス間呼び出しでは、認可の主体に2つの候補がある。
-
-- **サービス自身の権限で動く**: 定期バッチが全公開写真を集計する、など。
-  主体は `service:collector` で、scope とサービス向けの関係で判定する
-- **ユーザーの代理で動く**: 注文サービスがユーザーの写真情報を引く、など。
-  この場合、**誰のための呼び出しかを引数として明示的に渡し**、受けた側が
-  そのユーザーを主体として認可サービスに聞く
-
-後者でやりがちな失敗は、scope `internal:photo` を持っているからと
-リソース認可を省くことだ。scope は「注文サービスは写真の内部面を呼べる」
-までしか言っていない。「そのユーザーがその写真を見えるか」は別の質問で、
-省くと内部 API が権限昇格の抜け道になる。
-
-M2M のトークン管理（取得・期限までのキャッシュ・自動付与）は
-共通のクライアント基盤に置き、業務コードからは見えなくする。
-人間の開発用トークンも同じ経路に流すと、開発と本番で通り道が変わらない。
-
-## 全部 interface の後ろに置く
-
-最後に配線の話。ここまでの部品は全部、プロダクトから見れば interface だ。
+開発用のローカル実装は、この導出を SQL で素朴にやる（実物を要約）:
 
 ```go
-type Authenticator interface{ Middleware() func(http.Handler) http.Handler }
-type Authorizer    interface{ Can(ctx, Request) (Result, error) }
-type Lister        interface{ ListAccessible(ctx, action, resourceType string) ([]string, error) }
+func (s *Store) Can(ctx context.Context, req authz.Request) (authz.Result, error) {
+	relation := s.mapping[req.Action]          // photo.view → viewer
+	object := authz.ObjectRef(req.ResourceType, req.ResourceID) // photo:42
+
+	// viewer の直接根拠(owner)をタプルで探す
+	for _, direct := range grants[relation] {  // viewer → [owner]
+		if ok, _ := s.has(ctx, subject, direct, object); ok {
+			return authz.Result{Allowed: true}, nil
+		}
+	}
+	// 無ければ運営者導出: platform:main への operator タプルがあるか
+	if fromParent[relation] {
+		op, err := s.has(ctx, subject, "operator", PlatformObject)
+		return authz.Result{Allowed: op}, err
+	}
+	return authz.Result{}, nil
+}
 ```
 
-開発中はローカル実装（署名検証なしの開発トークン + DB 1枚の擬似 ReBAC）で
-動かし、本番アダプタ（OIDC 検証 + 認可サービス + OpenFGA）へは合成ルートの
-差し替えだけで移る。検証リポジトリで実際に差し替えたときの
-**usecase / handler の diff はゼロ**だった。認証・認可は横断的関心事の中でも
-特に「あとから本物に差し替える」ことが確定している領域なので、
-差し込み口を最初に切っておく価値が大きい。
+本番アダプタは同じ質問を HTTP で authz サービスに投げるだけ:
+
+```go
+func (c *Client) Can(ctx context.Context, req authz.Request) (authz.Result, error) {
+	in := map[string]string{
+		"subject": sub, "action": req.Action,
+		"resource_type": req.ResourceType, "resource_id": req.ResourceID,
+	}
+	if v := consistency(req.Consistency); v != "" {
+		in["consistency"] = v   // 「作成直後も見えてほしい」の一貫性ヒントを透過する
+	}
+	var out struct{ Allowed bool `json:"allowed"` }
+	err := c.post(ctx, "/check", in, &out)
+	return authz.Result{Allowed: out.Allowed}, err
+}
+```
+
+usecase から見えるのは `authz.Authorizer` という interface だけなので、
+ローカル実装と本番アダプタの差し替えは合成ルート1箇所で済む。実際に
+差し替えたときの **usecase / handler の diff はゼロ**だった（CI が
+「差し替えの影響が配線部に閉じる」を毎回検証している）。
+
+## 一覧は Can のループではなく WHERE IN
+
+「何が見えるか」を Can の全件ループでやると N+1 になるうえ、
+**先に LIMIT してから認可で落とすと取りこぼす**。正しい形は
+「見える ID の集合を先にもらい、SQL で絞る」。
+
+ID 集合を返す側（ローカル実装の実物）:
+
+```go
+// 運営者なら全件(owner タプルの存在をもってリソースの存在と見なす)
+if op { return s.ids(ctx,
+	"SELECT DISTINCT object FROM relation_tuples WHERE relation = 'owner' AND object LIKE ?",
+	"photo:%") }
+// 一般ユーザーは自分に根拠タプルがある object だけ
+query := "SELECT DISTINCT object FROM relation_tuples WHERE subject = ? AND object LIKE ? AND relation IN (...)"
+```
+
+受け取った側の表示クエリ（実物）。公開範囲と件数の絞り込みを
+**SQL 側でやる**のが要点で、Go 側で絞ると同じ取りこぼしが起きる:
+
+```sql
+-- name: ListPhotosByIDs :many
+SELECT * FROM photos
+WHERE id IN (sqlc.slice('ids'))
+  AND status = 'ready'
+  AND (sqlc.arg('visibility') = '' OR visibility = sqlc.arg('visibility'))
+ORDER BY created_at DESC
+LIMIT ?;
+```
+
+## scope は「面」を守る。実測の 401/403
+
+サービスは呼び出し主体ごとに面を分けている（external / admin / internal）。
+internal の面には scope `internal:photo` を要求する。CI が毎回実測している
+結果がそのまま意味論の表になる:
+
+```
+1. 外部API
+  ok: トークン無しは 401
+  ok: alice のトークンで 200（認可付き一覧が authz サービス経由で返る）
+  ok: 壊れたトークンは 401
+2. 内部API
+  ok: トークン無しは 401
+  ok: 人間のトークン（internal:photo 無し）は 403
+  ok: M2M でもスコープ無しは 403
+  ok: svc-gear + internal:photo で 200
+```
+
+**401 は「誰か分からない。トークンを取り直せ」、403 は「誰かは分かるが枠の外。
+取り直しても無駄」**。この使い分けが崩れると、クライアントは失敗時に
+何をすべきか判断できない。
+
+つまり認可判断は二段になっている。
+
+```
+scope 検査   … このトークンでこの面に入れるか（呼び出し文脈の枠。粗い）
+関係の判定   … この主体はこのリソースに何ができるか（細かい）
+```
+
+scope で関係を代用すると `photos:read:own` のような擬似リソース権限が
+scope に増殖する。関係だけで面を守ろうとすると「内部 API に人間のトークンで
+入れる」穴が開く。両方要る。とくにサービス間でユーザーの代理として動くとき、
+scope を持っているからと細かい認可を省くと、**内部 API が権限昇格の抜け道になる**。
+
+## M2M の配管: RoundTripper に横断的関心事を束ねる
+
+M2M 側の実装で気に入っているのがここで、トークンの自動付与・冪等キー・
+トレース伝播が**1つの RoundTripper** に束ねてある（実物）:
+
+```go
+func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tok, err := tr.ts.Token(req.Context())   // 取得 + 期限までキャッシュ
+	if err != nil {
+		return nil, err
+	}
+	clone := req.Clone(req.Context())        // RoundTripper は元リクエストを書き換えない規約
+	clone.Header.Set("Authorization", "Bearer "+tok)
+
+	// 冪等キー: 変更系は必ず付ける。呼び出し側が明示したキーは尊重する——
+	// リトライで同じキーを送り直すのは呼び出し側の責任で、ここで毎回
+	// 新しい UUID を振り直すと重複排除として機能しない
+	if mutating(clone.Method) && clone.Header.Get("Idempotency-Key") == "" {
+		clone.Header.Set("Idempotency-Key", randomKey())
+	}
+
+	// トレース伝播: 受信リクエストの相関があれば traceparent で運ぶ
+	if c, ok := middleware.FromContext(clone.Context()); ok && c.TraceID != "" {
+		clone.Header.Set("traceparent", "00-"+c.TraceID+"-"+c.SpanID+"-01")
+	}
+	return tr.base.RoundTrip(clone)
+}
+```
+
+業務コードは `http.Client` を受け取るだけで、認証もトレースも冪等キーも
+知らない。開発用トークンも本番の client_credentials も同じ transport を
+通るので、開発と本番で通り道が変わらない。
 
 ## まとめ
 
-| 質問 | 答える仕組み | 粒度 |
+| 質問 | 答える仕組み | 実体 |
 |---|---|---|
-| 誰か | OIDC の JWT 検証（人間も M2M も同じ1本） | — |
-| この面に入れるか | scope | 粗い（呼び出し文脈） |
-| この操作をしてよいか | Can → 関係の導出 | 細かい（主体×リソース） |
-| 何が見えるか | ListAccessible → WHERE IN | 細かい（集合） |
+| 誰か | JWT 検証（人間も M2M も同じ1本） | RS256 固定 + JWKS、出力は Principal のみ |
+| この面に入れるか | scope | 401/403 の意味論を実測で固定 |
+| この操作をしてよいか | Can → 関係の導出 | 3列のタプル + 導出モデル。行として権利を配らない |
+| 何が見えるか | ListAccessible → WHERE IN | 絞り込みは SQL 側。LIMIT 後に認可で落とさない |
 
 - 認証は Principal を作るだけ。リソースを知らない
-- 権利は配らず、事実（所有・運営）から導出する。運営者も特別扱いしない
+- 権利は配らず、事実（所有・運営）から導出する。運営者も専用機構を作らない
 - scope は枠、関係は権利。**片方でもう片方を代用しない**
 - M2M は取得の儀式が違うだけで、検証・認可の枠は人間と同じ。
-  ユーザーの代理のときは、誰のためかを明示して細かい認可を省かない
+  配管（トークン・冪等キー・トレース）は RoundTripper に束ね、業務コードから隠す
