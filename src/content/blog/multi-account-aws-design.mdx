@@ -146,12 +146,13 @@ NAT GW は「private サブネットからインターネットに出るため�
 - **TGW Route Table** で環境分離（prod ↔ dev を通さない等）
 - 接続方式の選択フロー:
 
-```
-サービスを他のVPCに公開したい？
-├── Yes, 特定のAPI/サービス → PrivateLink
-├── Yes, 汎用的な接続（3+ VPC） → TGW
-├── Yes, 2VPC固定 → VPC Peering
-└── 外部サービス連携 → Internet
+```mermaid
+flowchart TD
+    Q{"サービスを他のVPCに公開したい？"}
+    Q -->|"Yes, 特定のAPI/サービス"| PL["PrivateLink"]
+    Q -->|"Yes, 汎用的な接続（3+ VPC）"| TGW["TGW"]
+    Q -->|"Yes, 2VPC固定"| PEER["VPC Peering"]
+    Q -->|"外部サービス連携"| INET["Internet"]
 ```
 
 ### CIDR 設計
@@ -282,8 +283,9 @@ aws route53 associate-vpc-with-hosted-zone \
 
 Network アカウントに Resolver Inbound/Outbound Endpoint を作成し、Forwarding Rule を RAM で全アカウントに共有します。
 
-```
-spoke VPC → Resolver Rule (RAM共有) → Outbound Endpoint → Inbound Endpoint → PHZ
+```mermaid
+flowchart LR
+    S["spoke VPC"] --> R["Resolver Rule (RAM共有)"] --> O["Outbound Endpoint"] --> I["Inbound Endpoint"] --> P["PHZ"]
 ```
 
 設定量は減りますが、Resolver Endpoint のコスト（$0.125/hr × ENI 数）が追加されます。

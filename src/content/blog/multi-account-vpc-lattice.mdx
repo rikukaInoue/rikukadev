@@ -147,14 +147,19 @@ TGW Route Table: stg-rt
 
 TGW の定番構成として、全通信を Firewall 経由にする Inspection VPC パターンがあります。
 
+```mermaid
+flowchart LR
+    A["Prod A"] --> T1["TGW"]
+    T1 --> I["Inspection VPC (AWS Network Firewall)"]
+    I --> T2["TGW"]
+    T2 --> B["Prod B"]
 ```
-Prod A → TGW → Inspection VPC (AWS Network Firewall) → TGW → Prod B
-                      │
-                  ルールで検査:
-                  - 許可するドメイン
-                  - 許可するプロトコル
-                  - IDS/IPS ルール
-```
+
+Inspection VPC ではルールで検査します:
+
+- 許可するドメイン
+- 許可するプロトコル
+- IDS/IPS ルール
 
 これは Lattice にはない機能で、TGW の大きな強みです。
 
@@ -175,24 +180,25 @@ Prod A → TGW → Inspection VPC (AWS Network Firewall) → TGW → Prod B
 
 ### どちらを選ぶか
 
-```
-マルチアカウントでサービス間通信したい
-  │
-  ├─ 通信は HTTP/gRPC か？
-  │    ├─ Yes → VPC Lattice を第一候補に
-  │    └─ No  → TGW + PrivateLink
-  │
-  ├─ ECS 内で完結するか？
-  │    ├─ Yes → Service Connect で十分
-  │    └─ No  → Lattice or TGW
-  │
-  ├─ 集中 Firewall 検査が必要か？
-  │    ├─ Yes → TGW は必須
-  │    └─ No  → Lattice だけで始められる
-  │
-  └─ オンプレ接続が必要か？
-       ├─ Yes → TGW は必須（Direct Connect/VPN 終端）
-       └─ No  → Lattice だけで完結できる可能性あり
+```mermaid
+flowchart LR
+    S["マルチアカウントでサービス間通信したい"]
+    Q1{"通信は HTTP/gRPC か？"}
+    Q2{"ECS 内で完結するか？"}
+    Q3{"集中 Firewall 検査が必要か？"}
+    Q4{"オンプレ接続が必要か？"}
+    S --> Q1
+    S --> Q2
+    S --> Q3
+    S --> Q4
+    Q1 -->|Yes| A1["VPC Lattice を第一候補に"]
+    Q1 -->|No| A2["TGW + PrivateLink"]
+    Q2 -->|Yes| B1["Service Connect で十分"]
+    Q2 -->|No| B2["Lattice or TGW"]
+    Q3 -->|Yes| C1["TGW は必須"]
+    Q3 -->|No| C2["Lattice だけで始められる"]
+    Q4 -->|Yes| D1["TGW は必須（Direct Connect/VPN 終端）"]
+    Q4 -->|No| D2["Lattice だけで完結できる可能性あり"]
 ```
 
 ## 今回の構成での設計判断
@@ -457,19 +463,32 @@ Lattice だけで始めた後、以下の要件が出てきたら TGW の導入�
 
 サービス A がサービス B を呼んで、レスポンスを待つパターン。
 
-```
-Product A →「このユーザーの権限ある？」→ 認証 API → レスポンス返す
-結果がないと次に進めない
+```mermaid
+sequenceDiagram
+    participant A as Product A
+    participant Auth as 認証 API
+    A->>Auth: このユーザーの権限ある？
+    Auth-->>A: レスポンス返す
+    Note over A: 結果がないと次に進めない
 ```
 
 ### 非同期連携（EventBridge）
 
 サービス A がイベントを投げて終わり。誰が受け取るか知らなくてもいい。
 
-```
-Product A →「注文できたよ」→ EventBridge → Product B: メール送る
-                                        → Product C: 集計する
-A は後続の処理を知らないし、待たない
+```mermaid
+sequenceDiagram
+    participant A as Product A
+    participant EB as EventBridge
+    participant B as Product B
+    participant C as Product C
+    A->>EB: 注文できたよ
+    Note over A: A は後続の処理を知らないし、待たない
+    par
+        EB->>B: メール送る
+    and
+        EB->>C: 集計する
+    end
 ```
 
 ### 使い分けの基準

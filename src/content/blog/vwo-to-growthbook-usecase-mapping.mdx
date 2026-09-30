@@ -15,21 +15,24 @@ VWO から GrowthBook への移行を検討しています。移行で一番つ�
 
 個々のユースケースの前に、全体像の違いを押さえておきます。ここを理解すると逆引きの大半は自然に導けます。
 
+```mermaid
+flowchart LR
+    subgraph vwo["VWO(オールインワン型)"]
+        VB["ブラウザ"] -->|SmartCode| VS["VWO サーバー"]
+        VS --- V1["割当"]
+        VS --- V2["計測(独自トラッキング)"]
+        VS --- V3["レポート"]
+    end
 ```
-VWO（オールインワン型）
 
-  ブラウザ ── SmartCode ──> VWO サーバー
-                              ├─ 割当
-                              ├─ 計測（独自トラッキング）
-                              └─ レポート
-
-GrowthBook（ウェアハウスネイティブ型）
-
-  ブラウザ/サーバー ── SDK ──> GrowthBook（割当ルール配信のみ）
-        │
-        └─ 露出イベント ──> GA4 ──> BigQuery <── GrowthBook が読みに来る
-                                       ↑
-                          行動データ（CV、PV など）も同じ場所
+```mermaid
+flowchart LR
+    subgraph gb["GrowthBook(ウェアハウスネイティブ型)"]
+        GB["ブラウザ/サーバー"] -->|SDK| G["GrowthBook(割当ルール配信のみ)"]
+        GB -->|露出イベント| GA["GA4"] --> BQ["BigQuery"]
+        BD["行動データ(CV、PV など)"] -->|同じ場所| BQ
+        G -.->|GrowthBook が読みに来る| BQ
+    end
 ```
 
 | 観点 | VWO | GrowthBook |
@@ -230,14 +233,15 @@ VWO の枠には無い使い方ですが、SEO 文脈では重要なので触れ
 
 タイトルタグやコンテンツ構成の SEO テストは「ユーザーを分ける」のではなく「**ページ群を分ける**」のが定石です。GrowthBook は hashAttribute を自由に選べるため、ユーザー ID の代わりにページパスで割当できます。
 
+```mermaid
+flowchart LR
+    subgraph p["hashAttribute: #quot;path#quot; にした場合"]
+        P1["/items/001"] --> H1["ハッシュ"] --> A["バリエーション A(常に)"]
+        P2["/items/002"] --> H2["ハッシュ"] --> B["バリエーション B(常に)"]
+    end
 ```
-hashAttribute: "path" にした場合
 
-  /items/001 ──> ハッシュ ──> バリエーション A（常に）
-  /items/002 ──> ハッシュ ──> バリエーション B（常に）
-
-  誰が見ても（Googlebot が見ても）同じページには同じ表示
-```
+誰が見ても（Googlebot が見ても）同じページには同じ表示になります。
 
 ユーザー単位で割当てるとクローラーへの表示が揺れてクローキング疑いのリスクがあるため、SEO テストではこの構成 + SSR が安全です。効果測定は GA4 → BigQuery に入るオーガニック流入後の行動指標、あるいは Search Console データを BigQuery にエクスポートして Metric 化します。
 
@@ -270,13 +274,13 @@ GrowthBook は「フラグ管理 + 実験 + 統計分析」に特化したツー
 
 実験データそのものは移行できないため、「走っている実験は VWO で完了させ、新規は GrowthBook で開始」が基本方針です。
 
-```
-1. GA4 → BigQuery リンクを整備
-2. GrowthBook に BigQuery データソースを接続
-3. 主要指標を Metrics として定義
-4. SDK 導入 + 露出イベントの疎通を Exposures Debugger で確認
-5. VWO と無関係なページで小さい実験を 1 本試験運用
-6. VWO の実験を順次完了 → 新規は GrowthBook のみ → VWO 解約
+```mermaid
+flowchart TD
+    S1["1. GA4 → BigQuery リンクを整備"] --> S2["2. GrowthBook に BigQuery データソースを接続"]
+    S2 --> S3["3. 主要指標を Metrics として定義"]
+    S3 --> S4["4. SDK 導入 + 露出イベントの疎通を Exposures Debugger で確認"]
+    S4 --> S5["5. VWO と無関係なページで小さい実験を 1 本試験運用"]
+    S5 --> S6a["6. VWO の実験を順次完了"] --> S6b["新規は GrowthBook のみ"] --> S6c["VWO 解約"]
 ```
 
 並行期間中は同じページを両ツールで触らないルールにしておかないと、変更が重なって両方の計測が汚れます。

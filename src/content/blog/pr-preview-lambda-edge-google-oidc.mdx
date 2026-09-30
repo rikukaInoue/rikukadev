@@ -95,29 +95,30 @@ CloudFront を PR ごとに作るのではなく、**1 つの CloudFront + Lambd
 
 ### 認証フロー
 
-```
-1. feature-login.demo.rikuka.dev にアクセス
-
-2. Lambda@Edge (viewer-request): cookie なし
-   → Google の authorize エンドポイントへリダイレクト
-     client_id=xxx
-     redirect_uri=https://demo.rikuka.dev/auth/callback
-     scope=openid email profile
-     state=feature-login.demo.rikuka.dev  ← 元のホストを保持
-
-3. Google ログイン画面 → ユーザーが認証
-
-4. → https://demo.rikuka.dev/auth/callback?code=xxx&state=feature-login...
-
-5. Lambda@Edge (viewer-request): /auth/callback パス
-   → Google の token エンドポイントに code を送信
-   → id_token を取得、email を確認
-   → allowedEmails に含まれてなければ 403
-   → cookie セット: Domain=.demo.rikuka.dev（全サブドメインで共有）
-   → state の URL にリダイレクト
-
-6. feature-login.demo.rikuka.dev に cookie 付きでアクセス
-   → Lambda@Edge: cookie あり → オリジンへ通す
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as ブラウザ
+    participant E as Lambda@Edge (viewer-request)
+    participant G as Google
+    participant O as オリジン (API GW)
+    U->>E: feature-login.demo.rikuka.dev にアクセス
+    Note over E: cookie なし
+    E-->>U: Google の authorize エンドポイントへリダイレクト
+    Note over U,G: client_id=xxx, redirect_uri=https://demo.rikuka.dev/auth/callback, scope=openid email profile, state=feature-login.demo.rikuka.dev（元のホストを保持）
+    U->>G: Google ログイン画面でユーザーが認証
+    G-->>U: https://demo.rikuka.dev/auth/callback?code=xxx&state=feature-login...
+    U->>E: /auth/callback パス
+    E->>G: token エンドポイントに code を送信
+    G-->>E: id_token を取得、email を確認
+    alt allowedEmails に含まれてない
+        E-->>U: 403
+    else 含まれている
+        E-->>U: cookie セット（Domain=.demo.rikuka.dev、全サブドメインで共有）して state の URL にリダイレクト
+    end
+    U->>E: feature-login.demo.rikuka.dev に cookie 付きでアクセス
+    Note over E: cookie あり
+    E->>O: オリジンへ通す
 ```
 
 ### ポイント
@@ -177,15 +178,19 @@ export async function handler(event) {
 
 ### DynamoDB ルーティングテーブル
 
+```mermaid
+erDiagram
+    "preview-routes" {
+        string subdomain PK "サブドメイン"
+        string origin "API GW のドメイン"
+    }
 ```
-Table: preview-routes
 
-subdomain (PK)  │ origin
-────────────────┼──────────────────────────────────────────
-_default        │ pgui67b3gl.execute-api.us-east-1.amazonaws.com
-feature-login   │ a1b2c3d4e5.execute-api.us-east-1.amazonaws.com
-fix-signup      │ f6g7h8i9j0.execute-api.us-east-1.amazonaws.com
-```
+| subdomain (PK) | origin |
+|---|---|
+| `_default` | `pgui67b3gl.execute-api.us-east-1.amazonaws.com` |
+| `feature-login` | `a1b2c3d4e5.execute-api.us-east-1.amazonaws.com` |
+| `fix-signup` | `f6g7h8i9j0.execute-api.us-east-1.amazonaws.com` |
 
 ## GitHub Actions
 

@@ -15,13 +15,19 @@ description: "自作 OSS kagerou のプレビュー環境を 1 周(up → 検証
 
 kagerou は専用のデータベースや状態ファイルを持たない。**環境 1 つにつき CloudFormation スタックを 1 つ作り、そのタグを真実の源にする**。
 
-```
-kagerou:managed     true            走査時の対象判定
-kagerou:name        demo-cli        環境名
-kagerou:project     spa-demo        list / reap の分離境界
-kagerou:expires-at  2026-10-01T…    TTL の期限(RFC3339)。"none" で無期限
-kagerou:owner       arn:…:role/…    作成者。他人の環境への同名 up を弾く
-kagerou:url         https://…       作成前に確定した URL
+```mermaid
+erDiagram
+    environment ||--|| cfn_stack : "環境 1 つにつきスタック 1 つ。タグが真実の源"
+    environment["環境"] {
+    }
+    cfn_stack["CloudFormation スタック"] {
+        boolean kagerou_managed "kagerou:managed = true / 走査時の対象判定"
+        string kagerou_name "kagerou:name = demo-cli / 環境名"
+        string kagerou_project "kagerou:project = spa-demo / list と reap の分離境界"
+        string kagerou_expires_at "kagerou:expires-at = 2026-10-01T… / TTL の期限 (RFC3339)。none で無期限"
+        string kagerou_owner "kagerou:owner = arn:…:role/… / 作成者。他人の環境への同名 up を弾く"
+        string kagerou_url "kagerou:url = https://… / 作成前に確定した URL"
+    }
 ```
 
 環境 1 つの全体像はこうなる。共有ベース(CloudFront / DNS / バケット)は全環境で 1 組しかなく、環境の増分は「タグ付きの極小スタック」と「S3 のプレフィックス」だけだ。
