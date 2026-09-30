@@ -9,8 +9,9 @@ description: "参照は interface、更新は状態ごとの struct という設
 
 認証基盤を作っていると、ユーザーは単に「存在する/しない」の二値ではないことに気づきます。
 
-```
-未登録 → 仮登録 → 有効 → 一時停止 → 削除
+```mermaid
+flowchart LR
+    A["未登録"] --> B["仮登録"] --> C["有効"] --> D["一時停止"] --> E["削除"]
 ```
 
 各状態で「何ができるか」が異なります。仮登録ユーザーにログインさせてはいけないし、一時停止中のユーザーのグループを変更する意味はない。
@@ -96,19 +97,15 @@ type DeletedUser struct { ... }
 
 ### 状態遷移図
 
-```
-PendingUser ──Confirm()──→ ActiveUser
-                            │
-                  Suspend() │ ← UpdateGroups()
-                            ↓     RecordLogin()
-                       SuspendedUser
-                            │
-                Reactivate()│
-                            ↓
-                        ActiveUser
-
-ActiveUser ──Delete()──→ DeletedUser
-SuspendedUser ──Delete()──→ DeletedUser
+```mermaid
+flowchart TD
+    P["PendingUser"] -->|"Confirm()"| A["ActiveUser"]
+    A -->|"UpdateGroups()"| A
+    A -->|"RecordLogin()"| A
+    A -->|"Suspend()"| S["SuspendedUser"]
+    S -->|"Reactivate()"| A
+    A -->|"Delete()"| D["DeletedUser"]
+    S -->|"Delete()"| D
 ```
 
 `DeletedUser` は終端状態です。遷移メソッドを持たないことで、コンパイル時に「削除済みユーザーに対する操作」が不可能になります。

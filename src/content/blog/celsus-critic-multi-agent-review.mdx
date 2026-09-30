@@ -54,11 +54,18 @@ LLMは確率的な生成器として使う。決定論的な部分（入力フ�
 
 2人の思考の型は、デザイン思考のダブルダイアモンドに対応している。
 
-```
-Diamond 1: 問題を理解する    Diamond 2: 解決に向かう
-  Discover → Define            Develop → Deliver
-     ↓                            ↓
-    Aria                         Mitra
+```mermaid
+flowchart TB
+    subgraph D2["Diamond 2: 解決に向かう"]
+        direction LR
+        Develop --> Deliver
+    end
+    subgraph D1["Diamond 1: 問題を理解する"]
+        direction LR
+        Discover --> Define
+    end
+    D1 --> Aria
+    D2 --> Mitra
 ```
 
 Ariaは問題を定義する。解決策は出さない。問いを投げて、構造を見せる。

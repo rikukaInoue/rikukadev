@@ -148,12 +148,17 @@ Martin Fowlerの strangler fig pattern は、既存システムの周りに新�
 
 理由はシンプルで、**新sliceの追加が既存コードに一切触らない**から。
 
-```
-                [Reverse Proxy]
-                       ↓
-[POST /api/v2/tweets]  → [新Goアプリ: post_tweet slice]
-[GET  /api/v1/tweets]  → [既存Rails]
-[POST /api/v2/notify]  → [新Goアプリ: notify slice]
+```mermaid
+flowchart TD
+    RP["Reverse Proxy"]
+    subgraph GO["新Goアプリ"]
+        N1["post_tweet slice"]
+        N2["notify slice"]
+    end
+    RAILS["既存Rails"]
+    RP -->|"POST /api/v2/tweets"| N1
+    RP -->|"GET /api/v1/tweets"| RAILS
+    RP -->|"POST /api/v2/notify"| N2
 ```
 
 新エンドポイントを新言語で書く時、VSAなら「post\_tweet」というディレクトリを1個切るだけ。既存のドメインモデルもUseCase層も骨格を組む必要がない。

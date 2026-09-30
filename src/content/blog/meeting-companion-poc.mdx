@@ -279,10 +279,9 @@ yMapState.observeDeep(() => {
 
 通常モードとは別に、デザイン思考の「ダブルダイアモンド」フレームワークに沿って会議を分析するモードを搭載した。
 
-```
-◇ Discover    ◇ Define    ◇ Develop    ◇ Deliver
-  (発見)        (定義)       (展開)       (実行)
-   ↑ 発散        収束 ↓      ↑ 発散       収束 ↓
+```mermaid
+flowchart LR
+    D1["Discover (発見) / 発散"] --> D2["Define (定義) / 収束"] --> D3["Develop (展開) / 発散"] --> D4["Deliver (実行) / 収束"]
 ```
 
 ### 4つのフェーズ

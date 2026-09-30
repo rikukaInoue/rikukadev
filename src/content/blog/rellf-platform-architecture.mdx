@@ -171,16 +171,17 @@ billing がプロダクトレベルの**ゲート**、authz がリソースレ�
 
 ### 循環依存がない
 
-```
-rellf-auth ←───── 全プロダクト（JWT 検証）
-     │
-     │ sub / groups
-     ▼
-rellf-authz ←──── プロダクト（認可判定）
-     ▲
-     │ context.plan
-     │
-rellf-billing ←── プロダクト（プラン確認・使用量記録）
+```mermaid
+flowchart TD
+    Products["全プロダクト"]
+    Auth["rellf-auth"]
+    Authz["rellf-authz"]
+    Billing["rellf-billing"]
+    Products -->|"JWT 検証"| Auth
+    Products -->|"認可判定"| Authz
+    Products -->|"プラン確認・使用量記録"| Billing
+    Auth -->|"sub / groups"| Authz
+    Billing -->|"context.plan"| Authz
 ```
 
 - auth は誰にも依存しない（最上流）
@@ -204,25 +205,22 @@ rellf-billing ←── プロダクト（プラン確認・使用量記録）
 
 ### データフロー
 
-```
-[ユーザーがリクエスト]
-     │
-     ▼
-[プロダクト API]
-     │
-     ├─ 1. JWT 検証 → rellf-auth の JWKS
-     │     sub: user-123, groups: ["lawyer"]
-     │
-     ├─ 2. プラン取得 → rellf-billing
-     │     org: org-abc, plan: "pro"
-     │
-     └─ 3. 認可判定 → rellf-authz
-           {
-             principal: { id: "user-123", groups: ["lawyer"] },
-             action: "create_case",
-             context: { plan: "pro", current_count: 42 }
-           }
-           → permit
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant P as プロダクト API
+    participant Auth as rellf-auth
+    participant Bill as rellf-billing
+    participant Authz as rellf-authz
+    U->>P: リクエスト
+    P->>Auth: 1. JWT 検証(JWKS)
+    Note over P,Auth: sub: user-123, groups: ["lawyer"]
+    P->>Bill: 2. プラン取得
+    Note over P,Bill: org: org-abc, plan: "pro"
+    P->>Authz: 3. 認可判定
+    Note over P,Authz: principal: { id: "user-123", groups: ["lawyer"] }
+    Note over P,Authz: action: "create_case", context: { plan: "pro", current_count: 42 }
+    Authz-->>P: permit
 ```
 
 プロダクトが 3 つのサービスから情報を集め、context として認可エンジンに渡す。**組み立ての責任はプロダクト側にある**のがポイントです。

@@ -14,36 +14,27 @@ description: "handler・usecase・domain・repository・readmodel の5層を図�
 
 ## 図1: リクエストの流れ
 
+```mermaid
+flowchart TD
+    REQ["HTTPリクエスト"] --> H["handler/（HTTPの形 ⇄ usecaseの型の変換だけ）"]
+    H -->|"書き込み"| C["usecase.Commands"]
+    H -->|"読み取り"| Q["usecase.Queries"]
+    subgraph TX["トランザクション（txはここだけ）"]
+        D["domain.Photo ← ドメインモデル"]
+        INV["不変条件（タイトル長の上限等）"]
+        ST["状態遷移（未完了の写真は公開できない、等）"]
+        D --- INV
+        D --- ST
+        D --> R["repository/（Entityの復元と保存）"]
+    end
+    C -->|"認可: この操作をしてよいか"| D
+    Q -->|"認可: 見えるIDの一覧を取得"| RM["readmodel/（Entityを経由せず表示の形を直接SELECT）"]
+    R --> DB["MySQL photos テーブル（同一）"]
+    RM --> DB
 ```
-                        HTTPリクエスト
-                             │
-                        handler/          ← HTTPの形 ⇄ usecaseの型の変換だけ
-                             │
-            ┌────────────────┴────────────────┐
-            │ 書き込み                          │ 読み取り
-            ▼                                 ▼
-     usecase.Commands                   usecase.Queries
-      │ 認可: この操作をしてよいか         │ 認可: 見えるIDの一覧を取得
-      ▼                                 │
- ┌─── トランザクション ── txはここだけ ─┐   │   txなし(持つ口が実装に無い)
- │                                  │   │
- │   domain.Photo  ← ドメインモデル   │   │
- │    ├ 不変条件  (タイトル長の上限等) │   │
- │    └ 状態遷移  (未完了の写真は     │   │
- │               公開できない、等)    │   │
- │        │                         │   │
- │        ▼                         │   │
- │   repository/  (Entityの復元と保存)│   │
- └────────┼─────────────────────────┘   │
-          │                             ▼
-          │                        readmodel/  (Entityを経由せず
-          │                             │       表示の形を直接SELECT。
-          │                             │       未完了の行は返さない)
-          ▼                             ▼
-      ┌────────────────────────────────────┐
-      │       MySQL photos テーブル(同一)     │
-      └────────────────────────────────────┘
-```
+
+- 読み取りの道は tx なし（持つ口が実装に無い）
+- readmodel/ は未完了の行は返さない
 
 見てほしいのは1点だけ。**ドメインモデルが居るのは書き込みの道だけ**だ。
 読みの道は domain を通らず、SQL が直接応答の形を作る。
@@ -89,14 +80,13 @@ Entity のメソッドに置くと、**そのルールを迂回する書き込�
 クエリは手書きの SQL で、sqlc（SQL から型付き Go コードを生成するツール）に
 食わせる。生成先が書きと読みで分かれている。
 
-```
- db/schema.sql（マイグレーション全適用後のスキーマ）
-      │
-      ├─ 入力 ─ db/queries/repository/*.sql ─ 生成 → repository/internal/sqlcgen
-      │              (INSERT / UPDATE / FOR UPDATE)
-      │
-      └─ 入力 ─ db/queries/readmodel/*.sql ── 生成 → readmodel/internal/sqlcgen
-                     (表示用SELECT)
+```mermaid
+flowchart LR
+    S["db/schema.sql（マイグレーション全適用後のスキーマ）"]
+    S -->|"入力"| RQ["db/queries/repository/*.sql（INSERT / UPDATE / FOR UPDATE）"]
+    S -->|"入力"| MQ["db/queries/readmodel/*.sql（表示用SELECT）"]
+    RQ -->|"生成"| RG["repository/internal/sqlcgen"]
+    MQ -->|"生成"| MG["readmodel/internal/sqlcgen"]
 ```
 
 生成型は Go の `internal` パッケージに置く。言語規則により、

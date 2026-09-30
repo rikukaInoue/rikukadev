@@ -13,19 +13,18 @@ description: "認証・認可・課金の3サービス基盤をプロダクト�
 
 ## 全体像
 
-```
-ブラウザ SDK (@rellf/sdk)
-  │ OIDC (Authorization Code + PKCE)
-  │ → ID Token + Access Token 取得
-  │
-  │ Access Token を Authorization ヘッダーに付けて API 呼び出し
-  ▼
-プロダクト API
-  │
-  │ Go SDK (rellf-sdk-go)
-  │ → JWT 検証 + 認可判定 + プラン取得
-  ▼
-auth / authz / billing
+```mermaid
+flowchart TD
+    subgraph FE["ブラウザ SDK (@rellf/sdk)"]
+        S1["OIDC (Authorization Code + PKCE) で ID Token + Access Token を取得"]
+        S2["Access Token を Authorization ヘッダーに付けて API 呼び出し"]
+        S1 --> S2
+    end
+    subgraph API["プロダクト API"]
+        G["Go SDK (rellf-sdk-go): JWT 検証 + 認可判定 + プラン取得"]
+    end
+    S2 --> G
+    G --> SVC["auth / authz / billing"]
 ```
 
 ブラウザ SDK が入口（ユーザー認証）、Go SDK が出口（検証・認可・課金）。プロダクト開発者はこの 2 つを入れるだけで rellf 基盤に接続できます。
@@ -97,25 +96,27 @@ func CreateCase(c *gin.Context) {
 
 ### `Can()` の内部フロー
 
+```mermaid
+sequenceDiagram
+    participant P as client.Can(ctx, req)
+    participant BL as billing
+    participant AZ as authz
+    Note over P: 1. ctx から JWT クレームを取得 (ミドルウェアが注入済み): sub, groups, auth_time, amr
+    P->>BL: 2. GET /api/orgs/{orgId}/plan (Client Credentials トークンで認証。キャッシュあり、TTL 5分)
+    BL-->>P: { plan: "pro" }
+    P->>AZ: 3. POST /api/{product}/is-authorized (principal, action, resource, context)
+    AZ-->>P: { allowed: true } or { allowed: false, reason: "..." }
 ```
-client.Can(ctx, req)
-  │
-  ├─ 1. ctx から JWT クレームを取得（ミドルウェアが注入済み）
-  │     sub, groups, auth_time, amr
-  │
-  ├─ 2. billing からプラン取得（キャッシュあり、TTL 5分）
-  │     Client Credentials トークンで認証
-  │     GET /api/orgs/{orgId}/plan → { plan: "pro" }
-  │
-  └─ 3. authz に判定要求
-        POST /api/{product}/is-authorized
-        {
-          principal: { id: sub, groups: ["lawyer"] },
-          action: "create_case",
-          resource: { type: "Case" },
-          context: { plan: "pro", auth_time: 1712796400, amr: ["pwd"] }
-        }
-        → { allowed: true } or { allowed: false, reason: "..." }
+
+3 で authz に送る判定要求のボディ:
+
+```
+{
+  principal: { id: sub, groups: ["lawyer"] },
+  action: "create_case",
+  resource: { type: "Case" },
+  context: { plan: "pro", auth_time: 1712796400, amr: ["pwd"] }
+}
 ```
 
 プロダクト側は `Can()` 1 行で 3 サービスの連携が完了します。
