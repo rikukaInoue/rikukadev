@@ -1,0 +1,298 @@
+---
+title: "バックスラッシュ1本でログイン後の戻り先が奪われる"
+date: 2026-09-30
+tags: ["セキュリティ", "認証", "OIDC", "React Router", "設計"]
+description: "ログイン後の戻り先を検証する関数が /\\evil.com で抜けた。WHATWG URL がバックスラッシュをパス区切りとして扱うため、前方一致の判定では追いつかない。素直な直し方に残っていたもう1つの穴と、なぜ既製の脆弱性検査からは出てこないのかを実測つきでまとめた。"
+---
+
+ログイン後に元のページへ戻す `returnTo` の検証が、`/\evil.com` で抜けていた。
+
+```
+https://app.example/auth/login?returnTo=/\evil.com
+```
+
+このリンクを踏むと、**ログイン成功後に `https://evil.com` へ着地する**。
+
+見つけた実装と、**素直な直し方にも残っていたもう1つの穴**、そして
+なぜこれが既製の脆弱性検査からは出てこないのかを書く。
+
+## 単体では何も漏れない。だから軽く見られる
+
+オープンリダイレクトは、**自分のサイトの URL を踏ませて任意の外部サイトへ転送させられる**
+状態を指す。それ自体はデータを1バイトも漏らさない。だから「ただのリダイレクトでしょう」と
+扱われやすい。
+
+性質が変わるのは**ログインフローに乗ったとき**だ。
+
+| | 起きること | ユーザーが疑う材料 |
+|---|---|---|
+| 1 | メールのリンクは**本物のドメイン** | 無い |
+| 2 | 表示されるのは**本物のログイン画面** | 無い（IdP のドメイン、本物の証明書） |
+| 3 | ユーザーは正しくログインする | 無い（認証は成功する） |
+| 4 | `redirect(returnTo)` が走り、**攻撃者のページに着地** | ここで初めて出る |
+| 5 | 「セッションが切れました。もう一度ログインしてください」 | 手遅れ |
+
+つまりこういうことになる。
+
+> 自ドメインの信頼を、攻撃者が借りる。
+
+フィッシングが失敗する理由はたいてい「URL が変だと気づかれる」ことだが、
+この経路では**最初に見る URL が本物**で、**次に見るログイン画面も本物**だ。
+
+OAuth 2.0 が `redirect_uri` の完全一致を要求し、ワイルドカードを認めないのも同じ理由だ。
+**リダイレクト先はユーザー入力ではなく設定として扱う**という判断が仕様に埋め込まれている。
+`returnTo` はその判断から外れた場所に自分で作った例外なので、自分で守る必要がある。
+
+## 実際にあったコード
+
+React Router の SSR で、OIDC の Authorization Code + PKCE を回している。
+ログイン前のページへ戻すために `returnTo` を持ち回る。よくある実装だと思う。
+
+```ts
+// app/routes/auth.login.ts
+// 同一オリジンのパスだけを通す（つもりだった）
+function safeReturnTo(v: string | null): string {
+  return v && v.startsWith("/") && !v.startsWith("//") ? v : "/";
+}
+
+export async function loader({ request }: Route.LoaderArgs) {
+  const url = new URL(request.url);
+  const req = newAuthRequest(safeReturnTo(url.searchParams.get("returnTo")));
+  // state / nonce / verifier と一緒に短命の署名 Cookie へ
+  flow.set("flow", JSON.stringify(req));
+  return redirect(await authorizationUrl(req, redirectUri), { headers });
+}
+```
+
+```ts
+// app/routes/auth.callback.ts — Location が出るのはここ
+// state / nonce を検証し、トークンをサーバー側セッションに保存したあと
+return redirect(req.returnTo, { headers });
+```
+
+この実装は**間違ったことを何もしていないように見える**。`state` も `nonce` も PKCE も
+入っている。トークンは Cookie に載せずサーバー側ストアに置いている。
+`//evil.com`（プロトコル相対 URL）もちゃんと弾いている。
+
+抜けるのは `/\evil.com` の方だ。
+
+## なぜバックスラッシュで抜けるのか
+
+[WHATWG URL 仕様](https://url.spec.whatwg.org/#special-scheme)は、**special scheme**
+（`http` / `https` / `ws` / `wss` / `ftp` / `file`）に限って
+**バックスラッシュをパス区切りとして `/` と同じに扱う**と決めている。
+Windows のパス表記との互換のために入った挙動で、すべてのモダンブラウザが従っている。
+
+つまりブラウザは `Location: /\evil.com` を `//evil.com` として解決する。
+
+```
+input="/photos"        passed=true  host=app.example
+input="//evil.com"     passed=false host=app.example   ← 塞げている
+input="/\evil.com"     passed=true  host=evil.com      ← 抜ける
+input="/\\evil.com"    passed=true  host=evil.com
+```
+
+ここで大事なのは、**バックスラッシュが漏れの原因ではない**ことだ。
+原因は**文字列の前方一致で URL を判定した**ことにある。
+
+| 入力 | ブラウザが解決する先 | 前方一致の判定 |
+|---|---|---|
+| `//evil.com` | `evil.com` | 止まる |
+| `/\evil.com` | `evil.com` | **通る** |
+| `/\/evil.com` | `evil.com` | **通る** |
+| `///evil.com` | `evil.com` | 止まる |
+| `/⟨tab⟩evil.com` | `app.example/evil.com` | 通るが無害 |
+| `/%2f%2fevil.com` | `app.example/%2f%2f…` | 通るが無害 |
+
+この表を見て「危ない文字を全部列挙すればいい」と思うなら、それは**拒否リスト**だ。
+仕様の正規化ルールを自分で再実装することになるので、ブラウザのパーサに勝てる見込みがない。
+
+## 素直な直し方には、もう1つ穴がある
+
+正しい方向は**「ブラウザと同じパーサで解決してから origin を比べる」**だ。
+文字の判定をやめて、意味の判定にする。
+
+```ts
+// 案A — 解決して origin を比べる
+const u = new URL(v, origin);
+if (u.origin !== origin) return "/";
+return u.pathname + u.search + u.hash;
+```
+
+バックスラッシュも制御文字も `javascript:` も、これで一度に片付く。
+だが**これだけでは足りない**。
+
+| 入力 | 案A（origin 比較のみ） | 案B（載せ直して再確認） |
+|---|---|---|
+| `/photos` | `/photos` | `/photos` |
+| `//evil.com` | `/` | `/` |
+| `/\evil.com` | `/` | `/` |
+| `javascript:alert(1)` | `/` | `/` |
+| `https://app.example//evil.com` | **`//evil.com` → evil.com へ漏れる** | `/` |
+
+最後の行が要点だ。この入力は**オリジンが本当に同一**なので `u.origin !== origin` を通過する。
+ところが `pathname` が `//evil.com` になる。
+
+そしてその値を `Location` ヘッダに載せると、**ブラウザはもう一度パースする**。
+今度は base の無い文字列として読むので、`//evil.com` はプロトコル相対 URL として解釈される。
+
+> 「パスとして安全」と「Location に載せて安全」は別の判定だ。
+
+だから**返す値をもう一度解決して、ブラウザが同じ結論に至ることを確かめる**。
+
+## 採用した実装
+
+```ts
+// app/.server/returnto.ts
+// safeReturnTo は returnTo パラメータを同一オリジンのパスへ正規化する。
+// 外部オリジンに解決される値、および Location に載せるとオリジンを離れる値は "/" に落とす。
+export function safeReturnTo(value: string | null | undefined, base: string | URL): string {
+  if (!value) return "/";
+
+  let origin: string;
+  try { origin = new URL(base).origin; } catch { return "/"; }
+
+  let resolved: URL;
+  try { resolved = new URL(value, origin); } catch { return "/"; }
+  if (resolved.origin !== origin) return "/";
+
+  // pathname が "//host" の形だと Location ではプロトコル相対 URL として解釈される。
+  // 返す値をもう一度解決し、ブラウザが同じ結論に至ることを確かめる。
+  const path = resolved.pathname + resolved.search + resolved.hash;
+  try {
+    if (new URL(path, origin).origin !== origin) return "/";
+  } catch { return "/"; }
+  return path;
+}
+```
+
+実装で気をつけた点が3つある。
+
+- **`base` を引数で受ける。** グローバルな設定値から取ると、テストで別オリジンを渡せなくなる。
+  React Router なら loader / action の `request.url` がそのまま使える
+- **`try / catch` を省かない。** `new URL()` は壊れた入力で例外を投げる。
+  `catch` の中は必ず `"/"`（安全側）に倒す
+- **戻り値は必ずパス。** 絶対 URL を返す形にすると、呼び出し側でまた同じ判定が必要になる
+
+## 検証関数をコピーすると、片方だけ直る
+
+調べてみると `safeReturnTo` は**2つのファイルに複製されていて、両方が同じバグ**だった。
+
+```
+app/routes/auth.login.ts:8   function safeReturnTo(v: string | null): string {
+app/routes/login.tsx:8       function safeReturnTo(v: string | null): string {
+```
+
+片方はコメントまで同じだった。**「同一オリジンのパスだけを通す」と書いてあって、通していなかった。**
+
+修正の作業量の半分は、共有モジュールへの1本化に使った。バグそのものを直すのは数行だ。
+**検証関数がコピーされている状態は、それ自体が脆弱性の温床**だと考えた方がいい。
+直したつもりで片方だけ直るし、レビューでも「もう片方」は視界に入らない。
+
+## テストは性質で書く
+
+個別のバイパスを1件ずつ書いても、**次に見つかる形は書いていない**。
+だから性質そのものをテストにする。
+
+```ts
+test("返した値は Location に載せても同一オリジンに留まる", () => {
+  const inputs = [...passthrough.map(([i]) => i), ...rejected.map(([i]) => i), "", "/"];
+  for (const input of inputs) {
+    const out = safeReturnTo(input, BASE);
+    assert.equal(
+      new URL(out, BASE).origin,
+      BASE,
+      `${JSON.stringify(input)} -> ${JSON.stringify(out)} が外へ出た`,
+    );
+  }
+});
+```
+
+個別のケースも書く。ただし**「なぜそれが危ないのか」をテスト名に書く**と、
+次に触る人が判断できる。
+
+```ts
+const rejected: Array<[string, string]> = [
+  ["//evil.com",                    "プロトコル相対 URL"],
+  ["/\\evil.com",                   "バックスラッシュ1本（special scheme では / と同じ扱い）"],
+  ["/\\\\evil.com",                 "バックスラッシュ2本"],
+  ["///evil.com",                   "スラッシュ3本"],
+  ["https://app.example//evil.com", "同一オリジンだが pathname が //host になる"],
+  ["https://evil.com/x",            "別オリジン"],
+  ["http://app.example/x",          "スキームが違う"],
+  ["javascript:alert(1)",           "javascript スキーム"],
+];
+```
+
+**通す形も書く。** 検証を厳しくしすぎて `/photos?fresh=1` が落ちるようになったら、
+それは別の壊れ方をしている。
+
+## React Router で見る場所
+
+`redirect()` にリクエスト由来の値が届く経路は、思ったより多い。
+
+| 場所 | 危ない形 |
+|---|---|
+| ログイン開始の loader | `searchParams.get("returnTo")` をそのまま持ち回る |
+| OIDC callback の loader | Cookie / セッションに入れた `returnTo` を無検証で `redirect()` |
+| ログイン action | `formData.get("returnTo")` — **hidden input は改竄できる** |
+| ログアウト | `post_logout_redirect_uri` をリクエスト由来で組む |
+| エラー境界 / 401 ハンドラ | 元の URL に戻す処理 |
+| ステップアップ認証 | AAL2 要求で `/login?aal=2&returnTo=…` に飛ばす処理 |
+
+### 出口にも置く
+
+今回は callback 側の `redirect(req.returnTo)` にも検証を入れた。
+`returnTo` は署名 Cookie 由来なので改竄はできず、入口で検証済みでもある。**二重になる。**
+
+それでも入れたのは、**Location を出すのはここだから**だ。
+保存形式が署名 Cookie からサーバー側セッションに変わっても、
+別のルートが同じ値を書くようになっても、出口の判定は生き残る。
+**入口の検証は「値の由来」に依存するが、出口の検証は依存しない。**
+
+```diff
+- return redirect(req.returnTo, { headers });
++ return redirect(safeReturnTo(req.returnTo, url), { headers });
+```
+
+## なぜ既製の検査から出てこないのか
+
+[脆弱性検査を層で回して](/blog/continuous-vulnerability-scanning/)いても、これは出てこない。
+層ごとに理由が違う。
+
+| 層 | 見つけられない理由 |
+|---|---|
+| govulncheck / Dependabot / `pnpm audit` | 依存の CVE を見る層。**自分で書いたコードは対象外** |
+| Trivy | イメージと設定の層。同じく対象外 |
+| gosec / ESLint | パターン検査。`safeReturnTo` という名前の関数を通っている以上、**それが正しいかは判定できない** |
+| CodeQL / semgrep | データフローを追えるが、**検証関数をサニタイザと見なして追跡を打ち切る**。名前が説得力を持ってしまう |
+| OWASP ZAP | オープンリダイレクトの active ルールはある。だが**この経路は外部 IdP を1往復する**ので駆動できない |
+
+ZAP について補足すると、`/auth/login?returnTo=…` を叩いて返るのは IdP への 302 だけだ。
+**着地点は認証が完了しないと現れない。** ZAP に IdP のログインを突破させる設定は書けるが、
+それは「ZAP でオープンリダイレクトを探す」より手間がかかる。
+
+> 「検証関数がある」ことは道具から見える。「その検証が正しい」ことは見えない。
+
+だから**検証関数にはテストを書く**。これは道具の不足ではなく役割分担だと思う。
+既製の検査は「知られた悪いパターン」を見る。
+自分が書いた保証を確かめるのは、自分のテストの仕事になる。
+
+## まとめ
+
+1. **拒否リストで URL を検証してはいけない。** ブラウザの URL パースは仕様の正規化
+   （バックスラッシュ、制御文字、スキーム、パーセントエンコード）を通る。
+   文字列の前方一致でそれに追いつくことはできない
+2. **解決してから origin を比べ、返す値をもう一度解決して確かめる。**
+   「パスとして安全」と「`Location` に載せて安全」は別の判定
+3. **検証関数は1箇所に置く。** コピーされた検証は、片方だけ直る
+4. **出口にも置く。** 入口の検証は値の由来に依存する。出口の検証は依存しない
+5. **テストは性質で書く。** 「返り値を全部 `Location` に載せ直して同一オリジンに留まる」の1本が、
+   個別ケース9本より長持ちする
+
+同じ教訓が別の場所にもあった。本番用の危険な実装を止めるガードを
+`ENV === "production"` という**拒否リスト**で書いていて、`ENV` 未設定や `prd` という綴りで
+通り抜けていたことがある。それを許可リスト（`dev` / `test` / `ci` のみ許す）に直した。
+
+拒否リストは「知っている悪い形」しか止められない。
+URL 検証でも環境ガードでも、同じ結論になった。
