@@ -357,6 +357,18 @@ const publishedAt = getPublishedAt(post);
         box-sizing: border-box;
       }
 
+      /* 横に広い図はスマホ幅で縮小されて文字が読めなくなる。表と同じく
+         箱に包んで、図には下限幅を持たせて横スクロールさせる(下限はスクリプトが
+         SVG の実寸から決める) */
+      .prose :global(.diagram-wrap) {
+        overflow-x: auto;
+        margin: 1.5rem 0;
+      }
+
+      .prose :global(.diagram-wrap > svg[id^='mermaid']) {
+        margin: 0;
+      }
+
       .back-link {
         display: block;
         max-width: 960px;
@@ -478,6 +490,18 @@ const publishedAt = getPublishedAt(post);
             btn.classList.remove('copied');
           }, 2000);
         }
+      });
+    </script>
+    <script>
+      // 横に広い Mermaid 図は縮小せず横スクロールにする。下限幅は図の実寸(viewBox)と
+      // 720px の小さい方: 大きい図でも 720px あれば文字が読める
+      document.querySelectorAll<SVGSVGElement>('.prose svg[id^="mermaid"]').forEach((svg) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'diagram-wrap';
+        svg.parentNode?.insertBefore(wrap, svg);
+        wrap.appendChild(svg);
+        const vb = svg.viewBox.baseVal;
+        if (vb && vb.width > 0) svg.style.minWidth = `${Math.min(vb.width, 720)}px`;
       });
     </script>
     <script>
