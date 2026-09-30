@@ -23,7 +23,7 @@ export default defineConfig({
       sidebar: [
         { label: 'Documents', link: '/documents/' },
         {
-          label: '螺旋の歴史',
+          label: '螺旋の歴史 — システム開発はなぜ同じ場所に戻らないのか',
           items: [{ autogenerate: { directory: 'documents/spiral-history' } }],
         },
       ],
