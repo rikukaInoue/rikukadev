@@ -11,9 +11,8 @@ description: "デプロイ戦略×DBマイグレーションの組み合わせ�
 
 この問いに答えるために、検証環境で数字を取ってきました。
 
-- [ECS ネイティブ B/G・カナリアの実測と使い分け](/blog/ecs-native-bluegreen-canary/) — 無停止切替、カナリア重み、provider の fail open
-- [カナリアは失敗を消さない — ECS 3層防衛の実測](/blog/ecs-deployment-gates-measured/) — 同じ壊れた版で被弾 **0/1,679**（昇格ゲート）vs **69/2,880**（カナリア+アラーム）
-- [Aurora MySQL で INSTANT DDL と fast clone を実測した](/blog/aurora-instant-ddl-fast-clone/) — DDL 方式の判定、COPY は 2M 行 56 秒
+- [プログレッシブデリバリー入門 — 置く・当てる・見せる](/blog/progressive-delivery-intro/) — 全体地図と語彙、2本の巻き戻しレバー（デプロイ32秒 / フラグ14秒）
+- [アプリと DB でプログレッシブは別物](/blog/progressive-delivery-app-vs-db/) — 各層の仕組みと実測。同じ壊れた版で被弾 **0/1,679**（昇格ゲート）vs **69/2,880**（カナリア+アラーム）、DDL 方式の判定、COPY は 2M 行 56 秒
 
 この記事はその総集編です。**変更の種類ごとの組み合わせ表**と、表を作った後に気づいた**もっと大事なこと** — この表を開発者に渡してはいけない — を書きます。
 
