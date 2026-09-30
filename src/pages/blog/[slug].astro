@@ -283,6 +283,68 @@ const publishedAt = getPublishedAt(post);
         margin: 2rem 0;
       }
 
+      /* 表。Markdown の表は既定だと罫線も余白も無く読めないので、
+         見出し行を面で区別し、行ごとに薄い罫線を引く。横に長い表は
+         スクリプトで .table-wrap に包んで横スクロールさせる */
+      .prose :global(.table-wrap) {
+        overflow-x: auto;
+        margin: 1.5rem 0;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
+
+      .prose :global(table) {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+        line-height: 1.6;
+      }
+
+      .prose :global(th),
+      .prose :global(td) {
+        padding: 0.65rem 0.9rem;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .prose :global(th) {
+        background: var(--surface);
+        color: var(--text);
+        font-weight: 600;
+        font-size: 0.8rem;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+
+      .prose :global(td) {
+        /* 狭い画面で 2〜3 文字ごとに折り返されるのを防ぐ。足りなければ横スクロール */
+        min-width: 6rem;
+      }
+
+      .prose :global(td:first-child) {
+        font-weight: 400;
+        color: var(--text);
+      }
+
+      .prose :global(tbody tr:last-child td) {
+        border-bottom: none;
+      }
+
+      .prose :global(tbody tr:hover td) {
+        background: color-mix(in srgb, var(--surface) 60%, transparent);
+      }
+
+      .prose :global(table code) {
+        white-space: nowrap;
+      }
+
+      /* 表の中の強調は、本文と同じアクセント色だと地の文より薄く見えるので
+         文字色を本文色に寄せる */
+      .prose :global(td strong) {
+        color: var(--text);
+      }
+
       /* rehype-mermaid が生成する inline SVG。ダーク背景では既定テーマの
          文字が読めないため、明るい背景を敷く */
       .prose :global(svg[id^='mermaid']) {
@@ -416,6 +478,15 @@ const publishedAt = getPublishedAt(post);
             btn.classList.remove('copied');
           }, 2000);
         }
+      });
+    </script>
+    <script>
+      // 横に長い表を横スクロールできる箱に包む(CSS だけでは table の幅指定と両立しない)
+      document.querySelectorAll<HTMLTableElement>('.prose table').forEach((table) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'table-wrap';
+        table.parentNode?.insertBefore(wrap, table);
+        wrap.appendChild(table);
       });
     </script>
     <script>
