@@ -44,6 +44,18 @@ hub への CASCADE は集約の証拠ではない。順序を入れ替えた途�
 「ダウンロード商品の購入権」と「注文」をつなぐ FK 2 本で、どちらも
 `SET NULL / NULL可`(重み 1)。つまり **切っても存在保証が要らない**候補。
 
+切断前の ER はこう。橋になっているのは上の 2 本だけで、購入権の親子
+(CASCADE)は同一ブロック、customer は hub なので分割の議論から外れている。
+
+```mermaid
+erDiagram
+    sales_order ||--o{ downloadable_link_purchased : "order_id (SET NULL / NULL可) ← 橋"
+    sales_order_item ||--o{ downloadable_link_purchased_item : "order_item_id (SET NULL / NULL可) ← 橋"
+    customer_entity ||--o{ downloadable_link_purchased : "customer_id (SET NULL / hub)"
+    downloadable_link_purchased ||--|{ downloadable_link_purchased_item : "purchased_id (CASCADE = 同一ブロック)"
+    sales_order ||--|{ sales_order_item : "order_id (CASCADE)"
+```
+
 面白かったのは、このダンプは 2015 年頃の Magento 2.0 世代のものだったこと。
 現行の 2.4.9 をインストールして同じスキャンをかけたら、**橋は同じ場所に同じ 2 本**あった。
 10 年間、この境界は動いていない。
@@ -98,7 +110,29 @@ habakiri が重み 1(NULL可のみ)= 難易度「易」と付けた判定が、
 結合はまだ全部アプリ層に残っている。
 
 なので仕上げとして、切り出した 2 テーブルを **Go 製ミニサービス(専用DB)** に移し、
-Magento 本体からはテーブルを DROP した。境界を渡っていたコードは 5 箇所:
+Magento 本体からはテーブルを DROP した。分離後の形はこう。
+
+```mermaid
+flowchart LR
+    subgraph mono["Magento(magento DB)"]
+        OBS["observer ×3<br/>(注文イベントの書き込み)"]
+        BLK["マイダウンロード一覧<br/>(block)"]
+        CTL["ダウンロード実行<br/>(controller)"]
+        SO[("sales_order / _item<br/>ほか 356 テーブル")]
+    end
+    subgraph svc["dlsvc(Go・別プロセス・magento_dl DB)"]
+        API["POST /purchases<br/>POST /orders/{id}/link-status<br/>POST /orders/{id}/customer<br/>GET /purchases?customer_id=<br/>GET /items/{hash} + POST …/consume"]
+        DLP[("downloadable_link_purchased / _item<br/>FK 0 本")]
+    end
+    OBS -->|HTTP| API
+    BLK -->|HTTP| API
+    CTL -->|HTTP| API
+    API --> DLP
+```
+
+ER 図にあった FK は 1 本も残っていない。`order_id` や `customer_id` は
+ただの値になり、存在保証は「参照時点で存在した」に弱まった
+(前回の記事で書いた「弱める」の実物)。境界を渡っていたコードは 5 箇所:
 
 | 箇所 | 旧(モノリス) | 新(HTTP) |
 |---|---|---|
@@ -121,9 +155,21 @@ HTTP ごしで完走した。**FK 2 本の橋が、API 6 本の境界にその�
 ```
 
 モノリスでは同一トランザクションだったから見えなかった順序依存が、HTTP に
-した瞬間「**まだ存在しない行への UPDATE**」として実体化した。今回は作成時に
-状態を確定させる設計だったので無害だが、本番の分離では非同期メッセージ +
-冪等コンシューマ + 突合が必須になる。
+した瞬間「**まだ存在しない行への UPDATE**」として実体化した。
+
+```mermaid
+sequenceDiagram
+    participant M as Magento(注文確定)
+    participant D as dlsvc
+    Note over M: 旧: この 2 つは同一トランザクション内の<br/>save で、順序は問題にならなかった
+    M->>D: POST /orders/4/link-status(状態遷移)
+    Note over D: 対象の行がまだ無い → UPDATE は空振り
+    M->>D: POST /purchases(購入権の作成)
+    Note over D: 作成時に available を確定させる設計<br/>だったため、今回は無害で済んだ
+```
+
+今回は作成時に状態を確定させる設計だったので無害だが、本番の分離では
+非同期メッセージ + 冪等コンシューマ + 突合が必須になる。
 
 ## 重みは「切断後の API 契約の強さ」に裏返る
 
