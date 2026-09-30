@@ -5,6 +5,7 @@ import Seo from '../../components/Seo.astro';
 import ThemeInit from '../../components/ThemeInit.astro';
 import ThemeToggle from '../../components/ThemeToggle.astro';
 import '../../styles/theme.css';
+import { formatPublishedAt, getPublishedAt } from '../../lib/publish-date';
 
 export async function getStaticPaths() {
   const posts = await getCollection('blog');
@@ -17,6 +18,7 @@ export async function getStaticPaths() {
 const { post } = Astro.props;
 const { Content } = await render(post);
 const rawBody = post.body ?? "";
+const publishedAt = getPublishedAt(post);
 ---
 
 <!doctype html>
@@ -31,7 +33,7 @@ const rawBody = post.body ?? "";
       title={`${post.data.title} — rikuka.dev`}
       description={post.data.description}
       ogType="article"
-      publishedDate={post.data.date}
+      publishedDate={publishedAt}
       tags={post.data.tags}
       ogImage={`/blog/${post.id}/og.png`}
     />
@@ -97,6 +99,7 @@ const rawBody = post.body ?? "";
       }
 
       .post-date {
+        display: block;
         font-size: 0.75rem;
         color: var(--muted);
         letter-spacing: 0.08em;
@@ -132,6 +135,13 @@ const rawBody = post.body ?? "";
         padding: 0.1rem 0.5rem;
         border-radius: 999px;
         letter-spacing: 0.04em;
+        text-decoration: none;
+        transition: color 0.15s, border-color 0.15s;
+      }
+
+      .tag:hover {
+        color: var(--text);
+        border-color: var(--text);
       }
 
       .prose {
@@ -355,16 +365,14 @@ const rawBody = post.body ?? "";
 
     <article>
       <div class="post-header">
-        <div class="post-date">
-          {post.data.date.toLocaleDateString('en-US', {
-            year: 'numeric', month: 'short', day: 'numeric'
-          })}
-        </div>
+        <time class="post-date" datetime={publishedAt.toISOString()}>
+          {formatPublishedAt(publishedAt)}
+        </time>
         <h1>{post.data.title}</h1>
         <p class="post-description">{post.data.description}</p>
         <div class="post-tags">
           {post.data.tags.map((tag) => (
-            <span class="tag">{tag}</span>
+            <a class="tag" href={`/?tag=${encodeURIComponent(tag)}`}>{tag}</a>
           ))}
         </div>
       </div>
