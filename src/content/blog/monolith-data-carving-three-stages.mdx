@@ -50,14 +50,30 @@ graph TB
 在庫側を「在庫サービス」として切り出したい、という設定です。
 
 ```mermaid
-graph LR
-    O["<b>orders</b><br/>id PK<br/>user_id<br/>status"]
-    OI["<b>order_items</b><br/>id PK<br/>order_id FK<br/>product_id FK<br/>quantity"]
-    P["<b>products</b><br/>id PK<br/>name<br/>price"]
-    ST["<b>stocks</b><br/>product_id PK,FK<br/>available"]
-    OI -->|FK order_id| O
-    OI -->|FK product_id| P
-    ST -->|FK product_id| P
+erDiagram
+    orders ||--|{ order_items : "FK order_id"
+    products ||--o{ order_items : "FK product_id"
+    products ||--|| stocks : "FK product_id"
+    orders {
+        bigint id PK
+        bigint user_id
+        varchar status
+    }
+    order_items {
+        bigint id PK
+        bigint order_id FK
+        bigint product_id FK
+        int quantity
+    }
+    products {
+        bigint id PK
+        varchar name
+        int price
+    }
+    stocks {
+        bigint product_id PK "FK でもある"
+        int available
+    }
 ```
 
 注文確定のコードは今、こういう1トランザクションを張っています:
@@ -135,18 +151,30 @@ graph TB
 商品名の表示のような読みは、在庫モジュールの API か、複製テーブルで解決します:
 
 ```mermaid
-graph LR
-    subgraph shop["database: shop(注文側)"]
-        OI["<b>order_items</b><br/>id PK<br/>order_id FK<br/>product_id(FKなし・値として保持)<br/>quantity<br/>product_name(注文時点の複製)"]
-        PR["<b>products_replica</b><br/>product_id PK<br/>name"]
-    end
-    subgraph inv["database: inventory(在庫側)"]
-        P["<b>products</b><br/>id PK<br/>name<br/>price"]
-        ST["<b>stocks</b><br/>product_id PK,FK<br/>available"]
-    end
-    ST -->|"FK(同一database内は残す)"| P
-    P -.->|"イベントで同期(表示用)"| PR
-    OI -.->|"product_id は値。存在確認は在庫側の API"| P
+erDiagram
+    order_items {
+        bigint id PK "database: shop"
+        bigint order_id FK
+        bigint product_id "FK なし・値として保持"
+        int quantity
+        varchar product_name "注文時点の複製"
+    }
+    products_replica {
+        bigint product_id PK "database: shop(表示用)"
+        varchar name
+    }
+    products {
+        bigint id PK "database: inventory"
+        varchar name
+        int price
+    }
+    stocks {
+        bigint product_id PK "database: inventory"
+        int available
+    }
+    products ||--|| stocks : "FK(同一 database 内は残す)"
+    products |o..o| products_replica : "イベントで同期"
+    order_items }o..|| products : "値参照。存在確認は API"
 ```
 
 **注文確定トランザクションの分解**。冒頭の「注文と在庫引当が原子的」は

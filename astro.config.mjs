@@ -5,6 +5,7 @@ import react from '@astrojs/react';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import rehypeMermaid from 'rehype-mermaid';
+import rehypeSanitizeInlineStyles from './src/plugins/rehype-sanitize-inline-styles.mjs';
 
 // https://astro.build/config
 export default defineConfig({
@@ -21,6 +22,9 @@ export default defineConfig({
     },
     rehypePlugins: [
       [rehypeMermaid, { strategy: 'inline-svg' }],
+      // mermaid(erDiagram)が吐く壊れた style="undefined;;;undefined" を落とす。
+      // 無いと MDX 変換がビルドごと失敗する。src/plugins/ 参照
+      rehypeSanitizeInlineStyles,
     ],
   },
 });
