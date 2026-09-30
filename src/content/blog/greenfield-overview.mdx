@@ -99,10 +99,22 @@ graph TB
 - **[EventBridge の新カスタムバスは SNS/SQS FIFO を置き換えられるか](/blog/eventbridge-enhanced-bus-vs-sns-sqs-fifo/)** —
   順序・重複排除の意味論は同型。それでも今は乗り換えない理由
 
-## 認可
+## 認証・認可
 
 - **[OpenFGAで認可を実装してみた。ScopeとRelationによる権限制御](/blog/authn-authz-m2m/)** —
   JWT 検証・関係タプル・Can/ListAccessible・M2M まで、実物のコードで追う
+- **[ステップアップ認証を入れてみた。エージェントは自力で昇格できない](/blog/stepup-auth-mcp-human-in-the-loop/)** —
+  RFC 9470 を Keycloak で動かし、AI エージェント（MCP）の危険操作が人間の TOTP なしに通らないことを実測。
+  human-in-the-loop は認証サーバの設定から出てくる性質だった
+
+## 運用と可観測性
+
+- **[OTelを入れてみた。ログのtrace_idでトレースを引く](/blog/otel-log-trace-id-unified/)** —
+  ID の採番元を既存のログ側に揃え、ログとトレースの主キーを1つに保つ。トレースが静かに消える罠4つ
+- **[グレースフルシャットダウンとデッドライン伝播を実測した](/blog/graceful-shutdown-deadline-propagation/)** —
+  止めるたびに再配信を自分で作っていた話から、タイムアウトヒエラルキーと残り時間の伝播まで
+- **[フェイルオーバーは切断ではなく凍結 — RDS 復旧系の実測](/blog/rds-failover-freeze-and-restore/)** —
+  Multi-AZ のフェイルオーバーと、バックアップから戻して中身まで照合するリストア演習
 
 ## 移行
 
@@ -112,6 +124,8 @@ graph TB
 
 ## セキュリティ
 
+- **[セキュリティの既定値をCIで固定し、検査も検査する](/blog/secure-defaults-fitness-functions/)** —
+  秘密情報・TLS・暗号化・非 root を直し、戻れないよう検査を対で入れる。署名・SBOM・provenance と、アラートのルール自体のテストまで
 - **[継続的脆弱性検査は層で回す](/blog/continuous-vulnerability-scanning/)** —
   依存・更新・イメージ・静的解析・DAST の5層を頻度を変えて回す設計
 - **[バックスラッシュ1本でログイン後の戻り先が奪われる](/blog/open-redirect-returnto-validation/)** —
