@@ -5,9 +5,26 @@ import Seo from '../components/Seo.astro';
 import ThemeInit from '../components/ThemeInit.astro';
 import ThemeToggle from '../components/ThemeToggle.astro';
 import '../styles/theme.css';
+import { formatMonth, formatPublishedAt, getPublishedAt, monthKey } from '../lib/publish-date';
 
 const posts = (await getCollection('blog'))
-  .sort((a, b) => b.data.date.getTime() - a.data.date.getTime());
+  .map((post) => {
+    const publishedAt = getPublishedAt(post);
+    return { post, publishedAt, month: monthKey(publishedAt) };
+  })
+  .sort((a, b) => b.publishedAt.getTime() - a.publishedAt.getTime());
+
+// 絞り込み UI 用の一覧。タグは記事数の多い順、月は新しい順
+const tagCounts = new Map<string, number>();
+const monthCounts = new Map<string, number>();
+for (const { post, month } of posts) {
+  for (const tag of post.data.tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+  monthCounts.set(month, (monthCounts.get(month) ?? 0) + 1);
+}
+const tags = [...tagCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'));
+const months = [...monthCounts.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+// 初期表示するタグ数。残りは「すべてのタグ」で開く
+const VISIBLE_TAGS = 16;
 ---
 
 <!doctype html>
@@ -94,7 +111,7 @@ const posts = (await getCollection('blog'))
         color: inherit;
       }
 
-      .post-card:first-child {
+      .post-list {
         border-top: 1px solid var(--border);
       }
 
@@ -103,6 +120,7 @@ const posts = (await getCollection('blog'))
       }
 
       .post-date {
+        display: block;
         font-size: 0.75rem;
         color: var(--muted);
         letter-spacing: 0.08em;
@@ -146,6 +164,132 @@ const posts = (await getCollection('blog'))
         font-size: 0.95rem;
       }
 
+      /* 絞り込み。JS が無い環境では全件表示のまま隠しておく */
+      .filters {
+        display: flex;
+        flex-direction: column;
+        gap: 0.8rem;
+        padding-bottom: 1.5rem;
+      }
+
+      .filters[hidden] {
+        display: none;
+      }
+
+      .filter-row {
+        display: flex;
+        align-items: baseline;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+      }
+
+      .filter-label {
+        font-size: 0.7rem;
+        color: var(--muted);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        min-width: 3.2rem;
+      }
+
+      .filter-tags {
+        display: flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+        flex: 1;
+      }
+
+      .filter-tag {
+        font: inherit;
+        font-size: 0.7rem;
+        color: var(--accent);
+        background: transparent;
+        border: 1px solid var(--accent);
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+      }
+
+      .filter-tag:hover {
+        color: var(--text);
+        border-color: var(--text);
+      }
+
+      .filter-tag[aria-pressed='true'],
+      .filter-tag[aria-pressed='true']:hover {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-contrast);
+      }
+
+      .filter-tag .count {
+        opacity: 0.7;
+        margin-left: 0.2em;
+      }
+
+      .filter-tag.more,
+      .filter-tag.more:hover {
+        border-style: dashed;
+      }
+
+      .filter-tags:not(.expanded) .filter-tag.overflow {
+        display: none;
+      }
+
+      .filter-tags.expanded .filter-tag.more {
+        display: none;
+      }
+
+      .filter-month {
+        font: inherit;
+        font-size: 0.8rem;
+        color: var(--text);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.3rem 0.6rem;
+        cursor: pointer;
+      }
+
+      .filter-status {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+
+      .filter-clear {
+        font: inherit;
+        font-size: 0.75rem;
+        color: var(--accent);
+        background: none;
+        border: none;
+        padding: 0;
+        cursor: pointer;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+
+      .filter-clear[hidden] {
+        display: none;
+      }
+
+      .post-card[hidden] {
+        display: none;
+      }
+
+      .no-match {
+        padding: 3rem 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .no-match[hidden] {
+        display: none;
+      }
+
       footer {
         border-top: 1px solid var(--border);
         padding: 2rem 2.5rem;
@@ -170,25 +314,154 @@ const posts = (await getCollection('blog'))
       {posts.length === 0 ? (
         <p class="empty-state">記事はまだありません。</p>
       ) : (
-        posts.map((post) => (
-          <a href={`/blog/${post.id}`} class="post-card">
-            <div class="post-date">
-              {post.data.date.toLocaleDateString('en-US', {
-                year: 'numeric', month: 'short', day: 'numeric'
-              })}
+        <>
+          <div class="filters" id="filters" hidden>
+            <div class="filter-row">
+              <span class="filter-label">Tag</span>
+              <div class="filter-tags" id="filter-tags">
+                {tags.map(([tag, count], i) => (
+                  <button
+                    type="button"
+                    class:list={['filter-tag', { overflow: i >= VISIBLE_TAGS }]}
+                    data-tag={tag}
+                    aria-pressed="false"
+                  >{tag}<span class="count">{count}</span></button>
+                ))}
+                {tags.length > VISIBLE_TAGS && (
+                  <button type="button" class="filter-tag more" id="filter-tags-more">
+                    すべてのタグ ({tags.length})
+                  </button>
+                )}
+              </div>
             </div>
-            <div class="post-title">{post.data.title}</div>
-            <div class="post-excerpt">{post.data.description}</div>
-            <div class="post-tags">
-              {post.data.tags.map((tag) => (
-                <span class="tag">{tag}</span>
-              ))}
+            <div class="filter-row">
+              <label class="filter-label" for="filter-month">Month</label>
+              <select class="filter-month" id="filter-month">
+                <option value="">すべての月</option>
+                {months.map(([key, count]) => (
+                  <option value={key}>{formatMonth(key)} ({count})</option>
+                ))}
+              </select>
+              <span class="filter-status">
+                <span id="filter-count"></span>
+                <button type="button" class="filter-clear" id="filter-clear" hidden>絞り込みを解除</button>
+              </span>
             </div>
-          </a>
-        ))
+          </div>
+
+          <div class="post-list" id="post-list">
+            {posts.map(({ post, publishedAt, month }) => (
+              <a
+                href={`/blog/${post.id}`}
+                class="post-card"
+                data-tags={JSON.stringify(post.data.tags)}
+                data-month={month}
+              >
+                <time class="post-date" datetime={publishedAt.toISOString()}>
+                  {formatPublishedAt(publishedAt)}
+                </time>
+                <div class="post-title">{post.data.title}</div>
+                <div class="post-excerpt">{post.data.description}</div>
+                <div class="post-tags">
+                  {post.data.tags.map((tag) => (
+                    <span class="tag">{tag}</span>
+                  ))}
+                </div>
+              </a>
+            ))}
+          </div>
+          <p class="no-match" id="no-match" hidden>条件に合う記事はありません。</p>
+        </>
       )}
     </section>
 
     <footer>&copy; rikuka.dev &mdash; All rights reserved &middot; <a href="/privacy" style="color: inherit;">プライバシーポリシー</a></footer>
+
+    <script>
+      // タグ・月の絞り込み。状態は URL の ?tag=&month= に持たせ、共有や戻る操作に耐えるようにする
+      const filters = document.getElementById('filters');
+      const tagList = document.getElementById('filter-tags');
+      const monthSelect = document.getElementById('filter-month') as HTMLSelectElement | null;
+      const countEl = document.getElementById('filter-count');
+      const clearBtn = document.getElementById('filter-clear');
+      const noMatch = document.getElementById('no-match');
+      const cards = Array.from(document.querySelectorAll<HTMLAnchorElement>('#post-list .post-card'));
+
+      if (filters && tagList && monthSelect && countEl && clearBtn && noMatch) {
+        const tagButtons = Array.from(tagList.querySelectorAll<HTMLButtonElement>('.filter-tag[data-tag]'));
+        const moreBtn = document.getElementById('filter-tags-more');
+        const total = cards.length;
+
+        const state = { tag: '', month: '' };
+
+        function readUrl() {
+          const params = new URLSearchParams(location.search);
+          state.tag = params.get('tag') ?? '';
+          state.month = params.get('month') ?? '';
+        }
+
+        function writeUrl() {
+          const params = new URLSearchParams();
+          if (state.tag) params.set('tag', state.tag);
+          if (state.month) params.set('month', state.month);
+          const qs = params.toString();
+          history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
+        }
+
+        function apply() {
+          let shown = 0;
+          for (const card of cards) {
+            const tags: string[] = JSON.parse(card.dataset.tags ?? '[]');
+            const ok = (!state.tag || tags.includes(state.tag)) && (!state.month || card.dataset.month === state.month);
+            card.hidden = !ok;
+            if (ok) shown++;
+          }
+          for (const btn of tagButtons) {
+            const active = btn.dataset.tag === state.tag;
+            btn.setAttribute('aria-pressed', String(active));
+            // 選択中のタグが折りたたみ側にあるときは開いて見せる
+            if (active && btn.classList.contains('overflow')) tagList!.classList.add('expanded');
+          }
+          monthSelect!.value = state.month;
+          const filtering = Boolean(state.tag || state.month);
+          countEl!.textContent = filtering ? `${shown} / ${total} 件` : `${total} 件`;
+          clearBtn!.hidden = !filtering;
+          noMatch!.hidden = shown > 0;
+        }
+
+        for (const btn of tagButtons) {
+          btn.addEventListener('click', () => {
+            const tag = btn.dataset.tag ?? '';
+            state.tag = state.tag === tag ? '' : tag;
+            writeUrl();
+            apply();
+          });
+        }
+
+        moreBtn?.addEventListener('click', () => tagList.classList.add('expanded'));
+
+        monthSelect.addEventListener('change', () => {
+          state.month = monthSelect.value;
+          writeUrl();
+          apply();
+        });
+
+        clearBtn.addEventListener('click', () => {
+          state.tag = '';
+          state.month = '';
+          writeUrl();
+          apply();
+        });
+
+        window.addEventListener('popstate', () => {
+          readUrl();
+          apply();
+        });
+
+        readUrl();
+        apply();
+        filters.hidden = false;
+      }
+    </script>
   </body>
 </html>
