@@ -142,6 +142,104 @@ ER 図にあった FK は 1 本も残っていない。`order_id` や `customer_
 | マイダウンロード一覧 | 2 コレクション SELECT | `GET /purchases?customer_id=` |
 | ダウンロード実行 + 消費 | 行ロード + save | `GET /items/{hash}` + `POST …/consume` |
 
+### 改変の実物
+
+diff の総量は **6 ファイル、+71 / −80 行**。橋が細ければアプリ側の外科手術も
+このサイズで済む、というのが今回いちばん伝えたい数字かもしれない。
+
+HTTP クライアントは 1 クラス追加しただけ(実験なので素の `file_get_contents`)。
+
+```php
+namespace Magento\Downloadable\Model;
+
+class DlsvcClient
+{
+    private const BASE = 'http://127.0.0.1:30090';
+
+    /** @return array{status:int, data:array} */
+    public static function call(string $method, string $path, ?array $body = null): array
+    {
+        $ctx = stream_context_create(['http' => [
+            'method'  => $method,
+            'header'  => "Content-Type: application/json\r\n",
+            'content' => $body === null ? '' : json_encode($body),
+            'ignore_errors' => true,
+            'timeout' => 5,
+        ]]);
+        $raw = @file_get_contents(self::BASE . $path, false, $ctx);
+        // ... ステータス行のパースと json_decode(省略)
+    }
+}
+```
+
+**書き込み側**の置換はほぼ機械的だった。observer はモデルを組み立てて `save()` する
+構造なので、`save()` を「データを集めて 1 回 POST」に差し替えるだけで済む。
+いちばん小さい `UpdateLinkPurchasedObserver` の diff がこれ。
+
+```diff
+         if (!$orderId || !$customerId) {
+             return $this;
+         }
+-        $purchasedLinksCollection = $this->getPurchasedCollection((int)$orderId);
+-        foreach ($purchasedLinksCollection as $linkPurchased) {
+-            $linkPurchased->setCustomerId($customerId)->save();
+-        }
++        // dlsvc 分離: 顧客紐付けは HTTP(旧: コレクション経由の直接 UPDATE)
++        \Magento\Downloadable\Model\DlsvcClient::call(
++            'POST',
++            '/orders/' . $orderId . '/customer',
++            ['customer_id' => $customerId]
++        );
+```
+
+購入権を作る `SaveDownloadableOrderItemObserver` も、モデル組み立てのロジックは
+一切触らず、末尾の `save()` を配列への積み込みに変えて最後に 1 回 POST する形。
+
+```php
+// 旧: $linkPurchasedItem->...->setUpdatedAt($orderItem->getUpdatedAt())->save();
+$itemsPayload[] = $linkPurchasedItem->getData();
+// ループを抜けたら:
+\Magento\Downloadable\Model\DlsvcClient::call('POST', '/purchases', [
+    'purchased' => $linkPurchased->getData(),
+    'items'     => $itemsPayload,
+]);
+```
+
+**読み取り側**は ORM のコレクションを JSON からの再水和(rehydration)に置き換える。
+マイダウンロード一覧の block はこうなった。テンプレートは
+`$_item->getPurchased()->getOrderIncrementId()` のようなマジックゲッターで
+読んでいるので、`DataObject` に詰め直せば **テンプレートは 1 行も変えずに済む**。
+
+```php
+protected function _construct()
+{
+    parent::_construct();
+    $resp = DlsvcClient::call(
+        'GET',
+        '/purchases?customer_id=' . (int)$this->currentCustomer->getCustomerId()
+    );
+    $collection = ObjectManager::getInstance()->create(Collection::class);
+    foreach ($resp['data'] as $purchasedData) {
+        $items = $purchasedData['items'] ?? [];
+        unset($purchasedData['items']);
+        $purchased = new DataObject($purchasedData);
+        foreach ($items as $itemData) {
+            $item = new DataObject($itemData + ['id' => $itemData['item_id']]);
+            $item->setPurchased($purchased);
+            $collection->addItem($item);
+        }
+    }
+    $this->setItems($collection);
+}
+```
+
+ダウンロードのコントローラも同型で、`load($id, 'link_hash')` が
+`GET /items/{hash}`、ダウンロード成功後の `save()`(使用回数加算)が
+`POST /items/{hash}/consume` になる。所有者チェックは応答に同梱された
+purchased の `customer_id` で行う — **N+1 の HTTP 呼び出しを避けるため、
+サービス側が親子を 1 レスポンスに畳む**。この判断は ORM の遅延ロードを
+そのまま HTTP に写すと往復が爆発する、という分離あるあるの裏返しでもある。
+
 注文 → 一覧 → ダウンロード → 使用回数加算 → 他人の権利の拒否、まで全旅程が
 HTTP ごしで完走した。**FK 2 本の橋が、API 6 本の境界にそのまま写った。**
 
