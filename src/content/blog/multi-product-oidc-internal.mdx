@@ -31,6 +31,23 @@ description: "自社で複数プロダクトを運営する際に、独自 OIDC 
 
 OIDC で最も一般的な Authorization Code Flow を、実際の HTTP リクエストで追います。
 
+```mermaid
+sequenceDiagram
+    participant U as ユーザー(ブラウザ)
+    participant P as プロダクト(cases-app)
+    participant OP as OIDC Provider(auth.example.com)
+    U->>P: 「ログイン」ボタンを押す
+    P->>OP: (1) GET /oidc/authorize にリダイレクト
+    opt OIDC Provider に未ログイン
+        OP->>U: (2) ログイン画面を表示
+        U->>OP: 認証
+    end
+    Note over OP: ログイン済み(セッション有効)なら (2) はスキップ = SSO
+    OP-->>P: (3) 302 redirect_uri に code と state を付けて返す
+    P->>OP: (4) POST /oidc/token(code + code_verifier)
+    OP-->>P: (5) access_token / id_token
+```
+
 ### ステップ 1: プロダクトが認可リクエストを送る
 
 ユーザーが「ログイン」ボタンを押すと、プロダクトは OIDC Provider にリダイレクトします。
@@ -264,12 +281,16 @@ groups := token.Get("groups")
 
 ユーザーがプロダクト A でログイン済みなら、プロダクト B にアクセスしたとき：
 
-```
-1. プロダクト B → auth.example.com/oidc/authorize にリダイレクト
-2. OIDC Provider: セッション cookie あり → ログイン画面スキップ
-3. → 認可コードを発行して即リダイレクト
-4. プロダクト B: コードをトークンに交換
-5. → ログイン完了（ユーザーはログイン画面を見ていない）
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as プロダクト B
+    participant OP as OIDC Provider
+    B->>OP: auth.example.com/oidc/authorize にリダイレクト
+    OP->>OP: セッション cookie あり → ログイン画面スキップ
+    OP-->>B: 認可コードを発行して即リダイレクト
+    B->>OP: コードをトークンに交換
+    B->>B: ログイン完了(ユーザーはログイン画面を見ていない)
 ```
 
 ユーザーからは「プロダクト B にアクセスしたら勝手にログインされた」ように見えます。これが SSO です。
@@ -353,8 +374,9 @@ Cognito の JWT をそのままプロダクトに返すと、`iss` に Cognito �
 
 Proxy IdP（自社 OIDC Provider）を挟むことで：
 
-```
-プロダクト → auth.example.com（不変）→ Cognito（交換可能）
+```mermaid
+flowchart LR
+    P["プロダクト"] --> A["auth.example.com(不変)"] --> C["Cognito(交換可能)"]
 ```
 
 プロダクト側は `iss: https://auth.example.com` だけを信頼すればよく、裏のユーザーストアが何であるかを知る必要がありません。

@@ -21,11 +21,16 @@ description: "認証(auth)・認可(authz)・課金(billing)の3サービス間�
 
 3サービスが直接通信するのではなく、**プロダクト（アプリ）がオーケストレーターになる**のが基本設計です。
 
-```
-[アプリ]
-  ├─ 1. JWT 検証      → auth（JWKS 取得のみ）
-  ├─ 2. プラン取得     → billing（API 呼び出し）
-  └─ 3. 認可判定       → authz（context にプランを渡す）
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as アプリ
+    participant Auth as auth
+    participant Billing as billing
+    participant Authz as authz
+    App->>Auth: JWT 検証（JWKS 取得のみ）
+    App->>Billing: プラン取得（API 呼び出し）
+    App->>Authz: 認可判定（context にプランを渡す）
 ```
 
 auth / authz / billing の3つは互いを知らない。アプリが「auth から得た sub」と「billing から得た plan」を組み合わせて、authz に context として渡す。
@@ -107,12 +112,13 @@ auth / authz / billing の3つは互いを知らない。アプリが「auth か
 
 3サービス + 将来のサービス追加を考えると、**EventBridge が最適**です。
 
-```
-auth ──publish──→ EventBridge ──rule──→ billing の Lambda
-                      │
-billing ─publish──→   │ ──rule──→ authz の Lambda（キャッシュ無効化）
-                      │
-                      │ ──rule──→ 通知サービス（メール・Slack）
+```mermaid
+flowchart LR
+    Auth["auth"] -->|publish| EB["EventBridge"]
+    Billing["billing"] -->|publish| EB
+    EB -->|rule| BL["billing の Lambda"]
+    EB -->|rule| AL["authz の Lambda（キャッシュ無効化）"]
+    EB -->|rule| N["通知サービス（メール・Slack）"]
 ```
 
 理由：
@@ -157,74 +163,88 @@ billing ─publish──→   │ ──rule──→ authz の Lambda（キャ�
 
 ### 1. トライアル管理
 
-```
-[ユーザーサインアップ]
-  auth: UserCreated イベント発行
-    ↓
-  billing: 14日間のトライアルプランを自動付与
-    ↓
-[14日後]
-  billing: TrialExpired イベント発行
-    ↓
-  アプリ: 機能制限 UI を表示
-  auth: （任意）ログイン時に「プランを選んでください」画面を挟む
+```mermaid
+sequenceDiagram
+    participant Auth as auth
+    participant Billing as billing
+    participant App as アプリ
+    Note over Auth,App: ユーザーサインアップ
+    Auth->>Billing: UserCreated イベント発行
+    Note over Billing: 14日間のトライアルプランを自動付与
+    Note over Auth,App: 14日後
+    Billing->>App: TrialExpired イベント発行
+    Note over App: 機能制限 UI を表示
+    Billing->>Auth: TrialExpired イベント発行
+    Note over Auth: （任意）ログイン時に「プランを選んでください」画面を挟む
 ```
 
 トライアルの状態管理は billing の責任です。auth がトライアル期限を知る必要はなく、billing が「期限切れ」イベントを出せば、各サービスが反応する形になります。
 
 ### 2. 使用量ベースの制限
 
-```
-[APIリクエストごと]
-  アプリ → billing: 使用量を記録（POST /api/orgs/:id/usage）
-    ↓
-[上限到達時]
-  billing: UsageLimitReached イベント発行
-    ↓
-  アプリ: 429 Too Many Requests を返す
-  通知: 管理者にメール/Slack 通知
+```mermaid
+sequenceDiagram
+    participant App as アプリ
+    participant Billing as billing
+    participant N as 通知
+    Note over App,Billing: APIリクエストごと
+    App->>Billing: 使用量を記録（POST /api/orgs/:id/usage）
+    Note over App,N: 上限到達時
+    Billing->>App: UsageLimitReached イベント発行
+    Note over App: 429 Too Many Requests を返す
+    Billing->>N: UsageLimitReached イベント発行
+    Note over N: 管理者にメール/Slack 通知
 ```
 
 使用量の記録は**同期 API**で行いますが、上限到達の通知は**イベント**で行います。毎リクエストで上限チェックする場合は billing API を同期で叩く必要がありますが、レスポンス速度が気になるならキャッシュ + イベントで上限変更時だけ無効化する方式もあります。
 
 ### 3. 支払い失敗時のアカウント制限
 
-```
-[Stripe Webhook: 支払い失敗]
-  billing: PaymentFailed イベント発行
-    ↓
-  auth: アカウントを「制限付き」状態にする（ログインは可能だが機能制限）
-  通知: ユーザーと管理者に通知
-    ↓
-[猶予期間終了後]
-  billing: AccountSuspendRequired イベント発行
-    ↓
-  auth: アカウントを Suspended にする
+```mermaid
+sequenceDiagram
+    participant S as Stripe
+    participant Billing as billing
+    participant Auth as auth
+    participant N as 通知
+    S->>Billing: Webhook: 支払い失敗
+    Billing->>Auth: PaymentFailed イベント発行
+    Note over Auth: アカウントを「制限付き」状態にする（ログインは可能だが機能制限）
+    Billing->>N: PaymentFailed イベント発行
+    Note over N: ユーザーと管理者に通知
+    Note over S,N: 猶予期間終了後
+    Billing->>Auth: AccountSuspendRequired イベント発行
+    Note over Auth: アカウントを Suspended にする
 ```
 
 支払い失敗でいきなりアカウントを停止するのではなく、**猶予期間**を設けるのが一般的です。この状態遷移は billing が制御し、auth はイベントを受けて実行するだけ。
 
 ### 4. 不正アクセス検知
 
-```
-[ログイン失敗が短時間に多発]
-  auth: LoginFailedBurst イベント発行
-    ↓
-  authz: 一時的にそのIPからのアクセスを拒否するポリシーを追加
-  通知: セキュリティチームに通知
-    ↓
-[一定時間後]
-  authz: 一時ポリシーを自動削除
+```mermaid
+sequenceDiagram
+    participant Auth as auth
+    participant Authz as authz
+    participant N as 通知
+    Note over Auth,N: ログイン失敗が短時間に多発
+    Auth->>Authz: LoginFailedBurst イベント発行
+    Note over Authz: 一時的にそのIPからのアクセスを拒否するポリシーを追加
+    Auth->>N: LoginFailedBurst イベント発行
+    Note over N: セキュリティチームに通知
+    Note over Auth,N: 一定時間後
+    Note over Authz: 一時ポリシーを自動削除
 ```
 
 auth 単体でのレート制限に加えて、authz と連携した動的なポリシー追加で多層防御を実現します。
 
 ### 5. 監査ログの統合
 
-```
-auth  ──→ EventBridge ──→ 監査ログサービス ──→ DynamoDB / S3
-authz ──→                  （全イベントを永続化）
-billing ──→
+```mermaid
+flowchart LR
+    Auth["auth"] --> EB["EventBridge"]
+    Authz["authz"] --> EB
+    Billing["billing"] --> EB
+    EB --> Audit["監査ログサービス（全イベントを永続化）"]
+    Audit --> Store["DynamoDB / S3"]
 ```
 
 3サービスのイベントをすべて監査ログサービスに流して永続化します。SOC 2 や ISO 27001 の要件で「誰が何をいつしたか」を追跡可能にする必要がある場合に必須です。
@@ -240,38 +260,41 @@ billing ──→
 
 テナント作成はイベントだけでは足りず、**Saga パターン**（各サービスでの処理を順番に実行し、失敗時は補償トランザクション）が必要になる場面です。
 
-```
-billing: CreateOrg
-  → 成功
-auth: AssignAdmin
-  → 成功
-authz: CreatePolicyStore
-  → 失敗！
-  → 補償: auth で Admin 解除、billing で Org 削除
+```mermaid
+flowchart TD
+    A["billing: CreateOrg"] -->|"成功"| B["auth: AssignAdmin"]
+    B -->|"成功"| C["authz: CreatePolicyStore"]
+    C -->|"失敗！"| D["補償: auth で Admin 解除"]
+    D --> E["補償: billing で Org 削除"]
 ```
 
 これは Step Functions で実装するのが適切です。
 
 ### 7. SSO セッション連携
 
-```
-[auth でログアウト]
-  auth: UserLoggedOut イベント発行
-    ↓
-  各プロダクト: セッションを無効化（Back-Channel Logout）
+```mermaid
+sequenceDiagram
+    participant Auth as auth
+    participant P as 各プロダクト
+    Note over Auth: auth でログアウト
+    Auth->>P: UserLoggedOut イベント発行
+    Note over P: セッションを無効化（Back-Channel Logout）
 ```
 
 OIDC の Back-Channel Logout を実装する場合、auth が各プロダクトの `back_channel_logout_uri` に POST を送ります。これは同期通信ですが、失敗してもログアウトの UX に影響を与えない設計にする必要があります。
 
 ### 8. 機能フラグとの統合
 
-```
-[billing: プラン変更]
-  PlanChanged イベント
-    ↓
-  Feature Flag サービス: プランに応じたフラグを更新
-    ↓
-  アプリ: フラグに基づいて UI / API の機能を出し分け
+```mermaid
+sequenceDiagram
+    participant Billing as billing
+    participant FF as Feature Flag サービス
+    participant App as アプリ
+    Note over Billing: プラン変更
+    Billing->>FF: PlanChanged イベント
+    Note over FF: プランに応じたフラグを更新
+    FF->>App: 更新されたフラグ
+    Note over App: フラグに基づいて UI / API の機能を出し分け
 ```
 
 エンタイトルメントと Feature Flag を統合すると、プラン変更が即座に機能の有効/無効に反映されます。LaunchDarkly などの Feature Flag サービスとの連携、または自前の仕組みで実装します。

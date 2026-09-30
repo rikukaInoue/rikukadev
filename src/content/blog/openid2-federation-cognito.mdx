@@ -33,25 +33,21 @@ OpenID 2.0 は XML ベースのディスカバリーと独自の署名検証を�
 
 [rellf-auth](/blog/rellf-auth-oidc-provider) は既に Cognito を裏に隠した Proxy IdP として動いています。この構成を拡張して、OpenID 2.0 の RP（Relying Party）機能を追加します。
 
-```
-ユーザー
-  │
-  │ 「外部IDでログイン」
-  ▼
-rellf-auth (Proxy IdP)
-  │
-  │ OpenID 2.0 Authentication Request
-  ▼
-外部 OpenID 2.0 Provider
-  │
-  │ OpenID 2.0 Authentication Response（署名付き）
-  ▼
-rellf-auth
-  │ 署名検証 + ユーザー情報抽出
-  │ AdminLinkProviderForUser で Cognito に紐づけ
-  │ rellf-auth の JWT を発行
-  ▼
-クライアントアプリ
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as ユーザー
+    participant RA as rellf-auth (Proxy IdP)
+    participant OP as 外部 OpenID 2.0 Provider
+    participant CG as Cognito
+    participant APP as クライアントアプリ
+    U->>RA: 「外部IDでログイン」を選択
+    RA->>OP: OpenID 2.0 Authentication Request（リダイレクト）
+    U->>OP: 外部 OP で認証
+    OP->>RA: OpenID 2.0 Authentication Response（署名付き）をコールバック URL へ
+    RA->>RA: 署名検証 + ユーザー識別子抽出
+    RA->>CG: AdminLinkProviderForUser で外部 ID を Cognito ユーザーに紐づけ
+    RA->>APP: rellf-auth の JWT を発行
 ```
 
 ### フロー詳細
@@ -126,12 +122,14 @@ id, err := openid.Verify(
 
 OIDC をサポートしている IdP の場合は、Cognito の組み込みフェデレーション機能がそのまま使えます。
 
-```
-// OIDC の場合（Cognito が直接サポート）
-ユーザー → Cognito Hosted UI → OIDC Provider → Cognito → JWT
-
-// OpenID 2.0 の場合（rellf-auth で吸収）
-ユーザー → rellf-auth → OpenID 2.0 Provider → rellf-auth → Cognito → JWT
+```mermaid
+flowchart LR
+    subgraph oidc["OIDC の場合（Cognito が直接サポート）"]
+        A1["ユーザー"] --> A2["Cognito Hosted UI"] --> A3["OIDC Provider"] --> A4["Cognito"] --> A5["JWT"]
+    end
+    subgraph openid2["OpenID 2.0 の場合（rellf-auth で吸収）"]
+        B1["ユーザー"] --> B2["rellf-auth"] --> B3["OpenID 2.0 Provider"] --> B4["rellf-auth"] --> B5["Cognito"] --> B6["JWT"]
+    end
 ```
 
 OpenID 2.0 の場合は rellf-auth が翻訳レイヤーとして機能し、Cognito からは通常の外部プロバイダーリンクとして見えます。

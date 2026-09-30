@@ -69,29 +69,34 @@ Policy Store を分けるパターンもありますが、マルチプロダク�
 
 ### エンティティ設計
 
-```
-Common::User
-  ├── email: String
-  ├── groups: Set<String>
-  └── memberOf: [Common::Role]
-
-Common::Role
-  （"admin", "site:editor", "studio:member" など）
-
-Site::Article
-  ├── author: Common::User
-  ├── status: String ("draft" | "published")
-  └── memberOf: [Site::Category]
-
-Site::Category
-  （"blog", "news" など）
-
-Studio::Project
-  └── owner: Common::User
-
-Studio::Task
-  ├── assignee: Common::User
-  └── memberOf: [Studio::Project]
+```mermaid
+erDiagram
+    Common_User["Common::User"] {
+        String email
+        Set groups "Set of String"
+    }
+    Common_Role["Common::Role"] {
+        String id PK "admin, site:editor, studio:member など"
+    }
+    Site_Article["Site::Article"] {
+        String author FK "Common::User"
+        String status "draft | published"
+    }
+    Site_Category["Site::Category"] {
+        String id PK "blog, news など"
+    }
+    Studio_Project["Studio::Project"] {
+        String owner FK "Common::User"
+    }
+    Studio_Task["Studio::Task"] {
+        String assignee FK "Common::User"
+    }
+    Common_User }o--o{ Common_Role : memberOf
+    Site_Article }o--|| Common_User : author
+    Site_Article }o--o{ Site_Category : memberOf
+    Studio_Project }o--|| Common_User : owner
+    Studio_Task }o--|| Common_User : assignee
+    Studio_Task }o--o{ Studio_Project : memberOf
 ```
 
 ポイントは **`Common::User` を全 Namespace から参照する**こと。ユーザーは 1 つ、リソースはプロダクトごとに定義します。
@@ -297,10 +302,22 @@ Authorization: Bearer <rellf-auth の JWT>
 
 API 側でやること:
 
-1. JWT から `sub` と `groups` を取得
-2. AVP に `IsAuthorized(principal, Authz::Action::"createPolicy", Authz::Namespace::"Site")` を問い合わせ
-3. 許可されたら AVP の `CreatePolicy` API を呼ぶ
-4. 監査ログを記録
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Adm as プロダクト管理者
+    participant API as rellf-authz API
+    participant AVP as Amazon Verified Permissions
+    participant Log as 監査ログ
+    Adm->>API: POST /api/policies（rellf-auth の JWT 付き）
+    API->>API: JWT から sub と groups を取得
+    API->>AVP: IsAuthorized(principal, Authz::Action::#quot;createPolicy#quot;, Authz::Namespace::#quot;Site#quot;)
+    AVP-->>API: ALLOW / DENY
+    opt 許可されたら
+        API->>AVP: CreatePolicy API を呼ぶ
+    end
+    API->>Log: 監査ログを記録
+```
 
 ## Dry Run（テスト実行）
 
@@ -433,14 +450,20 @@ Cedar を一切書かずにポリシーを管理できます。
 
 各プロダクトの API が認可判定を行うときのフロー:
 
-```
-1. クライアント → プロダクト API（JWT 付き）
-2. API が JWT を検証（rellf-auth の JWKS）
-3. API が rellf-authz に認可判定を問い合わせ
-   → IsAuthorized(user, action, resource)
-4. rellf-authz が AVP に問い合わせ
-5. AVP が Cedar ポリシーを評価 → ALLOW / DENY
-6. 結果に基づいてレスポンス返却
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as クライアント
+    participant API as プロダクト API
+    participant AZ as rellf-authz
+    participant AVP as Amazon Verified Permissions
+    C->>API: リクエスト（JWT 付き）
+    API->>API: JWT を検証（rellf-auth の JWKS）
+    API->>AZ: 認可判定を問い合わせ IsAuthorized(user, action, resource)
+    AZ->>AVP: 問い合わせ
+    AVP-->>AZ: Cedar ポリシーを評価 → ALLOW / DENY
+    AZ-->>API: 判定結果
+    API-->>C: 結果に基づいてレスポンス返却
 ```
 
 プロダクト API から見ると、認可は 1 回の API コール。ポリシーの中身を知る必要はありません。

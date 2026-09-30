@@ -55,43 +55,45 @@ NIST SP 800-63A の Identity Assurance Level でいうと：
 
 アプリのバックエンドだけで完結する最もシンプルなパターン。
 
-```
-[初回アクセス]
-  Backend: anon_id Cookie がない
-    → UUID 生成、HttpOnly Cookie でセット
-
-[以降のアクセス]
-  Backend: anon_id Cookie あり
-    → そのUUID をユーザーID扱いにしてDB操作
-
-  DB:
-    cart_items (anon_id, product_id, ...)
-    drafts (anon_id, content, ...)
-
-[サインアップ]
-  Backend: 認証システムでユーザー作成
-    → 新しい user_id を取得
-    → UPDATE cart_items SET user_id = ?, anon_id = NULL WHERE anon_id = ?
-    → anon_id Cookie 削除、JWT セット
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant BE as Backend
+    participant DB as DB
+    participant AUTH as 認証システム
+    Note over B,BE: 初回アクセス
+    B->>BE: リクエスト（anon_id Cookie がない）
+    BE-->>B: UUID 生成、HttpOnly Cookie でセット
+    Note over B,DB: 以降のアクセス
+    B->>BE: リクエスト（anon_id Cookie あり）
+    BE->>DB: そのUUID をユーザーID扱いにしてDB操作
+    Note over DB: cart_items (anon_id, product_id, ...) / drafts (anon_id, content, ...)
+    Note over B,AUTH: サインアップ
+    B->>BE: サインアップ
+    BE->>AUTH: ユーザー作成
+    AUTH-->>BE: 新しい user_id を取得
+    BE->>DB: UPDATE cart_items SET user_id = ?, anon_id = NULL WHERE anon_id = ?
+    BE-->>B: anon_id Cookie 削除、JWT セット
 ```
 
 ### B. 認証基盤が匿名 JWT を発行
 
 認証基盤側に匿名トークン発行機能を追加するパターン。
 
-```
-[匿名トークン取得]
-  POST /auth/anonymous
-    → 匿名 sub (anon-xxxxx) を生成
-    → JWT 発行: { sub: "anon-xxxxx", anonymous: true }
-
-[サインアップ昇格]
-  POST /auth/upgrade
-    Authorization: Bearer <匿名JWT>
-    Body: { email, password }
-    → 1. ユーザーストアにユーザー作成
-       2. 匿名 sub と新 sub の紐付けを記録
-       3. 新しい JWT を返す
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant A as 認証基盤
+    participant US as ユーザーストア
+    Note over C,A: 匿名トークン取得
+    C->>A: POST /auth/anonymous
+    A->>A: 匿名 sub (anon-xxxxx) を生成
+    A-->>C: JWT 発行 { sub: "anon-xxxxx", anonymous: true }
+    Note over C,US: サインアップ昇格
+    C->>A: POST /auth/upgrade（Authorization: Bearer 匿名JWT、Body: { email, password }）
+    A->>US: 1. ユーザーストアにユーザー作成
+    A->>A: 2. 匿名 sub と新 sub の紐付けを記録
+    A-->>C: 3. 新しい JWT を返す
 ```
 
 ### C. Cognito Identity Pool
@@ -137,10 +139,14 @@ AWS の標準機能を使うパターン。Identity Pool の `allow_unauthentica
 
 通常のユーザーライフサイクルに匿名状態を追加すると、こうなります。
 
-```
-[なし]──visit──> Anonymous ──signup──> Pending ──confirm──> Active ──> Suspended ──> Deleted
-                    │                                          │
-                    └──upgrade(マージ)─────────────────────────┘
+```mermaid
+flowchart LR
+    N["なし"] -->|"visit"| AN["Anonymous"]
+    AN -->|"signup"| P["Pending"]
+    P -->|"confirm"| AC["Active"]
+    AC --> S["Suspended"]
+    S --> D["Deleted"]
+    AN -->|"upgrade（マージ）"| AC
 ```
 
 **Anonymous は Pending の手前に追加される状態**で、「Unauthorized（認可なし）」とは別軸です。

@@ -147,11 +147,13 @@ CREATE TABLE relation_tuples (
 日本語にすると「photo の viewer とは、その photo の **owner**、または
 photo の **parent（= platform）の operator**」。導出を図にする:
 
-```
-user:alice ──owner──▶ photo:42          alice は owner 経由で viewer
-user:bob ──operator──▶ platform:main
-                          ▲
-photo:42 ──parent────────┘              bob は operator 経由で viewer
+```mermaid
+flowchart LR
+    alice["user:alice"] -->|owner| photo["photo:42"]
+    bob["user:bob"] -->|operator| platform["platform:main"]
+    photo -->|parent| platform
+    alice -.->|"owner 経由で viewer"| photo
+    bob -.->|"operator 経由で viewer"| photo
 ```
 
 この設計の利点は2つ。**剥奪が漏れない**（「見せる」を配って回らず、

@@ -18,53 +18,39 @@ description: "認証ページを認証基盤側でホストする（Hosted Login
 
 ## Hosted Login の動き
 
-```
-プロダクト A (cases.example.com)
-  │ 「ログイン」ボタン押下
-  │
-  │ リダイレクト
-  ▼
-認証基盤 (auth.example.com/oidc/authorize)
-  ┌──────────────────────────┐
-  │ auth.example.com          │
-  │                           │
-  │  メール:    [           ]  │
-  │  パスワード: [           ]  │
-  │                           │
-  │  [Google でログイン]       │
-  │                           │
-  │        [ログイン]          │
-  └──────────────────────────┘
-  │ 認証成功
-  │
-  │ 認可コードで戻る
-  ▼
-プロダクト A (cases.example.com/callback?code=xxx)
-  │ コードをトークンに交換
-  ▼
-ログイン完了
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant P as プロダクト A (cases.example.com)
+    participant A as 認証基盤 (auth.example.com)
+    U->>P: 「ログイン」ボタン押下
+    P->>U: /oidc/authorize へリダイレクト
+    U->>A: ログイン画面を表示
+    Note over A: auth.example.com のログインフォーム（メール / パスワード / Google でログイン / ログイン）
+    U->>A: 認証成功
+    A->>U: 認可コードで戻る
+    U->>P: /callback?code=xxx
+    P->>A: コードをトークンに交換
+    A-->>P: トークン
+    P->>U: ログイン完了
 ```
 
 プロダクトはログイン UI を一切持ちません。ユーザーは一旦 `auth.example.com` に移動し、認証後にプロダクトに戻ってきます。
 
 ## Embedded Login の動き
 
-```
-プロダクト A (cases.example.com)
-  ┌──────────────────────────┐
-  │ cases.example.com         │
-  │                           │
-  │  メール:    [           ]  │
-  │  パスワード: [           ]  │
-  │                           │
-  │        [ログイン]          │
-  └──────────────────────────┘
-  │ パスワードをバックエンドに送信
-  │
-  │ バックエンド → 認証 API (auth.example.com/auth/login)
-  │ → トークン取得
-  ▼
-ログイン完了
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant F as プロダクト A フロントエンド (cases.example.com)
+    participant B as プロダクト A バックエンド
+    participant A as 認証 API (auth.example.com/auth/login)
+    Note over F: cases.example.com のログインフォーム（メール / パスワード / ログイン）
+    U->>F: メールとパスワードを入力
+    F->>B: パスワードをバックエンドに送信
+    B->>A: 認証 API を呼び出し
+    A-->>B: トークン取得
+    B->>U: ログイン完了
 ```
 
 プロダクトがログインフォームを持ち、パスワードを受け取って認証 API に送信します。
@@ -89,10 +75,11 @@ description: "認証ページを認証基盤側でホストする（Hosted Login
 
 Embedded Login では、ユーザーのパスワードがプロダクトのフロントエンド → バックエンドを経由します。
 
-```
-Embedded: ユーザー → プロダクトA → 認証API
-                      ↑
-               プロダクトAがパスワードを見れる
+```mermaid
+flowchart LR
+    U["ユーザー"] -->|"パスワード"| P["プロダクトA"]
+    P -->|"パスワード"| A["認証API"]
+    P -.- N["プロダクトAがパスワードを見れる"]
 ```
 
 これは以下のリスクを生みます：
@@ -107,11 +94,20 @@ Hosted Login なら、パスワードは `auth.example.com` にしか送られ�
 
 Hosted Login では、認証基盤のドメイン（`auth.example.com`）にセッション cookie が保存されます。
 
-```
-1. プロダクト A にログイン → auth.example.com にセッション cookie が作られる
-2. プロダクト B にアクセス → auth.example.com にリダイレクト
-3. セッション cookie があるのでログイン画面スキップ → 即座に認可コード発行
-4. プロダクト B に戻る → ログイン完了（ユーザーはログイン画面を見ていない）
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant PA as プロダクト A
+    participant PB as プロダクト B
+    participant A as auth.example.com
+    U->>PA: プロダクト A にログイン
+    PA->>A: リダイレクト（認証）
+    A-->>U: セッション cookie が作られる
+    U->>PB: プロダクト B にアクセス
+    PB->>A: auth.example.com にリダイレクト
+    Note over A: セッション cookie があるのでログイン画面スキップ
+    A-->>PB: 即座に認可コード発行してプロダクト B に戻る
+    PB->>U: ログイン完了（ユーザーはログイン画面を見ていない）
 ```
 
 Embedded Login でこれを実現するには、各プロダクトが認証基盤のセッション状態を確認する仕組み（hidden iframe や silent authentication）が必要になり、複雑さが大幅に増します。

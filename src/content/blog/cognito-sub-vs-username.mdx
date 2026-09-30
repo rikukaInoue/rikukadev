@@ -13,10 +13,11 @@ description: "自前OIDCプロバイダーからCognitoのAdmin APIを呼ぶ際�
 
 ## 構成
 
-```
-ブラウザ → rellf-auth (OIDC Provider / Go + Lambda)
-              → Cognito User Pool (認証バックエンド)
-              → IDトークン発行 (RS256署名)
+```mermaid
+flowchart LR
+    B["ブラウザ"] --> RA["rellf-auth (OIDC Provider / Go + Lambda)"]
+    RA --> C["Cognito User Pool (認証バックエンド)"]
+    RA --> T["IDトークン発行 (RS256署名)"]
 ```
 
 rellf-authはCognitoの `InitiateAuth` でユーザーを認証し、返ってきたIDトークンからユーザー情報を取り出して、自前のOIDC IDトークンを発行する。その過程で `AdminGetUser` を呼んでユーザーのライフサイクル状態（active/suspended/deleted）を検証している。
@@ -27,14 +28,16 @@ rellf-authはCognitoの `InitiateAuth` でユーザーを認証し、返って�
 
 Cognitoの `InitiateAuth` は成功する。トークンも返ってくる。しかしその直後の `AdminGetUser` が `UserNotFoundException` を返し、ユーザーのライフサイクル検証に失敗する。
 
-```
-InitiateAuth(email, password) → 成功、IDトークン取得
-↓
-IDトークンから sub を取得: "77f4ba88-2081-708c-a806-578cb1ac5752"
-↓
-AdminGetUser(sub) → UserNotFoundException ❌
-↓
-「ログインできません。管理者にお問い合わせください。」
+```mermaid
+sequenceDiagram
+    participant RA as rellf-auth
+    participant C as Cognito
+    RA->>C: InitiateAuth(email, password)
+    C-->>RA: 成功、IDトークン取得
+    Note over RA: IDトークンから sub を取得: "77f4ba88-2081-708c-a806-578cb1ac5752"
+    RA->>C: AdminGetUser(sub)
+    C-->>RA: UserNotFoundException
+    Note over RA: 「ログインできません。管理者にお問い合わせください。」
 ```
 
 ## 原因: sub ≠ cognito:username

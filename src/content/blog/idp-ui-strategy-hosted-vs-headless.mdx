@@ -15,21 +15,35 @@ description: "自前OIDCプロバイダーにログインUIを持たせるか、
 
 ### A. Hosted UI（IdP が UI を持つ）
 
-```
-[RP] GET /login → 302 → [IdP] /oidc/authorize（ログインフォーム表示）
-                          ユーザーが認証
-                          302 → [RP] /callback?code=xxx
-                          RP がセッション開始
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant RP as RP
+    participant IdP as IdP
+    B->>RP: GET /login
+    RP-->>B: 302
+    B->>IdP: /oidc/authorize（ログインフォーム表示）
+    Note over B,IdP: ユーザーが認証
+    IdP-->>B: 302
+    B->>RP: /callback?code=xxx
+    Note over RP: RP がセッション開始
 ```
 
 IdP がログインフォーム、登録、パスワードリセット等の UI を持つ。Auth0 の Universal Login、Cognito の Hosted UI と同じモデル。
 
 ### B. ヘッドレス（IdP は API だけ）
 
-```
-[RP] GET /login → RP 自身のログインフォーム表示
-     POST /login → RP サーバーが IdP の API を叩いてパスワード検証
-                   RP がセッション開始
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant RP as RP
+    participant IdP as IdP
+    B->>RP: GET /login
+    RP-->>B: RP 自身のログインフォーム表示
+    B->>RP: POST /login
+    RP->>IdP: RP サーバーが IdP の API を叩いてパスワード検証
+    IdP-->>RP: 検証結果
+    Note over RP: RP がセッション開始
 ```
 
 IdP はトークン発行 API だけ提供し、UI は RP が自由に作る。
@@ -85,22 +99,17 @@ IdP はトークン発行 API だけ提供し、UI は RP が自由に作る。
 
 ## 判断フロー
 
-```
-プロダクトが1つだけ？
-  → YES → ヘッドレスで十分。UI の自由度を取る
-  → NO ↓
-
-SSO が必要？
-  → YES → Hosted UI 一択（IdP セッション共有が前提）
-  → NO ↓
-
-認証方式の追加を頻繁にやる？
-  → YES → Hosted UI（1箇所で済む）
-  → NO ↓
-
-RP ごとにブランディングが大きく異なる？
-  → YES → ヘッドレス or Hosted UI + テーマ機能
-  → NO → Hosted UI
+```mermaid
+flowchart TD
+    Q1{"プロダクトが1つだけ？"}
+    Q1 -->|YES| A1["ヘッドレスで十分。UI の自由度を取る"]
+    Q1 -->|NO| Q2{"SSO が必要？"}
+    Q2 -->|YES| A2["Hosted UI 一択（IdP セッション共有が前提）"]
+    Q2 -->|NO| Q3{"認証方式の追加を頻繁にやる？"}
+    Q3 -->|YES| A3["Hosted UI（1箇所で済む）"]
+    Q3 -->|NO| Q4{"RP ごとにブランディングが大きく異なる？"}
+    Q4 -->|YES| A4["ヘッドレス or Hosted UI + テーマ機能"]
+    Q4 -->|NO| A5["Hosted UI"]
 ```
 
 ## MVC フレームワークからの移行パス
@@ -109,23 +118,32 @@ RP ごとにブランディングが大きく異なる？
 
 ### Before
 
-```
-POST /login (email, password)
-  → フレームワークの認証機能が DB 直接参照でパスワード検証
-  → session_id cookie 発行
-  → 以降のリクエストは session_id でユーザー特定
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant RP as RP（MVC フレームワーク）
+    participant DB as DB
+    B->>RP: POST /login (email, password)
+    RP->>DB: フレームワークの認証機能が DB 直接参照でパスワード検証
+    RP-->>B: session_id cookie 発行
+    B->>RP: 以降のリクエストは session_id でユーザー特定
 ```
 
 ### After (Hosted UI)
 
-```
-GET /login → IdP にリダイレクト
-GET /callback?code=xxx
-  → サーバーサイドで code → token 交換
-  → id_token から sub/email 取得
-  → フレームワークの session に sub を保存
-  → session_id cookie 発行（ここは今と同じ）
-  → 以降のリクエストは session_id でユーザー特定（ここも同じ）
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant RP as RP（MVC フレームワーク）
+    participant IdP as IdP
+    B->>RP: GET /login
+    RP-->>B: IdP にリダイレクト
+    B->>RP: GET /callback?code=xxx
+    RP->>IdP: サーバーサイドで code → token 交換
+    IdP-->>RP: id_token
+    Note over RP: id_token から sub/email 取得、フレームワークの session に sub を保存
+    RP-->>B: session_id cookie 発行（ここは今と同じ）
+    B->>RP: 以降のリクエストは session_id でユーザー特定（ここも同じ）
 ```
 
 ### 変わるもの・変わらないもの

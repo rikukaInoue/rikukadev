@@ -31,18 +31,22 @@ OIDCの主な役割は以下の3つです。
 
 OIDCの最大のメリットは、**1回のログインで全プロダクトを利用できる**ことです。
 
-```
-ユーザー → Product A にアクセス
-         → 未認証なので認証基盤にリダイレクト
-         → ログイン
-         → Product A に戻る（認証済み）
-
-  〜数分後〜
-
-ユーザー → Product B にアクセス
-         → 認証基盤にリダイレクト
-         → すでにセッションあり → ログイン画面スキップ
-         → Product B に戻る（認証済み）
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant A as Product A
+    participant IdP as 認証基盤
+    participant B as Product B
+    U->>A: アクセス
+    A-->>U: 未認証なので認証基盤にリダイレクト
+    U->>IdP: ログイン
+    IdP-->>U: Product A に戻る(認証済み)
+    Note over U,B: 〜数分後〜
+    U->>B: アクセス
+    B-->>U: 認証基盤にリダイレクト
+    U->>IdP: リダイレクトで到着
+    Note over IdP: すでにセッションあり → ログイン画面スキップ
+    IdP-->>U: Product B に戻る(認証済み)
 ```
 
 ユーザーから見ると「Product Bには一度もログインしていないのに使える」という体験になります。Google で Gmail にログインした後、Drive や Calendar をそのまま使えるのと同じです。

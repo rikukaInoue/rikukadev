@@ -18,21 +18,26 @@ SaaS のプラン付与は「ユーザーが自分でプランを選んで決済
 
 ## 全体像
 
-```
-プラン付与の経路:
-  ├── 直接購入（Stripe 等）
-  ├── シリアルキー（法人一括）
-  ├── リファラ（パートナー経由）
-  ├── プロモコード（キャンペーン）
-  └── 招待リンク（社内紹介）
-        │
-        ▼
-    billing サービス
-        │
-        ├── ライセンス管理
-        ├── プラン付与
-        ├── 成果報酬管理
-        └── 使用量管理
+```mermaid
+flowchart LR
+    subgraph routes["プラン付与の経路"]
+        R1["直接購入（Stripe 等）"]
+        R2["シリアルキー（法人一括）"]
+        R3["リファラ（パートナー経由）"]
+        R4["プロモコード（キャンペーン）"]
+        R5["招待リンク（社内紹介）"]
+    end
+    subgraph billing["billing サービス"]
+        B1["ライセンス管理"]
+        B2["プラン付与"]
+        B3["成果報酬管理"]
+        B4["使用量管理"]
+    end
+    R1 --> billing
+    R2 --> billing
+    R3 --> billing
+    R4 --> billing
+    R5 --> billing
 ```
 
 すべての経路が最終的に billing の「プラン付与」に収束します。
@@ -45,27 +50,23 @@ SaaS のプラン付与は「ユーザーが自分でプランを選んで決済
 
 ### フロー
 
-```
-1. 法人が 100 ライセンス購入
-   billing: org-abc に total_seats=100 を記録
-
-2. 法人管理者がキーを一括発行
-   POST /api/orgs/org-abc/licenses/keys?count=100
-   → ["RELLF-A1B2-C3D4", "RELLF-E5F6-G7H8", ...]
-
-3. 管理者が社員にキーを配布（メール、社内ポータル等）
-
-4. 社員がサインアップ
-   POST /auth/signup { email, password, license_key: "RELLF-A1B2-C3D4" }
-     ↓
-   auth → billing: キー検証
-   GET /api/licenses/keys/RELLF-A1B2-C3D4/validate
-     → 有効、org-abc、未使用
-     ↓
-   auth: ユーザー作成（org-abc に所属）
-     ↓
-   auth → billing: キー消費
-   POST /api/licenses/keys/RELLF-A1B2-C3D4/redeem { sub: "user-xxx" }
+```mermaid
+sequenceDiagram
+    participant C as 法人
+    participant M as 法人管理者
+    participant E as 社員
+    participant AU as auth
+    participant BL as billing
+    C->>BL: 1. 100 ライセンス購入
+    Note over BL: org-abc に total_seats=100 を記録
+    M->>BL: 2. POST /api/orgs/org-abc/licenses/keys?count=100
+    BL-->>M: ["RELLF-A1B2-C3D4", "RELLF-E5F6-G7H8", ...]
+    M->>E: 3. キーを配布（メール、社内ポータル等）
+    E->>AU: 4. POST /auth/signup { email, password, license_key: "RELLF-A1B2-C3D4" }
+    AU->>BL: キー検証 GET /api/licenses/keys/RELLF-A1B2-C3D4/validate
+    BL-->>AU: 有効、org-abc、未使用
+    AU->>AU: ユーザー作成（org-abc に所属）
+    AU->>BL: キー消費 POST /api/licenses/keys/RELLF-A1B2-C3D4/redeem { sub: "user-xxx" }
 ```
 
 ### キーの設計
@@ -84,21 +85,24 @@ SaaS のプラン付与は「ユーザーが自分でプランを選んで決済
 
 ### データモデル
 
-```
-licenses テーブル:
-  org_id: org-abc (PK)
-  plan: enterprise
-  total_seats: 100
-  used_seats: 42
-
-license_keys テーブル:
-  key: RELLF-A1B2-C3D4 (PK)
-  org_id: org-abc
-  status: unused | used | revoked
-  created_at: 2026-04-12
-  redeemed_by: null | user-xxx
-  redeemed_at: null | 2026-04-13
-  expires_at: 2027-04-12
+```mermaid
+erDiagram
+    licenses ||--o{ license_keys : "org_id で発行"
+    licenses {
+        varchar org_id PK "例: org-abc"
+        varchar plan "例: enterprise"
+        int total_seats "例: 100"
+        int used_seats "例: 42"
+    }
+    license_keys {
+        varchar key PK "例: RELLF-A1B2-C3D4"
+        varchar org_id FK "例: org-abc"
+        varchar status "unused / used / revoked"
+        datetime created_at "例: 2026-04-12"
+        varchar redeemed_by "null / user-xxx"
+        datetime redeemed_at "null / 2026-04-13"
+        datetime expires_at "例: 2027-04-12"
+    }
 ```
 
 ### 運用パターン
@@ -131,60 +135,53 @@ license_keys テーブル:
 
 ### フロー
 
-```
-1. パートナーサイトのリンク
-   https://app.example.com/signup?ref=partner-abc&plan=pro
-
-2. アプリがリファラ情報を cookie に保持
-
-3. サインアップ → auth でユーザー作成
-
-4. アプリ → billing: リファラ付きプラン付与
-   POST /api/orgs/org-new/activate
-   {
-     sub: "user-xxx",
-     referrer: "partner-abc",
-     plan: "pro",
-     source: "partner_referral"
-   }
-
-5. billing:
-   - パートナーが有効か検証
-   - pro プランの付与権限があるか検証
-   - org にプラン設定
-   - 成果報酬を記録
-
-6. イベント発行
-   billing → EventBridge: ReferralConverted
-   {
-     partner_id: "partner-abc",
-     org_id: "org-new",
-     plan: "pro",
-     commission_amount: 9800
-   }
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant PS as パートナーサイト
+    participant AP as アプリ
+    participant AU as auth
+    participant BL as billing
+    participant EB as EventBridge
+    PS->>U: 1. リンク https://app.example.com/signup?ref=partner-abc&plan=pro
+    U->>AP: リンク経由でアクセス
+    AP->>AP: 2. リファラ情報を cookie に保持
+    U->>AP: 3. サインアップ
+    AP->>AU: ユーザー作成
+    AP->>BL: 4. POST /api/orgs/org-new/activate（リファラ付きプラン付与）
+    Note over AP,BL: sub=user-xxx, referrer=partner-abc, plan=pro, source=partner_referral
+    BL->>BL: 5. パートナーが有効か検証
+    BL->>BL: pro プランの付与権限があるか検証
+    BL->>BL: org にプラン設定
+    BL->>BL: 成果報酬を記録
+    BL->>EB: 6. ReferralConverted イベント発行
+    Note over BL,EB: partner_id=partner-abc, org_id=org-new, plan=pro, commission_amount=9800
 ```
 
 ### データモデル
 
-```
-partners テーブル:
-  partner_id: partner-abc (PK)
-  name: "パートナー企業A"
-  allowed_plans: ["pro", "standard"]
-  commission_rate: 0.2
-  status: active | suspended
-  api_key: "pk_xxx"
-
-referrals テーブル:
-  id: ref-001 (PK)
-  partner_id: partner-abc
-  org_id: org-new
-  sub: user-xxx
-  plan_granted: "pro"
-  source_url: "https://partner-abc.com/recommend"
-  converted_at: 2026-04-12
-  commission_amount: 9800
-  commission_status: pending | paid
+```mermaid
+erDiagram
+    partners ||--o{ referrals : "partner_id で紹介"
+    partners {
+        varchar partner_id PK "例: partner-abc"
+        varchar name "例: パートナー企業A"
+        json allowed_plans "例: [pro, standard]"
+        decimal commission_rate "例: 0.2"
+        varchar status "active / suspended"
+        varchar api_key "例: pk_xxx"
+    }
+    referrals {
+        varchar id PK "例: ref-001"
+        varchar partner_id FK "例: partner-abc"
+        varchar org_id "例: org-new"
+        varchar sub "例: user-xxx"
+        varchar plan_granted "例: pro"
+        varchar source_url "例: https://partner-abc.com/recommend"
+        datetime converted_at "例: 2026-04-12"
+        int commission_amount "例: 9800"
+        varchar commission_status "pending / paid"
+    }
 ```
 
 ### リファラリンクの署名
@@ -209,40 +206,41 @@ billing がリンクの `sig` を検証して、正規のパートナーリン�
 
 ### フロー
 
-```
-1. サインアップ画面でプロモコード入力
-   POST /auth/signup { email, password, promo_code: "SPRING2026" }
-
-2. auth → billing: プロモコード検証
-   POST /api/promo/validate { code: "SPRING2026" }
-     → 有効、3ヶ月無料、残り 500 回使用可能
-
-3. auth: ユーザー作成
-
-4. auth → billing: プロモコード使用
-   POST /api/promo/redeem { code: "SPRING2026", sub: "user-xxx" }
-   → pro プラン + 3ヶ月無料トライアル付与
+```mermaid
+sequenceDiagram
+    participant U as ユーザー（サインアップ画面）
+    participant AU as auth
+    participant BL as billing
+    U->>AU: 1. プロモコード入力 POST /auth/signup { email, password, promo_code: "SPRING2026" }
+    AU->>BL: 2. プロモコード検証 POST /api/promo/validate { code: "SPRING2026" }
+    BL-->>AU: 有効、3ヶ月無料、残り 500 回使用可能
+    AU->>AU: 3. ユーザー作成
+    AU->>BL: 4. プロモコード使用 POST /api/promo/redeem { code: "SPRING2026", sub: "user-xxx" }
+    BL-->>AU: pro プラン + 3ヶ月無料トライアル付与
 ```
 
 ### データモデル
 
-```
-promo_codes テーブル:
-  code: SPRING2026 (PK)
-  description: "2026年春キャンペーン"
-  plan: "pro"
-  benefit_type: free_trial | discount | upgrade
-  benefit_value: 90  (日数 or 割引率)
-  max_redemptions: 1000
-  current_redemptions: 500
-  valid_from: 2026-03-01
-  valid_until: 2026-05-31
-  allowed_domains: []  (空=制限なし, ["example.com"]=ドメイン制限)
-
-promo_redemptions テーブル:
-  code: SPRING2026
-  sub: user-xxx
-  redeemed_at: 2026-04-12
+```mermaid
+erDiagram
+    promo_codes ||--o{ promo_redemptions : "code で使用"
+    promo_codes {
+        varchar code PK "例: SPRING2026"
+        varchar description "例: 2026年春キャンペーン"
+        varchar plan "例: pro"
+        varchar benefit_type "free_trial / discount / upgrade"
+        int benefit_value "例: 90（日数 or 割引率）"
+        int max_redemptions "例: 1000"
+        int current_redemptions "例: 500"
+        datetime valid_from "例: 2026-03-01"
+        datetime valid_until "例: 2026-05-31"
+        json allowed_domains "空=制限なし, [example.com]=ドメイン制限"
+    }
+    promo_redemptions {
+        varchar code FK "例: SPRING2026"
+        varchar sub "例: user-xxx"
+        datetime redeemed_at "例: 2026-04-12"
+    }
 ```
 
 ### プロモコードの種類

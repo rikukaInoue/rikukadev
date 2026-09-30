@@ -65,18 +65,23 @@ description: "アプリ認証と決済を混ぜない。キャリアには「ロ
 
 ## 目標アーキテクチャ
 
+```mermaid
+flowchart TD
+    AuthL["アプリ認証層: 自前の ID 基盤"]
+    Orch["決済オーケストレーション層: 抽象 IF"]
+    SBPS["SBPS アダプタ"]
+    Other["別 PG アダプタ(将来)"]
+    More["..."]
+    AuthL -->|"user_id を「入力として」渡す(一方通行)"| Orch
+    Orch --> SBPS
+    Orch --> Other
+    Orch --> More
 ```
-[アプリ認証層]   ← 自前のID基盤（メール/パスワード, OIDC, パスキー, SoftBank ID/au ID連携など）
-      │           ここで user_id が確定。決済とは完全独立。
-      │ user_id を「入力として」渡す（一方通行）
-      ▼
-[決済オーケストレーション層]   ← 抽象IF。PGの違いを吸収する唯一の場所
-      │   beginCheckout() / handleCallback() / confirm()
-      │   決済セッションの「真実の状態」を持つストアを管理
-      ├─→ SBPSアダプタ（まとめて支払い／auかんたん決済：取引登録・結果CGI受信・有効期限管理・電文/チェックサム）
-      ├─→ 別PGアダプタ（将来：PayPay / Stripe / その他）
-      └─→ ...
-```
+
+- **アプリ認証層**: 自前のID基盤（メール/パスワード, OIDC, パスキー, SoftBank ID/au ID連携など）。ここで user_id が確定。決済とは完全独立。
+- **決済オーケストレーション層**: 抽象IF。PGの違いを吸収する唯一の場所。`beginCheckout()` / `handleCallback()` / `confirm()`。決済セッションの「真実の状態」を持つストアを管理。
+- **SBPSアダプタ**: まとめて支払い／auかんたん決済。取引登録・結果CGI受信・有効期限管理・電文/チェックサム。
+- **別PGアダプタ**: 将来：PayPay / Stripe / その他。
 
 ### 依存ルール（最重要）
 
@@ -103,10 +108,21 @@ PGごとに決済セッションの有効期限はバラバラ（SBPSのキャ�
 
 ログイン時のキャリア認証と、決済時のキャリア認証は**目的も時間軸も違う別イベント**なので、同一ユーザーが同一キャリアに2回認証する形になっても冗長ではない。
 
-```
-[ログイン時] OpenID(SoftBank ID / au ID 等)でID連携 → user_id 確定・セッション開始
-      （…ユーザーが買い物…）
-[決済時]    SBPSの決済フロー内でキャリア認証 → この支払いの承認（user_idとは独立）
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant App as アプリ
+    participant IdP as キャリア IdP(SoftBank ID / au ID 等)
+    participant PG as SBPS 決済フロー
+    Note over U,IdP: ログイン時
+    U->>App: ログイン
+    App->>IdP: OpenID で ID 連携
+    IdP-->>App: ユーザー識別子(ID トークン等)
+    Note over App: user_id 確定・セッション開始
+    Note over U,PG: …ユーザーが買い物…
+    Note over U,PG: 決済時
+    U->>PG: SBPS の決済フロー内でキャリア認証
+    PG-->>App: この支払いの承認(user_id とは独立)
 ```
 
 守るのは依存方向（決済→認証の一方通行）だけ。これさえ守れば**別アプリ・別チーム・別リリースサイクルでも健全**。

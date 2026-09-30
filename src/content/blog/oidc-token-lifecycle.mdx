@@ -23,38 +23,50 @@ description: "ID token・access token・refresh token・session cookieの役割�
 
 ## Authorization Code Flow の全体像
 
+ログインまで（1〜8）:
+
+```mermaid
+sequenceDiagram
+    participant B as RP ブラウザ
+    participant RP as RP サーバー
+    participant IdP as IdP (rellf-auth)
+    B->>RP: (1) 「ログイン」を押す
+    Note over RP: (2) state, nonce, PKCE を生成
+    RP-->>B: (3) IdP の /oidc/authorize にリダイレクト
+    B->>IdP: (4) メール+パスワード入力
+    Note over IdP: (5) 認証、code を発行
+    IdP-->>B: (6) RP の callback URL に code 付きでリダイレクト
+    B->>RP: callback (code)
+    RP->>IdP: (7) /oidc/token に code を POST(サーバー間通信)
+    IdP-->>RP: access_token + id_token + refresh_token
+    Note over RP: RP サーバーが保持。ブラウザには一切渡さない
+    Note over RP: (8) id_token を検証し、RP 側のユーザーセッションを作成
+    RP-->>B: opaque session cookie を発行
+    Note over B,RP: id_token の役目はここで終わり
 ```
-[RP ブラウザ] → [RP サーバー] → [IdP (rellf-auth)]
 
-1. ユーザーが RP で「ログイン」を押す
-2. RP サーバーが state, nonce, PKCE を生成
-3. ブラウザを IdP の /oidc/authorize にリダイレクト
+(8) の id_token 検証の内訳:
 
-4. ユーザーが IdP 上でメール+パスワード入力
-5. IdP が認証、code を発行
-6. ブラウザが RP の callback URL に code 付きでリダイレクト
+- 署名検証 (JWKS)
+- issuer, audience, nonce チェック
+- sub, email, groups を読み取る
 
-7. RP サーバーが /oidc/token に code を POST（サーバー間通信）
-   → access_token + id_token + refresh_token が返る
-   → RP サーバーが保持。ブラウザには一切渡さない
+ログイン後のアクセスと更新（9〜10）:
 
-8. RP サーバーが id_token を検証
-   - 署名検証 (JWKS)
-   - issuer, audience, nonce チェック
-   - sub, email, groups を読み取る
-   → RP 側のユーザーセッションを作成
-   → opaque session cookie をブラウザに発行
-   → id_token の役目はここで終わり
-
-9. ブラウザ → RP サーバー → リソース API のアクセス時
-   - ブラウザは session cookie を RP サーバーに送る
-   - RP サーバーがセッションから access_token を取り出す
-   - access_token を Bearer ヘッダーに載せてリソース API を叩く
-
-10. access_token が期限切れ（15分）になったら
-    - RP サーバーが refresh_token で /oidc/token に POST
-    - 新しい access_token + refresh_token を受け取る
-    - セッションを更新。ブラウザは何も知らない
+```mermaid
+sequenceDiagram
+    participant B as RP ブラウザ
+    participant RP as RP サーバー
+    participant API as リソース API
+    participant IdP as IdP (rellf-auth)
+    B->>RP: (9) session cookie を送る
+    Note over RP: セッションから access_token を取り出す
+    RP->>API: access_token を Bearer ヘッダーに載せて叩く
+    opt (10) access_token が期限切れ(15分)になったら
+        RP->>IdP: refresh_token で /oidc/token に POST
+        IdP-->>RP: 新しい access_token + refresh_token
+        Note over RP: セッションを更新。ブラウザは何も知らない
+    end
 ```
 
 **ブラウザにトークンが一切出ない**。ブラウザが触るのは opaque session cookie だけ。
@@ -88,19 +100,17 @@ refresh token が盗まれた場合の検出。使うたびに新しいトーク
 
 ## ライフサイクルの流れ
 
-```
-ログイン
-  → id_token, access_token, refresh_token が発行される
-  → RP が session cookie を発行（独自の期限）
-  → id_token を読んでセッションに sub/email を保存 → id_token 破棄
-
-〜15分後（access_token 切れ）
-  → RP が refresh_token で更新
-  → 新 access_token + 新 refresh_token を受け取る
-  → session cookie はそのまま
-
-〜7日後（refresh_token 切れ）
-  → 更新不可 → RP がセッション破棄 → 再ログインへ
+```mermaid
+flowchart TD
+    L["ログイン"] --> T["id_token, access_token, refresh_token が発行される"]
+    T --> C["RP が session cookie を発行(独自の期限)"]
+    C --> R["id_token を読んでセッションに sub/email を保存"] --> D["id_token 破棄"]
+    D --> E15["〜15分後(access_token 切れ)"]
+    E15 --> RF["RP が refresh_token で更新"]
+    RF --> N["新 access_token + 新 refresh_token を受け取る"]
+    N --> K["session cookie はそのまま"]
+    K --> E7["〜7日後(refresh_token 切れ)"]
+    E7 --> X["更新不可"] --> Y["RP がセッション破棄"] --> Z["再ログインへ"]
 ```
 
 ユーザーが再ログインを求められる頻度は **refresh\_token の期限（7日）で決まり**、access\_token の期限（15分）はセキュリティ上の被害窓だけに影響する。
@@ -123,15 +133,14 @@ IdP（rellf-auth）は「エンドポイントを提供するだけ」で、更�
 
 RP 側の実装パターン:
 
-```
-[APIリクエストのたびに]
-
-1. session cookie からセッションを引く
-2. access_token の exp を確認
-3. 期限内 → そのまま API に送る
-4. 期限切れ → refresh_token で更新を試みる
-   4a. 成功 → 新トークンをセッションに保存 → API に送る
-   4b. 失敗 → セッション破棄 → 再ログインへ
+```mermaid
+flowchart TD
+    S0["APIリクエストのたびに"] --> S1["1. session cookie からセッションを引く"]
+    S1 --> S2{"2. access_token の exp を確認"}
+    S2 -->|"3. 期限内"| Send["そのまま API に送る"]
+    S2 -->|"4. 期限切れ"| Ref{"refresh_token で更新を試みる"}
+    Ref -->|"4a. 成功"| Save["新トークンをセッションに保存"] --> Send
+    Ref -->|"4b. 失敗"| Del["セッション破棄"] --> Login["再ログインへ"]
 ```
 
 ## マルチプロダクトでの選択肢

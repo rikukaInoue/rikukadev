@@ -13,6 +13,34 @@ description: "主要なポリシーエンジン5つを同じマルチプロダ�
 
 以下の要件を各エンジンで実装します。
 
+```mermaid
+erDiagram
+    Org ||--o{ User : "所属"
+    Org ||--o{ Case : "org"
+    Org ||--o{ Document : "org"
+    User ||--o{ Case : "担当者"
+    User ||--o{ Document : "作成者"
+    User {
+        string name PK
+        string group "admin / lawyer / viewer"
+        string org FK
+    }
+    Org {
+        string id PK
+    }
+    Case {
+        string id PK
+        string org FK
+        string assignedTo FK "担当者"
+    }
+    Document {
+        string id PK
+        string org FK
+        string author FK "作成者"
+        string status "draft / published"
+    }
+```
+
 ### プロダクト
 
 - **Cases** — 案件管理（弁護士向け）
@@ -20,19 +48,15 @@ description: "主要なポリシーエンジン5つを同じマルチプロダ�
 
 ### ユーザー
 
-```
-Alice: admin グループ、org-abc 所属
-Bob:   lawyer グループ、org-abc 所属
-Carol: viewer グループ、org-xyz 所属
-```
+- **Alice**: admin グループ、org-abc 所属
+- **Bob**: lawyer グループ、org-abc 所属
+- **Carol**: viewer グループ、org-xyz 所属
 
 ### リソース
 
-```
-case-001: org-abc の案件、担当者は Bob
-doc-001:  org-abc のドキュメント、作成者は Alice、ステータスは draft
-doc-002:  org-abc のドキュメント、作成者は Bob、ステータスは published
-```
+- **case-001**: org-abc の案件、担当者は Bob
+- **doc-001**: org-abc のドキュメント、作成者は Alice、ステータスは draft
+- **doc-002**: org-abc のドキュメント、作成者は Bob、ステータスは published
 
 ### 認可ルール
 

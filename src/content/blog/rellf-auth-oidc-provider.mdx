@@ -11,10 +11,15 @@ description: "Cognito をユーザーストアとして内部利用しつつ、�
 
 最初は AWS Cognito の薄いラッパーとして作りました。Cognito の `InitiateAuth` を呼んで、Cognito が発行した JWT をそのままクライアントに返す構成です。
 
-```
-クライアント → rellf-auth API → Cognito
-                                    ↓
-              ← Cognito の JWT をそのまま返す ←
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant A as rellf-auth API
+    participant Cog as Cognito
+    C->>A: 認証リクエスト
+    A->>Cog: InitiateAuth
+    Cog-->>A: Cognito の JWT
+    A-->>C: Cognito の JWT をそのまま返す
 ```
 
 これで動くけど、問題がありました。

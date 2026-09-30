@@ -54,18 +54,21 @@ resource "aws_cognito_user_pool" "main" {
 
 通常の Authorization Code Flow:
 
-```
-/oidc/authorize → ログイン → 認証成功 → コード発行 → リダイレクト
+```mermaid
+flowchart LR
+    A["/oidc/authorize"] --> B["ログイン"] --> C["認証成功"] --> D["コード発行"] --> E["リダイレクト"]
 ```
 
 メール未登録ユーザーの場合:
 
-```
-/oidc/authorize → ログイン → 認証成功
-  → メール未登録を検知
-  → 「メールアドレスを登録しませんか？」画面
-    → 登録する → コード発行 → リダイレクト
-    → スキップ → コード発行 → リダイレクト
+```mermaid
+flowchart TD
+    A["/oidc/authorize"] --> B["ログイン"] --> C["認証成功"]
+    C --> D["メール未登録を検知"]
+    D --> E{"「メールアドレスを登録しませんか？」画面"}
+    E -->|"登録する"| F["コード発行"]
+    E -->|"スキップ"| F
+    F --> G["リダイレクト"]
 ```
 
 ### OIDC パラメータの引き回し
@@ -121,18 +124,21 @@ POST /oidc/register-email-skip  スキップして続行
 
 ### メール一致時のフロー
 
-```
-外部IDで認証 → メール登録画面 → メール入力
-  → Cognito で検索 → 既存ユーザーと一致
-  → AdminLinkProviderForUser で外部IDを既存ユーザーにリンク
-  → 既存ユーザーの sub で JWT 発行
+```mermaid
+flowchart TD
+    A["外部IDで認証"] --> B["メール登録画面"] --> C["メール入力"]
+    C --> D["Cognito で検索"]
+    D --> E{"既存ユーザーと一致?"}
+    E -->|"一致"| F["AdminLinkProviderForUser で外部IDを既存ユーザーにリンク"]
+    F --> G["既存ユーザーの sub で JWT 発行"]
+    E -->|"不一致 or 既存ユーザーなし"| H["新規ユーザー作成（次節）"]
 ```
 
 ### メール不一致 or 既存ユーザーなし
 
-```
-→ AdminCreateUser で新規ユーザー作成
-→ 新しい sub で JWT 発行
+```mermaid
+flowchart LR
+    A["AdminCreateUser で新規ユーザー作成"] --> B["新しい sub で JWT 発行"]
 ```
 
 ## 2つのアカウントができてしまった場合
@@ -141,10 +147,12 @@ POST /oidc/register-email-skip  スキップして続行
 
 統合手順については別途ドキュメント（`docs/account-merge.md`）に記載しています。基本的な流れ:
 
-1. ソースユーザーの外部 ID リンクを解除
-2. デスティネーションユーザーに外部 ID をリンク
-3. グループを移行
-4. ソースユーザーを削除
+```mermaid
+flowchart LR
+    A["1. ソースユーザーの外部 ID リンクを解除"] --> B["2. デスティネーションユーザーに外部 ID をリンク"]
+    B --> C["3. グループを移行"]
+    C --> D["4. ソースユーザーを削除"]
+```
 
 ## まとめ
 

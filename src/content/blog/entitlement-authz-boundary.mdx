@@ -50,19 +50,15 @@ permit(
 
 ## あるべき姿: 2段階の判定
 
-```
-リクエスト
-  │
-  ▼
-[1段階目: エンタイトルメント] billing
-  「この org のプランで、このプロダクト/機能は使えるか？」
-  → 使えない → 403 (ここで終了)
-  → 使える → 続行
-  │
-  ▼
-[2段階目: リソースレベル認可] authz
-  「このユーザーは、このリソースに対して、この操作ができるか？」
-  → permit / forbid
+```mermaid
+flowchart TD
+    R["リクエスト"] --> S1["1段階目: エンタイトルメント（billing）"]
+    S1 --> E{"この org のプランで、このプロダクト/機能は使えるか？"}
+    E -->|"使えない"| D1["403（ここで終了）"]
+    E -->|"使える"| S2["2段階目: リソースレベル認可（authz）"]
+    S2 --> A{"このユーザーは、このリソースに対して、この操作ができるか？"}
+    A -->|"forbid"| D2["forbid"]
+    A -->|"permit"| OK["permit"]
 ```
 
 **billing がプロダクトレベルのゲート、authz がリソースレベルの細かい判定。**
@@ -255,25 +251,25 @@ result, _ := client.Can(ctx, rellf.AuthzRequest{
 
 ### before: Cedar にプラン条件がある場合
 
-```
-プラン「business」を追加
-  → Cedar ポリシーを全部確認
-  → "pro" が入ってる箇所に "business" を追加
-  → ポリシーをデプロイ
-  → テスト
-  → 本番反映
+```mermaid
+flowchart LR
+    A["プラン「business」を追加"] --> B["Cedar ポリシーを全部確認"]
+    B --> C["#quot;pro#quot; が入ってる箇所に #quot;business#quot; を追加"]
+    C --> D["ポリシーをデプロイ"]
+    D --> E["テスト"]
+    E --> F["本番反映"]
 ```
 
 所要時間: 数時間〜数日（開発者の作業が必要）
 
 ### after: エンタイトルメントが billing にある場合
 
-```
-プラン「business」を追加
-  → billing の管理画面で新プラン定義
-  → 使えるプロダクト/機能をチェックボックスで選択
-  → 保存
-  → 即反映
+```mermaid
+flowchart LR
+    A["プラン「business」を追加"] --> B["billing の管理画面で新プラン定義"]
+    B --> C["使えるプロダクト/機能をチェックボックスで選択"]
+    C --> D["保存"]
+    D --> E["即反映"]
 ```
 
 所要時間: 数分（ビジネス担当者でも可能）
@@ -308,11 +304,15 @@ authz のポリシー判定:
   キャッシュ: しない or 短い TTL（ポリシー変更が即反映されるべき）
 ```
 
-```
-[PlanChanged イベント]
-  billing → EventBridge → 各プロダクトの SDK
-    → エンタイトルメントキャッシュをクリア
-    → 次のリクエストで billing に再取得
+```mermaid
+sequenceDiagram
+    participant BL as billing
+    participant EB as EventBridge
+    participant SDK as 各プロダクトの SDK
+    BL->>EB: PlanChanged イベント
+    EB->>SDK: PlanChanged イベント
+    SDK->>SDK: エンタイトルメントキャッシュをクリア
+    SDK->>BL: 次のリクエストで再取得
 ```
 
 ## ブラウザ側での UI 制御
@@ -340,28 +340,16 @@ const entitlements = await rellf.getEntitlements()
 
 ## 全体の流れ
 
-```
-[ユーザーがリクエスト]
-  │
-  ├─ auth: JWT 検証 → sub, groups
-  │
-  ├─ billing: エンタイトルメントチェック
-  │    「org-abc の pro プランで cases は使えるか？」
-  │    → 使えない → 403 {"reason": "plan_not_entitled"}
-  │    → 使える → 続行
-  │
-  ├─ billing: 上限チェック（該当する場合）
-  │    「案件数は上限内か？」
-  │    → 超過 → 403 {"reason": "limit_reached"}
-  │    → OK → 続行
-  │
-  ├─ authz: リソースレベル認可
-  │    「このユーザーはこの案件を編集できるか？」
-  │    → forbid → 403 {"reason": "not_permitted"}
-  │    → permit → 続行
-  │
-  ▼
-[ビジネスロジック実行]
+```mermaid
+flowchart TD
+    R["ユーザーがリクエスト"] --> J["auth: JWT 検証 → sub, groups"]
+    J --> E{"billing: エンタイトルメントチェック（org-abc の pro プランで cases は使えるか？）"}
+    E -->|"使えない"| E403["403 {#quot;reason#quot;: #quot;plan_not_entitled#quot;}"]
+    E -->|"使える"| L{"billing: 上限チェック（該当する場合。案件数は上限内か？）"}
+    L -->|"超過"| L403["403 {#quot;reason#quot;: #quot;limit_reached#quot;}"]
+    L -->|"OK"| Z{"authz: リソースレベル認可（このユーザーはこの案件を編集できるか？）"}
+    Z -->|"forbid"| Z403["403 {#quot;reason#quot;: #quot;not_permitted#quot;}"]
+    Z -->|"permit"| BIZ["ビジネスロジック実行"]
 ```
 
 3段階のゲートを通過して初めてビジネスロジックが実行されます。SDK がこの 3 段階を `Can()` 1 行に隠蔽します。

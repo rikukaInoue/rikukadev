@@ -11,12 +11,14 @@ description: "ドコモ(OIDC)・au(OpenID 2.0)・ソフトバンク(Yahoo! JAPAN
 
 ## 目標
 
-```
-メール+パスワード ──┐
-Google OIDC ───────┤
-ドコモ OIDC ───────┤──→ 1つの cognito:username ──→ 1つのアカウント
-Yahoo!/SB OIDC ────┤
-au OpenID 2.0 ─────┘
+```mermaid
+flowchart LR
+    E["メール+パスワード"] --> U["1つの cognito:username"]
+    G["Google OIDC"] --> U
+    D["ドコモ OIDC"] --> U
+    Y["Yahoo!/SB OIDC"] --> U
+    A["au OpenID 2.0"] --> U
+    U --> ACC["1つのアカウント"]
 ```
 
 ## 3キャリアのIdP仕様
@@ -61,8 +63,9 @@ au OpenID 2.0 ─────┘
 
 Cognitoに繋ぐにはOIDCラッパが必要:
 
-```
-au OpenID 2.0 → rellf-auth (ラッパ) → 自前OIDC IDトークン発行 → Cognito外部IdP
+```mermaid
+flowchart LR
+    A["au OpenID 2.0"] --> W["rellf-auth (ラッパ)"] --> T["自前OIDC IDトークン発行"] --> C["Cognito外部IdP"]
 ```
 
 ### ソフトバンク: Yahoo! JAPAN YConnect v2
@@ -83,62 +86,69 @@ SoftBankユーザーは「スマートログイン」でYahoo! JAPAN IDと電話
 
 5つのログイン方法を統合すると、Cognitoのユーザーデータはこうなる。
 
-```
-AdminGetUser の結果:
+`AdminGetUser` の結果をデータ構造として描くと以下になる（`sub` 以下は `Attributes`、`Identity` は `Identities` に対応）。
 
-Username: "13b99ebb-851c-4401-ba4e-a6aba782f139"   ← cognito:username（内部ID）
-UserStatus: CONFIRMED
-Enabled: true
-
-Attributes:
-  sub:                    "77f4ba88-2081-708c-a806-578cb1ac5752"  ← OIDC公開ID（不変）
-  email:                  "user@example.com"
-  email_verified:         true
-  phone_number:           "+819012345678"
-  phone_number_verified:  true
-
-Identities:  ← リンク済み外部IdP一覧
-  [
-    {
-      "providerName": "Google",
-      "userId": "1234567890",
-      "primary": false
-    },
-    {
-      "providerName": "docomo",
-      "userId": "dac_xxxxxxxx",
-      "primary": false
-    },
-    {
-      "providerName": "YahooJapan",
-      "userId": "yj_xxxxxxxx",
-      "primary": false
-    },
-    {
-      "providerName": "au-wrapper",
-      "userId": "au_opaque_xxxxxxxx",
-      "primary": false
+```mermaid
+erDiagram
+    CognitoUser ||--o{ Identity : "Identities: リンク済み外部IdP一覧"
+    CognitoUser {
+        string Username PK "cognito:username (内部ID) 13b99ebb-851c-4401-ba4e-a6aba782f139"
+        string UserStatus "CONFIRMED"
+        boolean Enabled "true"
+        string sub "Attributes: OIDC公開ID (不変) 77f4ba88-2081-708c-a806-578cb1ac5752"
+        string email "user@example.com"
+        boolean email_verified "true"
+        string phone_number "+819012345678"
+        boolean phone_number_verified "true"
     }
-  ]
+    Identity {
+        string providerName "Google / docomo / YahooJapan / au-wrapper"
+        string userId "IdP 側のユーザーID"
+        boolean primary "false"
+    }
 ```
+
+このユーザーにリンク済みの `Identities`:
+
+| providerName | userId | primary |
+|---|---|---|
+| Google | 1234567890 | false |
+| docomo | dac_xxxxxxxx | false |
+| YahooJapan | yj_xxxxxxxx | false |
+| au-wrapper | au_opaque_xxxxxxxx | false |
 
 ### Cognito 内部のインデックス構造（イメージ）
 
+```mermaid
+erDiagram
+    user_table ||--o{ alias_index : "email / phone から引く"
+    user_table ||--o{ external_idp_index : "provider:userId から引く"
+    user_table["ユーザーテーブル"] {
+        string cognito_username PK "13b99ebb-..."
+        string sub "77f4ba88-..."
+        string email "user@example..."
+        string phone "+8190..."
+    }
+    alias_index["エイリアスインデックス"] {
+        string alias PK "email または phone"
+        string cognito_username FK
+    }
+    external_idp_index["外部IdPインデックス"] {
+        string provider_user_id PK "providerName:userId"
+        string cognito_username FK
+    }
 ```
-[ユーザーテーブル]
-cognito:username (PK)  | sub            | email           | phone
-13b99ebb-...           | 77f4ba88-...   | user@example... | +8190...
 
-[エイリアスインデックス]
-user@example.com       → 13b99ebb-...
-+819012345678          → 13b99ebb-...
+インデックスの中身はどれも同じ `cognito:username` を指す:
 
-[外部IdPインデックス]
-Google:1234567890       → 13b99ebb-...
-docomo:dac_xxxxxxxx     → 13b99ebb-...
-YahooJapan:yj_xxxxxxxx  → 13b99ebb-...
-au-wrapper:au_opaque_xx → 13b99ebb-...
-```
+| インデックス | キー | → cognito:username |
+|---|---|---|
+| エイリアス | user@example.com | 13b99ebb-... |
+| エイリアス | +819012345678 | 13b99ebb-... |
+| 外部IdP | Google:1234567890 | 13b99ebb-... |
+| 外部IdP | docomo:dac_xxxxxxxx | 13b99ebb-... |
+| 外部IdP | YahooJapan:yj_xxxxxxxx | 13b99ebb-... |
+| 外部IdP | au-wrapper:au_opaque_xx | 13b99ebb-... |
 
 **どのログイン方法でも、同じ `cognito:username` に収束する。** これがCognitoのアカウント統合の全体像。
 
@@ -189,23 +199,32 @@ au-wrapper:au_opaque_xx → 13b99ebb-...
 
 ## Cognito 統合アーキテクチャ
 
-```
-                    ┌───────────────────────────────────┐
-                    │         Cognito User Pool          │
-                    │                                    │
-  ドコモ OIDC ──────→ 外部IdP (OIDC)       ─────┐        │
-                    │                           │        │
-  Yahoo!/SB OIDC ──→ 外部IdP (OIDC)       ─────┤        │
-                    │                           ↓        │
-  au OpenID 2.0 ──→ OIDCラッパ(Lambda) ──→ 外部IdP ───→  │
-                    │                           ↑        │
-  Google OIDC ─────→ 外部IdP (Google)      ─────┤        │
-                    │                           │        │
-  メール+PW ────────→ ネイティブ            ─────┘        │
-                    │                     ↓              │
-                    │               PreSignUp Lambda      │
-                    │               (自動リンク)           │
-                    └───────────────────────────────────┘
+```mermaid
+flowchart LR
+    D["ドコモ OIDC"]
+    Y["Yahoo!/SB OIDC"]
+    A["au OpenID 2.0"]
+    G["Google OIDC"]
+    E["メール+PW"]
+    W["OIDCラッパ (Lambda)"]
+    subgraph POOL["Cognito User Pool"]
+        IDP1["外部IdP (OIDC)"]
+        IDP2["外部IdP (OIDC)"]
+        IDP3["外部IdP"]
+        IDP4["外部IdP (Google)"]
+        N["ネイティブ"]
+        PS["PreSignUp Lambda (自動リンク)"]
+        IDP1 --> PS
+        IDP2 --> PS
+        IDP3 --> PS
+        IDP4 --> PS
+        N --> PS
+    end
+    D --> IDP1
+    Y --> IDP2
+    A --> W --> IDP3
+    G --> IDP4
+    E --> N
 ```
 
 ### Cognito IdP 登録
@@ -339,12 +358,12 @@ func linkByAttribute(attr, value string, event) {
 
 新規登録より、既存ユーザーが後からキャリアを連携する方が自然なフロー。
 
-```
-既存ユーザー（メール+パスワードで登録済み）
-  → 設定画面: 「auアカウントを連携する」
-  → au でログイン → opaque ID 取得
-  → AdminLinkProviderForUser で既存アカウントにリンク
-  → 次回から au でワンタップログイン可能
+```mermaid
+flowchart TD
+    U["既存ユーザー (メール+パスワードで登録済み)"] --> S["設定画面: 「auアカウントを連携する」"]
+    S --> L["au でログイン → opaque ID 取得"]
+    L --> LK["AdminLinkProviderForUser で既存アカウントにリンク"]
+    LK --> N["次回から au でワンタップログイン可能"]
 ```
 
 ```go
@@ -380,14 +399,14 @@ auのopaque IDは**安定した永続IDではない**。
 
 ### リカバリ設計
 
-```
-通常ログイン:
-  au でログイン → opaque ID "aaa" → アカウント特定 → OK
-
-opaque ID が変わった場合:
-  au でログイン → opaque ID "bbb" → 見つからない
-  → 「このauアカウントは未連携です。メールアドレスでログインしてください」
-  → メール+パスワードでログイン → 設定画面から au 再連携
+```mermaid
+flowchart TD
+    A["au でログイン"] --> O["opaque ID を取得"]
+    O --> Q{"opaque ID に紐づくアカウントがある?"}
+    Q -->|"通常ログイン: opaque ID #quot;aaa#quot;"| OK["アカウント特定 → OK"]
+    Q -->|"opaque ID が変わった: #quot;bbb#quot; → 見つからない"| M["「このauアカウントは未連携です。メールアドレスでログインしてください」"]
+    M --> E["メール+パスワードでログイン"]
+    E --> R["設定画面から au 再連携"]
 ```
 
 **メールか電話番号を1つ持っておけば、opaque IDが変わってもリカバリできる。** au連携はあくまで「便利なショートカット」として位置づけ、アカウントの軸にはしない。

@@ -51,16 +51,18 @@ permit (
 
 **認可サービスがプロダクト DB に依存するパターン:**
 
-```
-プロダクト API → 認可サービス → プロダクト DB
+```mermaid
+flowchart LR
+    API["プロダクト API"] --> AZ["認可サービス"] --> DB["プロダクト DB"]
 ```
 
 サービス間の結合が強すぎます。認可サービスがすべてのプロダクトの DB スキーマを知っている状態は保守できません。
 
 **呼び出し側が属性を渡すパターン:**
 
-```
-プロダクト API → (DB からリソース取得) → 認可サービスに属性付きで問い合わせ
+```mermaid
+flowchart LR
+    API["プロダクト API"] --> F["DB からリソース取得"] --> AZ["認可サービスに属性付きで問い合わせ"]
 ```
 
 プロダクト側でリソースを取得した時点で、`article.AuthorID == userID` は判定できています。わざわざ認可 API に投げる意味が薄い。
@@ -141,14 +143,27 @@ Cognito のグループがそのまま AVP のロールになるので、追加�
 
 ## Cedar スキーマ
 
-```
-Policy Store: rellf
-  └── rellf::
-      ├── User (memberOfTypes: [Role])
-      ├── Role
-      ├── Article (memberOfTypes: [Category])
-      ├── Category
-      └── Action (viewArticle, editArticle, publishArticle)
+Policy Store `rellf` の Namespace `rellf::` に定義したエンティティ:
+
+```mermaid
+erDiagram
+    User }o--o{ Role : "memberOfTypes"
+    Article }o--o{ Category : "memberOfTypes"
+    User["rellf::User"] {
+        string id PK
+    }
+    Role["rellf::Role"] {
+        string id PK
+    }
+    Article["rellf::Article"] {
+        string id PK
+    }
+    Category["rellf::Category"] {
+        string id PK
+    }
+    Action["rellf::Action"] {
+        string id PK "viewArticle / editArticle / publishArticle"
+    }
 ```
 
 ※ AVP は1 Policy Store あたり1 Namespace の制限があるため、単一の `rellf` Namespace にすべてのエンティティを定義しています。

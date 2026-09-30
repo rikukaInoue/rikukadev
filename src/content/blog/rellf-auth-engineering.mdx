@@ -17,16 +17,10 @@ Cognito の JWT をそのままクライアントに返すと、`iss` に Cognit
 
 rellf-auth は Cognito を「ユーザーストア」として内部利用しつつ、外部には独自署名の JWT を返します。
 
-```
-クライアントアプリ
-    │
-    │ 標準 OIDC
-    ▼
-rellf-auth (OIDC Provider)
-    │
-    │ Cognito SDK (内部)
-    ▼
-AWS Cognito User Pool (ユーザーストア)
+```mermaid
+flowchart TD
+    C["クライアントアプリ"] -->|"標準 OIDC"| A["rellf-auth (OIDC Provider)"]
+    A -->|"Cognito SDK (内部)"| U["AWS Cognito User Pool (ユーザーストア)"]
 ```
 
 クライアントは rellf-auth の JWKS だけ見ればよく、裏が Cognito であることを知る必要がありません。Cognito → Auth0 に移行しても、rellf-auth の内部実装を変えるだけでクライアント側の変更はゼロです。
@@ -117,8 +111,9 @@ func (u *User) Suspend() error {
 
 ハンドラーが Cognito を直接叩くのではなく、ユースケース層を経由します。
 
-```
-ハンドラー → ユースケース → ドメインモデル（状態チェック）→ Cognito API
+```mermaid
+flowchart LR
+    H["ハンドラー"] --> UC["ユースケース"] --> D["ドメインモデル(状態チェック)"] --> CG["Cognito API"]
 ```
 
 ```go
@@ -151,11 +146,13 @@ func (uc *UserUseCase) SuspendUser(ctx context.Context, username, reason, actor 
 
 ただし完全に任意にすると、パスワードリセットやアカウント復旧ができない。そこで **OIDC フローの途中でメール登録を促す画面を挟む** ようにしました。
 
-```
-ログイン → 認証成功 → メール未登録？
-  → 「メールアドレスを登録しませんか？」画面
-    → 登録する → 通常フローに合流
-    → スキップ → 通常フローに合流
+```mermaid
+flowchart TD
+    L["ログイン"] --> S["認証成功"] --> Q{"メール未登録?"}
+    Q -->|"未登録"| P["「メールアドレスを登録しませんか?」画面"]
+    Q -->|"登録済み"| N["通常フローに合流"]
+    P -->|"登録する"| N
+    P -->|"スキップ"| N
 ```
 
 OIDC のパラメータはステートレス認可コードと同じ暗号化トークンで引き回すので、画面を挟んでもパラメータを失いません。
@@ -208,10 +205,16 @@ rellf-authz → 「この人は何ができるか」→ AVP (Cedar) で判定
 JWT の `groups` クレームがそのまま AVP の Role にマッピングされるので、Cognito のグループ管理が認可の基盤になります。
 
 クライアントの初回ロード時:
-```
-1. JWT 取得（rellf-auth）
-2. GET /api/permissions（rellf-authz）→ 許可アクション一覧
-3. メニュー出し分け
+
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant Auth as rellf-auth
+    participant Authz as rellf-authz
+    C->>Auth: 1. JWT 取得
+    C->>Authz: 2. GET /api/permissions
+    Authz-->>C: 許可アクション一覧
+    Note over C: 3. メニュー出し分け
 ```
 
 ## まとめ
