@@ -2,7 +2,7 @@
 title: "モノリスのデータ切り出しは3段階で考える"
 date: 2026-09-30
 tags: ["アーキテクチャ", "MySQL", "RDS", "マイグレーション", "移行"]
-description: "サービス切り出しの難所はコードでなくデータ。境目は「1つのトランザクションが新旧両方に届くか」で、同一DB同一スキーマ→同一インスタンス別database→別インスタンスの3段階に分けると、各段階で必要な装備(FK棚卸し・expand/contract・outbox)と、段階2で止まる合理性がはっきりする。"
+description: "サービス切り出しの難所はコードでなくデータ。境目は「1つのトランザクションが新旧両方に届くか」で、同一DB同一スキーマ→同一インスタンス別database→別インスタンスの3段階に分けると、各段階で必要な装備(FK棚卸し・expand/contract・outbox)と、段階2で止まる合理性がはっきりする。ER図とインフラ図で各段階の変化を追う。"
 ---
 
 ## はじめに
@@ -21,40 +21,153 @@ description: "サービス切り出しの難所はコードでなくデータ。
 一段重くなる。だから「どこまで届く状態を保ったまま、何を済ませておくか」が
 移行設計のほぼすべてになります。
 
+## 全体戦略
+
+先に地図を出します。各段階でやること・使う装備・次へ進む条件はこうなります。
+
+```mermaid
+graph TB
+    S1["段階1: 同一DB・同一スキーマ<br/>コードの所有権だけ分ける"]
+    S2["段階2: 同一インスタンス・別database<br/>結合を切り、データを移送する"]
+    S3["段階3: 別インスタンス<br/>物理的に分離する"]
+
+    S1 -->|"跨ぎFKの棚卸しが済み<br/>増加を CI で止められる"| S2
+    S2 -->|"跨ぎFK・JOIN・トランザクションが<br/>ゼロ(CI が守っている)"| S3
+
+    S1 -.->|装備| T1["FK のペア別集計 +<br/>ベースライン差分(逆行防止)"]
+    S2 -.->|装備| T2["オンラインマイグレーション標準装備<br/>(二重書き→バックフィル→読み切替→削除)"]
+    S3 -.->|装備| T3["イベント連携装備<br/>(outbox / 重複排除 / 再送)<br/>+ binlog レプリケーションで引っ越し"]
+```
+
+重要なのは矢印の条件です。段階2→3 の条件「跨ぎゼロ」が CI で守られている限り、
+段階3は**いつでも実行できる引っ越し**であって「いつか来る手術」ではない。
+以降、この地図を1段ずつ歩きます。
+
+## 前提: 走る例
+
+通販のモノリスを例にします。注文まわり（orders / order_items）と
+商品・在庫まわり（products / stocks）が1つの database に同居していて、
+在庫側を「在庫サービス」として切り出したい、という設定です。
+
+```mermaid
+graph LR
+    O["<b>orders</b><br/>id PK<br/>user_id<br/>status"]
+    OI["<b>order_items</b><br/>id PK<br/>order_id FK<br/>product_id FK<br/>quantity"]
+    P["<b>products</b><br/>id PK<br/>name<br/>price"]
+    ST["<b>stocks</b><br/>product_id PK,FK<br/>available"]
+    OI -->|FK order_id| O
+    OI -->|FK product_id| P
+    ST -->|FK product_id| P
+```
+
+注文確定のコードは今、こういう1トランザクションを張っています:
+
+```sql
+BEGIN;
+INSERT INTO orders ...;
+INSERT INTO order_items ...;
+UPDATE stocks SET available = available - 3 WHERE product_id = 42;  -- 境界を跨ぐ更新
+COMMIT;
+```
+
+この「注文と在庫引当が原子的」こそが、切り出しを難しくしている当のものです。
+
 ## 段階1: 同じ DB・同じスキーマのまま、コードだけ分ける
 
-いわゆるモジュラーモノリス。コードの所有権（このテーブルに触ってよいのは
-このモジュールだけ）を決めて守らせる段階で、データは何も動かしません。
-JOIN も外部キーもトランザクションも全部そのまま使える。
+いわゆるモジュラーモノリス。コードの所有権（stocks に触ってよいのは
+在庫モジュールだけ）を決めて守らせる段階で、**データは何も動かしません**。
 
-この段階の仕事は**現状を測ること**です。どのテーブル間に外部キーが張られて
-いるかを棚卸しすると、「このモジュールを独立させるには、あと何本の結合を
-切る必要があるか」が数字になる。禁止でなく計測として回すのがポイントで、
-ベースラインを固定して**増加だけを CI で止める**と、移行の逆行を防ぎながら
-削減を進捗として見られます（[fk:check の警告モードとして実装した話](https://github.com/rikukaInoue/greenfield/issues/197)）。
+```mermaid
+graph LR
+    subgraph 注文モジュール
+        O[orders]
+        OI[order_items]
+    end
+    subgraph 在庫モジュール
+        P[products]
+        ST[stocks]
+    end
+    OI -->|FK order_id| O
+    OI -->|"FK product_id ← 境界を跨ぐ①"| P
+    ST -->|FK product_id| P
+```
+
+線を引いてみて初めて、**境界を跨ぐ結合が数えられる**ようになります。この例では
+跨ぎ FK は `order_items.product_id → products.id` の1本（+ 注文確定トランザクション
+内の stocks 更新という「コードの跨ぎ」）。この段階の仕事は現状を測ることです:
+
+- 跨ぎ FK をペア別に集計する — 「注文 → 在庫: 残り1本。これが切れれば独立できる」
+- ベースラインを固定して**増加だけを CI で止める** — 移行の逆行を防ぎながら、
+  削減を進捗として見る（[fk:check の警告モードとして実装した話](https://github.com/rikukaInoue/greenfield/issues/197)）
+
+インフラは何も変わりません。アプリ1つ、RDS 1台、database 1つのままです。
 
 ## 段階2: 同じ DB インスタンスの中で、database を分ける
 
-`orders` モジュールのテーブルを `orders` database へ、`inventory` の
-テーブルを `inventory` database へ。物理サーバは1台のままです。
+products / stocks を `inventory` database へ動かします。物理サーバは1台のまま。
 
-ここが**一番おいしい段階**です。理由は、切り出しの難所を「まだトランザクションが
-張れる安全な場所」で済ませられるから:
+```mermaid
+graph TB
+    subgraph APP["アプリ(まだ1プロセスでもよい)"]
+        OM[注文モジュール]
+        IM[在庫モジュール]
+    end
+    subgraph RDS["RDS インスタンス(1台のまま)"]
+        subgraph shop["database: shop"]
+            O[orders]
+            OI[order_items]
+        end
+        subgraph inv["database: inventory"]
+            P[products]
+            ST[stocks]
+        end
+    end
+    OM -->|"shop ユーザーで接続<br/>(inventory への GRANT なし)"| shop
+    IM -->|inventory ユーザーで接続| inv
+    OM -->|"在庫引当は API 呼び出しに"| IM
+```
 
-- **跨ぎ JOIN と跨ぎ外部キーをここで捨てる**。他 database のテーブルを参照せず
-  ID を値として持つ、存在確認は相手モジュールの API か複製ビューで、という形に
-  書き換える。書き換え中に問題が出ても、同一インスタンスなので巻き戻しは安い
-- **データの移送もここでやる**。テーブルを別 database へ動かす作業は、
-  同一トランザクションで二重書きできるうちは[オンラインマイグレーションの
-  標準装備](/blog/progressive-delivery-db-side/)（二重書き → バックフィル →
-  読み切替 → 旧側を削除）がそのまま使える。カラム改名と同じ型で、対象が
-  テーブルに変わるだけ
+ここが**一番おいしい段階**です。切り出しの難所を全部、「まだトランザクションが
+張れる安全な場所」で済ませます。
+
+**結合の切り方（ER の変化）**。跨ぎ FK は張れなくなる（別 database への FK は
+移送後に物理的に消える）ので、`order_items.product_id` は**ただの値**になります。
+商品名の表示のような読みは、在庫モジュールの API か、複製テーブルで解決します:
+
+```mermaid
+graph LR
+    subgraph shop["database: shop(注文側)"]
+        OI["<b>order_items</b><br/>id PK<br/>order_id FK<br/>product_id(FKなし・値として保持)<br/>quantity<br/>product_name(注文時点の複製)"]
+        PR["<b>products_replica</b><br/>product_id PK<br/>name"]
+    end
+    subgraph inv["database: inventory(在庫側)"]
+        P["<b>products</b><br/>id PK<br/>name<br/>price"]
+        ST["<b>stocks</b><br/>product_id PK,FK<br/>available"]
+    end
+    ST -->|"FK(同一database内は残す)"| P
+    P -.->|"イベントで同期(表示用)"| PR
+    OI -.->|"product_id は値。存在確認は在庫側の API"| P
+```
+
+**注文確定トランザクションの分解**。冒頭の「注文と在庫引当が原子的」は
+ここで捨てます。注文を pending で確定 → 在庫モジュールへ引当コマンド
+（冪等キー付き）→ 結果で confirmed / rejected へ、という**ワークフロー**に
+組み替える。これが切り出しの中で一番設計が要る箇所で、DB でなくドメインの
+仕事です。段階2でやるのは、失敗してもまだ全部同じインスタンスにあって
+検算も修復も安いから。
+
+**テーブルの移送**。products / stocks を shop から inventory database へ動かす
+作業は、[オンラインマイグレーションの標準装備](/blog/progressive-delivery-db-side/)
+（二重書き → バックフィル → 読み切替 → 旧側を削除）がそのまま使えます。
+カラム改名と同じ型で、対象がテーブルに変わるだけ。**二重書きがまだ同一
+トランザクションで書ける**（同一インスタンスなので原子的）ことが効いています。
 
 注意が1つ。この段階では跨ぎのトランザクションが**技術的にはまだ張れて
 しまう**。MySQL は database を跨ぐ FK も JOIN もエラーにしないので、
-「張れるけど張らない」を文章でなく CI（跨ぎ FK の検査）で守る必要が
-あります。ここを規律で守れない場合、段階3に進んだ瞬間に「張れなくなって
-初めて発覚する結合」が一斉に火を吹きます。
+「張れるけど張らない」を文章でなく機械で守る必要があります。接続ユーザーを
+database ごとに分けて GRANT で縛る + 跨ぎ FK の CI 検査、の二段です。
+ここを規律で守れない場合、段階3に進んだ瞬間に「張れなくなって初めて発覚する
+結合」が一斉に火を吹きます。
 
 ## 段階3: 別インスタンスに分ける
 
@@ -68,24 +181,65 @@ AWS で言えば **RDS インスタンス（Aurora ならクラスタ）をサ�
 | 段階2 | 1つの RDS インスタンスに複数 database | まだ張れる（規律で禁じる） | フェイルオーバー・メンテ・スケールが運命共同体 |
 | 段階3 | サービスごとに別インスタンス/クラスタ | 物理的に張れない | 別々に落ち、別々にメンテでき、別々にスケールする |
 
-段階3で装備が一段重くなる理由は、**二重書きが原子でなくなる**ことです。
-段階2までは「旧テーブルと新テーブルへの書き込み」を同一トランザクションに
-入れられた。インスタンスが分かれると「旧側は成功、新側は失敗」が構造的に
-起こるので、二重書きそのものが信用できない。代わりに:
+装備が一段重くなる理由は、**二重書きが原子でなくなる**ことです。段階2までは
+「旧テーブルと新テーブルへの書き込み」を同一トランザクションに入れられた。
+インスタンスが分かれると「旧側は成功、新側は失敗」が構造的に起こるので、
+二重書きそのものが信用できない。代わりに outbox パターンを使います —
+業務の書き込みと**同一トランザクションで** outbox テーブルに変更を積み、
+relay が相手側へ運ぶ（at-least-once + 受信側 inbox の重複排除。
+[実バスで検証した形](/blog/sns-sqs-queue-policy/)と同じ装備）。
 
-- 旧側の書き込みと**同一トランザクションで outbox テーブル**に変更を積み、
-  relay が新側へ運ぶ（at-least-once + 受信側の重複排除。
-  [実バスで検証した形](/blog/sns-sqs-queue-policy/)と同じ装備）
-- あるいは定期の検算 + 修復で差分を潰す形にして、不整合の窓を許容する
+```mermaid
+graph TB
+    subgraph 注文サービス
+        OA[注文アプリ]
+    end
+    subgraph RDS_A["RDS: shop 用インスタンス"]
+        O[(orders / order_items)]
+        OB[(outbox)]
+    end
+    subgraph BUS["SNS/SQS FIFO"]
+        Q[イベントバス]
+    end
+    subgraph 在庫サービス
+        IA[在庫アプリ]
+    end
+    subgraph RDS_B["RDS: inventory 用インスタンス"]
+        P[(products / stocks)]
+        IB[(inbox)]
+    end
+    OA -->|"業務データと outbox を<br/>同一トランザクションで書く"| O
+    OA --- OB
+    OB -->|relay が publish| Q
+    Q -->|配送| IA
+    IA -->|"inbox が重複排除して適用"| P
+    IA --- IB
+```
 
-つまり段階3のデータ切り出しは、オンラインマイグレーションの装備に
-**イベント連携の装備（outbox / 重複排除 / 再送）を足したもの**になります。
+ただし、段階2を経由していれば段階3の**引っ越し自体**は「データの意味を変えない
+移送」に縮んでいます。inventory database だけを binlog レプリケーションで
+新インスタンスへ複製し、追いついたら DSN を切り替えるだけ:
 
-ただし、段階2を経由していれば段階3の引っ越し自体は**データの意味を変えない
-移送**に縮んでいます。MySQL なら binlog レプリケーション（`replicate-do-db` で
-対象 database だけ）を新インスタンスへ張り、追いついたら DSN を切り替えるのが
-定石。DMS でも可。切替のリハーサルには [Aurora fast clone
-（データ量非依存で5分半）](/blog/aurora-instant-ddl-fast-clone/)がそのまま使えます。
+```mermaid
+graph LR
+    subgraph before["切替前"]
+        A1["RDS 旧インスタンス<br/>shop + inventory"]
+        B1["RDS 新インスタンス<br/>inventory(複製)"]
+        A1 -->|"binlog レプリケーション<br/>replicate-do-db=inventory"| B1
+    end
+    subgraph cutover["切替"]
+        C["在庫アプリの DSN を差し替え<br/>(レプリカ昇格)"]
+    end
+    subgraph after["切替後"]
+        A2["RDS 旧インスタンス<br/>shop のみ(inventory は削除)"]
+        B2["RDS 新インスタンス<br/>inventory(本番)"]
+    end
+    before --> cutover --> after
+```
+
+DMS でも同じことができます。切替のリハーサルには [Aurora fast clone
+（データ量非依存で5分半）](/blog/aurora-instant-ddl-fast-clone/)がそのまま使えて、
+本番同等データで昇格と DSN 切替の予行ができます。
 
 ## 段階2で止まるのは撤退ではない
 
@@ -104,10 +258,11 @@ AWS で言えば **RDS インスタンス（Aurora ならクラスタ）をサ�
 ## まとめ
 
 - 境目は「1つのトランザクションが新旧両方に届くか」。届く間（段階1〜2）に
-  難所（FK 切り・JOIN 排除・データ移送）を済ませるのが移行設計の本体
+  難所（FK 切り・JOIN 排除・原子性の分解・データ移送）を済ませるのが移行設計の本体
 - 段階1の道具は**棚卸しと逆行防止**（FK のペア別集計 + ベースライン差分）
 - 段階2の道具は**オンラインマイグレーションの標準装備**（二重書き →
-  バックフィル → 読み切替 → 削除）。まだ原子的にできるうちに使う
+  バックフィル → 読み切替 → 削除）と GRANT 分離。まだ原子的にできるうちに使う
 - 段階3の道具は**outbox 以下のイベント連携装備**。二重書きが原子でなくなる
-  ことへの答えで、引っ越し自体は段階2を経ていれば意味を変えない移送に縮む
+  ことへの答えで、引っ越し自体は段階2を経ていれば binlog レプリケーション +
+  DSN 切替に縮む
 - 段階2で止まるのは合理的。ただし切符（跨ぎゼロの CI 検査）は握り続ける
