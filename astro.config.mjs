@@ -2,7 +2,7 @@
 import { defineConfig } from 'astro/config';
 
 import react from '@astrojs/react';
-import mdx from '@astrojs/mdx';
+import starlight from '@astrojs/starlight';
 import sitemap from '@astrojs/sitemap';
 import rehypeMermaid from 'rehype-mermaid';
 import rehypeSanitizeInlineStyles from './src/plugins/rehype-sanitize-inline-styles.mjs';
@@ -10,7 +10,34 @@ import rehypeSanitizeInlineStyles from './src/plugins/rehype-sanitize-inline-sty
 // https://astro.build/config
 export default defineConfig({
   site: 'https://rikuka.dev',
-  integrations: [react(), mdx(), sitemap({ filter: (page) => !page.includes('/404') })],
+  integrations: [
+    // Starlight は /documents 配下の読み物(書籍形式)。MDX 統合は Starlight が
+    // 内部で追加するので、ここで mdx() を重ねて登録しない(二重登録で落ちる)。
+    // blog コレクションの MDX もその統合で処理される
+    starlight({
+      title: 'rikuka.dev',
+      defaultLocale: 'root',
+      locales: { root: { label: '日本語', lang: 'ja' } },
+      customCss: ['./src/styles/starlight.css'],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/rikukaInoue' }],
+      sidebar: [
+        { label: 'Documents', link: '/documents/' },
+        {
+          label: '螺旋の歴史',
+          items: [{ autogenerate: { directory: 'documents/spiral-history' } }],
+        },
+      ],
+      pagefind: true,
+      // 404 はサイト側の src/pages/404.astro を使う(Starlight のと衝突する)
+      disable404Route: true,
+      // Expressive Code はサイト全体の MDX に掛かり、blog のコードブロック
+      // (shiki の .astro-code に依存したコピーボタンとテーマ切替)を置き換えて
+      // しまうので無効化。読み物側にコードブロックは無い
+      expressiveCode: false,
+    }),
+    react(),
+    sitemap({ filter: (page) => !page.includes('/404') }),
+  ],
   markdown: {
     syntaxHighlight: {
       type: 'shiki',

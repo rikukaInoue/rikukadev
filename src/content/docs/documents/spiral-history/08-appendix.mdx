@@ -1,0 +1,97 @@
+---
+title: 付録 — 年表、用語集、一次資料
+description: 5本の線を並べた統合年表、傷と概念の対応表、各部の一次資料。
+sidebar:
+  order: 8
+  label: 付録 — 年表、用語集、一次資料
+---
+
+## 統合年表 — 5本の線を並べる
+
+年は「業界の共有語彙になった年」を優先している。
+
+| 年 | 言語 | データ | アーキテクチャ/デリバリー | 組織/計測 | 契約・設計記述 |
+|---|---|---|---|---|---|
+| 1968 | Dijkstra「Go To」 | | | Conway の法則、NATO ソフトウェア危機 | |
+| 1970 | | Codd 関係モデル | | Royce(ウォーターフォールの図) | |
+| 1972 | Parnas 情報隠蔽 | | | | |
+| 1979 | Constantine/Yourdon 結合と凝集 | Oracle V2 | | | |
+| 1983 | | ACID(Härder/Reuter)、DB2 | | | |
+| 1986 | | SQL が ANSI 標準 | | | |
+| 1987 | | Saga(Garcia-Molina/Salem) | | | |
+| 1989 | | | | ITIL、CAB | |
+| 1991 | | | CORBA | | |
+| 1994 | GoF デザインパターン | | 8つの誤謬(Deutsch) | | |
+| 1995 | Java | | | | |
+| 1997 | | | | | UML 1.1 が OMG 標準 |
+| 1998 | | | EJB | RUP | XML 1.0 |
+| 1999 | | | | | SOAP、XSLT |
+| 2000 | | CAP(Brewer) | REST(Fielding) | | |
+| 2001 | | | | アジャイル宣言 | WSDL、XML Schema、MDA、YAML |
+| 2002 | | | 分散オブジェクト第一法則、PoEAA(ActiveRecord)、API mandate | | |
+| 2003 | | memcached | DDD(Evans) | | |
+| 2004 | Rails、CoC | | SOA 4テネット(Box) | | |
+| 2005 | Django、CakePHP、symfony | | | Puppet | Ajax |
+| 2006 | | BigTable 論文 | | | JSON(RFC 4627) |
+| 2007 | | Dynamo 論文、Helland | | | |
+| 2008 | Yii | Cassandra | Netflix 大障害 | | |
+| 2009 | Node.js、Go | MongoDB | | 10+ Deploys、devopsdays、SOA マニフェスト | |
+| 2010 | | | | Continuous Delivery | |
+| 2011 | | Kafka、pt-osc | 12-factor | ADR | |
+| 2012 | TypeScript | Spanner 論文 | | blameless postmortem | |
+| 2013 | | | Docker | | |
+| 2014 | Swift | Aurora | マイクロサービス命名、Kubernetes、LaunchDarkly | DORA 調査開始 | |
+| 2015 | Rust 1.0、PHP 7、PEP 484 | CockroachDB | | | OpenAPI、gRPC |
+| 2016 | | gh-ost、TiDB | | SRE 本 | |
+| 2017 | Kotlin 公式化 | | Istio、進化的アーキテクチャ | | |
+| 2018 | | MySQL INSTANT DDL | プログレッシブデリバリー | Accelerate | C4 モデル |
+| 2019 | | | | Team Topologies | sqlc |
+| 2020 | Ruby 3 RBS | | packwerk | Backstage 公開 | |
+| 2021 | Copilot | | Hard Parts | SPACE | |
+| 2022 | | Aurora Blue/Green | OpenFeature | | |
+| 2023 | | | Prime Video 事例 | DevEx、生産性計測論争 | |
+| 2024-26 | エージェント並行開発 | | | DORA AI レポート | |
+
+## 用語集 — 傷と概念の対応
+
+概念は傷の圧縮である。この表は、どの傷がどの概念を生んだかを引くためのもの。
+
+| 概念 | 生んだ傷 | 部 |
+|---|---|---|
+| 情報隠蔽 | 格納形式を1つ変えると全モジュールが変わる | プロローグ |
+| 正規化 | 同じ事実を2箇所に書いて食い違う | プロローグ |
+| GC | free を忘れる、2回呼ぶ | 第1部 |
+| ACID | 途中で落ちてデータが半分だけ書かれる | 第1部 |
+| 8つの誤謬、分散オブジェクト第一法則 | ループの中のリモート getter、部分故障 | 第1部 |
+| SOA の4テネット | 実装の型を共有して相手の内部に結合する | 第1部 |
+| 賢いエンドポイントと土管のパイプ | ESB チームが全社のボトルネックになる | 第1部、第3部 |
+| Convention over Configuration | クラスを1つ足すのに XML を3ファイル直す | 第1部、第2部 |
+| UML はスケッチとして | 締切の夜に図だけが古くなる(MDA) | 第1部 |
+| Data Mapper | ドメインと DB と表示が1クラスに同居する(神クラス) | 第2部 |
+| オンラインスキーマ変更 | ALTER TABLE が数時間テーブルをロックする | 第2部、第4部 |
+| スキーマの復権 | スキーマがアプリコードに暗黙のまま散乱する | 第3部 |
+| 境界づけられたコンテキスト | 「顧客」の意味が部署ごとに違うのに1つにする | 第3部 |
+| Saga、冪等キー、outbox | 境界を跨ぐトランザクションが無い、メッセージが重複する | 第3部 |
+| アーキテクチャ量子 | 分けたつもりで同時デプロイが要る(分散モノリス) | 第3部、第4部 |
+| blameless postmortem | 責められるので情報が隠され、同じ事故が繰り返す | 第3部 |
+| 漸進的型付け | 全部を一度に型付けできないで移住できない | 第4部 |
+| 適応度関数 | 文書に書いた境界がレビューをすり抜ける | 第4部 |
+| デプロイとリリースの分離 | レバーが1本しかなく、戻すと全部戻る | 第4部 |
+| エラーバジェット | 信頼性と速度の口論が毎回起きる | 第4部 |
+| Four Keys | 「変更を減らせば安全」を誰も反証できなかった | 第4部 |
+| 逆コンウェイ戦略 | 組織図の形がそのままシステムになる | 第4部 |
+| スキーマ駆動生成 | ドキュメントと実装、SQL と型がズレる | 第5部 |
+| expand/contract | 新旧バイナリが同じ DB を触る間に壊れる | 第5部 |
+| 3軸の分離 | 可逆な軸を先に動かし、不可逆な軸を放置する | 第5部 |
+| ゴールデンパス | 文化は説得だが、説得は続かない | 第5部 |
+| SPACE | 単一指標がゲーム化して腐る | 第5部 |
+
+## さらに読むなら — 一次資料
+
+- プロローグ: Conway「How Do Committees Invent?」(1968) / Parnas「On the Criteria To Be Used in Decomposing Systems into Modules」(1972) / Codd「A Relational Model of Data for Large Shared Data Banks」(1970) / Dijkstra「Go To Statement Considered Harmful」(1968)
+- 第1部: Fowler『Patterns of Enterprise Application Architecture』(2002、分散オブジェクト第一法則と ActiveRecord) / Deutsch「Fallacies of Distributed Computing」 / Box「A Guide to Developing and Running Connected Systems with Indigo」(MSDN 2004、4テネット) / Fowler『UML Distilled』 / OMG「MDA Guide」(2003)
+- 第2部: Rails の「Doctrine」(dhh) / Crockford「The application/json Media Type」(RFC 4627) / Fielding 博士論文第5章(REST)
+- 第3部: Allspaw/Hammond「10+ Deploys Per Day」(Velocity 2009) / DeCandia 他「Dynamo」(SOSP 2007) / Fowler/Lewis「Microservices」(2014) / Evans『Domain-Driven Design』(2003) / Garcia-Molina/Salem「Sagas」(1987) / Helland「Life beyond Distributed Transactions」(CIDR 2007) / Brewer「CAP Twelve Years Later」(2012) / Allspaw「Blameless PostMortems」(Etsy 2012)
+- 第4部: Corbett 他「Spanner」(OSDI 2012) / Beyer 他『Site Reliability Engineering』(2016) / Forsgren/Humble/Kim『Accelerate』(2018) / Skelton/Pais『Team Topologies』(2019) / Ford/Parsons/Kua『Building Evolutionary Architectures』(2017) / Governor「Towards Progressive Delivery」(2018)
+- 第5部: Ford 他『Software Architecture: The Hard Parts』(2021) / Forsgren 他「The SPACE of Developer Productivity」(ACM Queue 2021) / Noda 他「DevEx: What Actually Drives Productivity」(2023) / DORA「State of DevOps Report」(2024)、「State of AI-assisted Software Development」(2025) / Shopify「Deconstructing the Monolith」(2019)
+- 概念⇔実装の対応: [greenfield](https://github.com/rikukaInoue/greenfield) リポジトリの docs/conventions/ と docs/verification-log/(各概念の実験と証跡)

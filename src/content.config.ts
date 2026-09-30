@@ -1,5 +1,7 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
+import { docsLoader } from '@astrojs/starlight/loaders';
+import { docsSchema } from '@astrojs/starlight/schema';
 
 const blog = defineCollection({
   loader: glob({ pattern: '**/*.mdx', base: './src/content/blog' }),
@@ -11,4 +13,7 @@ const blog = defineCollection({
   }),
 });
 
-export const collections = { blog };
+// docs は Starlight の読み物(/documents/...)。src/content/docs/ 配下がそのまま URL になる
+const docs = defineCollection({ loader: docsLoader(), schema: docsSchema() });
+
+export const collections = { blog, docs };

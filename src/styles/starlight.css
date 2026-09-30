@@ -1,0 +1,42 @@
+/* Starlight(/documents 配下の読み物)のカスタム。
+   図(src/assets/documents/*.svg)は色を var(--cds-*) で持っているので、
+   ここで Starlight のテーマ変数に結ぶ。ライト/ダークは Starlight 側の
+   変数が切り替わるのに追従する */
+:root {
+  --cds-text-primary: var(--sl-color-white);
+  --cds-text-secondary: var(--sl-color-gray-2);
+  --cds-chart-axis: var(--sl-color-gray-3);
+  --cds-chart-grid: var(--sl-color-gray-5);
+  --cds-chart-reference-tint: var(--sl-color-gray-6);
+  --cds-chart-categorical-1: var(--sl-color-text-accent);
+  --cds-chart-status-good: #22c55e;
+  --cds-chart-status-warning: #f59e0b;
+  --cds-chart-status-critical: #ef4444;
+}
+
+:root[data-theme='light'] {
+  --cds-chart-status-good: #15803d;
+  --cds-chart-status-warning: #b45309;
+  --cds-chart-status-critical: #b91c1c;
+}
+
+/* 図。SVG は viewBox 760 幅で描いてあるので、本文幅いっぱいに伸ばす */
+.diagram {
+  margin: 1.5rem 0;
+}
+
+.diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: inherit;
+}
+
+/* 読み物なので本文を少しゆったり */
+.sl-markdown-content {
+  line-height: 1.85;
+}
+
+.sl-markdown-content blockquote {
+  font-style: normal;
+}
