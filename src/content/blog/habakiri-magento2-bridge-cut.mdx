@@ -9,7 +9,7 @@ description: "FKグラフから切断点を出すCLI(habakiri)を作り、Magent
 というアイディアを書いた。結びは「分割前のDBを読む機構は、それが動いてから考える」だった。
 
 作った。[habakiri](https://github.com/rikukadev/habakiri)(v0.3.0)。
-この記事は、作る → Magento 2 で実際に切る → Mastodon を DB 無しで読む →
+この記事は、作る → Magento 2 で実際に切る → Mastodon を ActiveRecord から静的解析する →
 「大物数個への分割案」を出せるようになるまでの記録。
 
 ## habakiri がやること
@@ -28,7 +28,7 @@ FK には重みを付ける。`CASCADE(3) > NOT NULL(2) > NULLABLE(1)`。この�
 ライフサイクルに融合**した。hub を先に外せば縮約は局所的な親子に限定される。
 順序を入れ替えた途端、境界が現れた。
 
-## Magento 2 で実際に切る — FK が勝手に生き返る
+## Magento 2 で実際に切る
 
 最初の実地検証は Magento 2。295 テーブル / 382 FK から橋が 2 本出た。
 1 本目は `downloadable_link_purchased ×— sales`(購入権と注文)。どちらも
@@ -73,13 +73,13 @@ FK の重みは「切断後に必要な API 契約の強さ」の予測として
 `dependent: :destroy` → CASCADE(3)、必須 `belongs_to` → NOT NULL(2)、`optional:` → 1。
 
 Mastodon の実物 146 モデルに当てたら、フィクスチャで全部通っていたテストを
-すり抜けて**6 つのバグが即死した**。abstract 基底の STI 貫通(全テーブルが
+すり抜けた**6 つのバグが立て続けに見つかった**。abstract 基底の STI 貫通(全テーブルが
 `application_records` に融合)、複数行宣言の class_name 取りこぼし、`with_options`
 ブロック(オプションが行ではなくブロックに付く)、名前空間の demodulize 漏れ、
-`singularize("status") = "statu"` の幽霊化、PORO 混入。**実物こそが最強のテストスイート。**
+`singularize("status") = "statu"` の誤変換、PORO 混入。**実物こそが最強のテストスイート。**
 
-取りこぼしの怖さは「読めない」ではなく「**偽の切断点を自信満々に出す**」ことだった。
-幽霊テーブルは橋に化ける。修正のたびに橋の数が 39 → 31 → 22 と減り、残ったものだけが本物。
+取りこぼしの怖さは「読めない」ではなく「**偽の切断点を出してしまう**」ことだった。
+誤検出されたテーブルは橋として現れる。修正のたびに橋の数が 39 → 31 → 22 と減り、残ったものだけが本物。
 
 修正後の Mastodon: 111 テーブル / 178 FK 相当。hub は **accounts(次数 60)と
 statuses(17)** — 全域がこの 2 つに参照を張るハブ・アンド・スポーク構造で、
