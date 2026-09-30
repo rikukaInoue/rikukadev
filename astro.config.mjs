@@ -28,6 +28,12 @@ export default defineConfig({
         },
       ],
       pagefind: true,
+      // 404 はサイト側の src/pages/404.astro を使う(Starlight のと衝突する)
+      disable404Route: true,
+      // Expressive Code はサイト全体の MDX に掛かり、blog のコードブロック
+      // (shiki の .astro-code に依存したコピーボタンとテーマ切替)を置き換えて
+      // しまうので無効化。読み物側にコードブロックは無い
+      expressiveCode: false,
     }),
     react(),
     sitemap({ filter: (page) => !page.includes('/404') }),
