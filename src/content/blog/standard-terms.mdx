@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -247,6 +247,42 @@ Alistair Cockburn, *Hexagonal Architecture*（2005）。Robert C. Martin, *Clean
 | ユースケース | Use Case | アプリケーション固有の業務の手順 | `usecase` パッケージ | アプリケーションサービス（DDD の語。同じものを指すときは usecase に寄せる） |
 | 依存の向き | dependency rule | 内側は外側を知らない | core は差し込み口だけを持ち、実装は外のモジュール | |
 
+### もっと古い古典 — 1960〜90 年代の論文と本
+
+上の本が前提にしている語。原典の著者と年を添える。
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| コンウェイの法則 | Conway's law | Melvin Conway, "How Do Committees Invent?"（1968） | システムの構造は、それを作る組織の通信構造を写す | サービスの境界とチームの境界を合わせる話。チームトポロジーの前提 |
+| 情報隠蔽 | information hiding | David Parnas, "On the Criteria To Be Used in Decomposing Systems into Modules"（1972） | 変わりやすい決定をモジュールの中に閉じ込める。分解の基準 | モジュール境界を機械で守る理由。マイクロサービスの表と同じ |
+| 結合度、凝集度 | coupling / cohesion | Yourdon & Constantine, *Structured Design*（1979。Constantine の 1960 年代後半の仕事に基づく） | モジュール間の依存の強さ / モジュール内の関連の強さ | 疎結合・高凝集。コナーセンスはこれを細かくしたもの |
+| 関心の分離 | separation of concerns | Edsger Dijkstra, "On the role of scientific thought"（1974） | 1 つの側面ずつ考えられるように分ける | 横断的関心事（core）と業務（usecase / domain）を分ける |
+| 構造化プログラミング | structured programming | Dijkstra, Dahl, Hoare, *Structured Programming*（1972） | goto を使わず、順次・分岐・反復で組む | |
+| 人月の神話 | The Mythical Man-Month | Frederick Brooks（1975。邦訳『人月の神話』） | 人と月は交換できない | 書名として使う |
+| ブルックスの法則 | Brooks's law | 同上 | 遅れたプロジェクトに人を足すとさらに遅れる | |
+| 概念的統一性 | conceptual integrity | 同上 | 設計が 1 つの考えで貫かれていること | 規約と ADR を 1 か所に持つ理由 |
+| セカンドシステム効果 | second-system effect | 同上 | 2 作目は機能を盛りすぎる | 螺旋の歴史で扱う |
+| 本質的複雑性 / 偶有的複雑性 | essential / accidental complexity | Brooks, "No Silver Bullet"（1986） | 問題そのものの難しさ / 道具や表現が生む難しさ | 道具で消せるのは偶有的なものだけ |
+| 銀の弾などない | No Silver Bullet | 同上 | 1 桁の生産性向上をもたらす単一の技術は無い | |
+| ソフトウェア進化の法則 | Lehman's laws of software evolution | Meir Lehman（1974 / 1980） | 使われるシステムは変わり続け、何もしなければ複雑さは増す | 進化的アーキテクチャの前提。「設計は放っておくと崩れる」 |
+| ウォーターフォール | waterfall | Winston Royce（1970。本人は改良版を提案していた） | 工程を順に 1 回ずつ通す | 螺旋の歴史で扱う |
+| スパイラルモデル | spiral model | Barry Boehm（1986） | リスク駆動で反復する | 同上 |
+| 早すぎる最適化 | premature optimization | Donald Knuth（1974） | 測る前に最適化しない | 「測れることは測ってから主張する」 |
+| 堅牢性の原則 | robustness principle（Postel's law） | Jon Postel, RFC 761（1980）、RFC 1122（1989） | 送るときは厳密に、受けるときは寛容に | 壊れた `traceparent` は黙って捨てて採番し直す。ただし境界では厳密さを優先する場面もある |
+| エンドツーエンド原則 | end-to-end argument | Saltzer, Reed, Clark, "End-to-End Arguments in System Design"（1984） | 正しさの保証は端点でしか完結しない。途中で頑張っても端点の検査は要る | at-least-once の配送と受信側の inbox。配送基盤に exactly-once を求めない |
+| 論理時計、happened-before | logical clocks / happened-before | Leslie Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System"（1978） | 分散した出来事の順序は物理時刻で決められない | 順序保証、デッドライン伝播を相対時間にする理由 |
+| ACID | atomicity / consistency / isolation / durability | Haerder & Reuter（1983）。Jim Gray, "The Transaction Concept"（1981） | トランザクションの 4 性質 | Atomic の範囲。outbox を同じトランザクションに含める |
+| 2 相コミット | two-phase commit（2PC） | Gray（1978）ほか | 複数の資源にまたがる原子的な確定 | 使わない。outbox で代替する理由として言及 |
+| 契約による設計 | design by contract | Bertrand Meyer, *Object-Oriented Software Construction*（1988 / 1997） | 事前条件・事後条件・不変条件で振る舞いを約束する | API の「契約」という語の由来 |
+| コマンドクエリ分離 | command-query separation（CQS） | 同上 | 状態を変える操作と値を返す操作を分ける | ADR 0005。`repository`（書き）と `readmodel`（読み）。CQRS とは別の語 |
+| 開放閉鎖の原則 | open-closed principle | 同上（Meyer, 1988） | 拡張に開き、修正に閉じる | 差し込み口で実装を足す |
+| リスコフの置換原則 | Liskov substitution principle | Barbara Liskov（1987） | 派生型は基底型として使える | |
+| CAP | consistency / availability / partition tolerance | Eric Brewer（2000） | 分断時に一貫性と可用性は両立しない | 結果整合性を選ぶ根拠 |
+| 結果整合性（原典） | eventually consistent | Werner Vogels, "Eventually Consistent"（2008） | 更新が止まれば全レプリカは同じ値に収束する | データ連携の表と同じ |
+| デザインパターン | design patterns | Gamma, Helm, Johnson, Vlissides（1994。邦訳『オブジェクト指向における再利用のためのデザインパターン』） | 再利用できる設計の型 23 種 | 次の行で使うものだけ |
+| アダプタ、ファサード、デコレータ、ストラテジ | Adapter / Facade / Decorator / Strategy | 同上 | 変換して合わせる / 入口を 1 つに / 振る舞いを包んで足す / 差し替え可能な手順 | handler はアダプタ、ミドルウェアはデコレータ、差し込み口の実装はストラテジ |
+| シングルトン | Singleton | 同上 | インスタンスを 1 つに限る | グローバルの TracerProvider は後勝ちになるので使わず、明示渡しにした |
+
 ### XP と TDD — Beck『エクストリームプログラミング』『テスト駆動開発』、Fowler『リファクタリング』
 
 Kent Beck, *Extreme Programming Explained*（Addison-Wesley, 1999 / 2nd ed. 2004。邦訳はオーム社, 2015）、
@@ -388,6 +424,12 @@ Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦�
 - Jez Humble, David Farley, *Continuous Delivery*（Addison-Wesley, 2010）。邦訳『継続的デリバリー』（アスキー・メディアワークス, 2012）
 - Alistair Cockburn, [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)（2005）
 - Robert C. Martin, *Clean Architecture*（Prentice Hall, 2017）。邦訳（アスキードワンゴ, 2018）
+- Melvin Conway, "How Do Committees Invent?"（1968）。David Parnas, "On the Criteria To Be Used in Decomposing Systems into Modules"（1972）。Yourdon & Constantine, *Structured Design*（1979）。Dijkstra, "On the role of scientific thought"（1974）
+- Frederick Brooks, *The Mythical Man-Month*（1975）、"No Silver Bullet"（1986）。Meir Lehman, "Programs, Life Cycles, and Laws of Software Evolution"（1980）
+- Winston Royce（1970）、Barry Boehm, "A Spiral Model of Software Development and Enhancement"（1986）。Donald Knuth, "Structured Programming with go to Statements"（1974）
+- Jon Postel, RFC 761（1980）/ RFC 1122（1989）。Saltzer, Reed, Clark, "End-to-End Arguments in System Design"（1984）。Leslie Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System"（1978）
+- Jim Gray, "The Transaction Concept"（1981）。Haerder & Reuter, "Principles of Transaction-Oriented Database Recovery"（1983）。Eric Brewer（CAP, 2000）。Werner Vogels, "Eventually Consistent"（2008）
+- Bertrand Meyer, *Object-Oriented Software Construction*（1988 / 1997）。Barbara Liskov（1987）。Gamma, Helm, Johnson, Vlissides, *Design Patterns*（1994）
 - Kent Beck, *Extreme Programming Explained*（1999 / 2004）、*Test-Driven Development: By Example*（2002）。Martin Fowler, *Refactoring*（1999 / 2018）
 - Titus Winters, Tom Manshreck, Hyrum Wright (eds.), *Software Engineering at Google*（O'Reilly, 2020）。[オンライン版](https://abseil.io/resources/swe-book)
 - Sam Newman, *Building Microservices*（O'Reilly, 2015 / 2021）、*Monolith to Microservices*（2019）。Susan J. Fowler, *Production-Ready Microservices*（O'Reilly, 2016）
