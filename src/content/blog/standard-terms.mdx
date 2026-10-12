@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -275,13 +275,39 @@ Alistair Cockburn, *Hexagonal Architecture*（2005）。Robert C. Martin, *Clean
 | 2 相コミット | two-phase commit（2PC） | Gray（1978）ほか | 複数の資源にまたがる原子的な確定 | 使わない。outbox で代替する理由として言及 |
 | 契約による設計 | design by contract | Bertrand Meyer, *Object-Oriented Software Construction*（1988 / 1997） | 事前条件・事後条件・不変条件で振る舞いを約束する | API の「契約」という語の由来 |
 | コマンドクエリ分離 | command-query separation（CQS） | 同上 | 状態を変える操作と値を返す操作を分ける | ADR 0005。`repository`（書き）と `readmodel`（読み）。CQRS とは別の語 |
-| 開放閉鎖の原則 | open-closed principle | 同上（Meyer, 1988） | 拡張に開き、修正に閉じる | 差し込み口で実装を足す |
-| リスコフの置換原則 | Liskov substitution principle | Barbara Liskov（1987） | 派生型は基底型として使える | |
 | CAP | consistency / availability / partition tolerance | Eric Brewer（2000） | 分断時に一貫性と可用性は両立しない | 結果整合性を選ぶ根拠 |
 | 結果整合性（原典） | eventually consistent | Werner Vogels, "Eventually Consistent"（2008） | 更新が止まれば全レプリカは同じ値に収束する | データ連携の表と同じ |
 | デザインパターン | design patterns | Gamma, Helm, Johnson, Vlissides（1994。邦訳『オブジェクト指向における再利用のためのデザインパターン』） | 再利用できる設計の型 23 種 | 次の行で使うものだけ |
 | アダプタ、ファサード、デコレータ、ストラテジ | Adapter / Facade / Decorator / Strategy | 同上 | 変換して合わせる / 入口を 1 つに / 振る舞いを包んで足す / 差し替え可能な手順 | handler はアダプタ、ミドルウェアはデコレータ、差し込み口の実装はストラテジ |
 | シングルトン | Singleton | 同上 | インスタンスを 1 つに限る | グローバルの TracerProvider は後勝ちになるので使わず、明示渡しにした |
+
+### 設計原則 — SOLID とその周辺
+
+原則は 1 冊の本ではなく、論文や記事が出どころである。略語はそのまま使い、初出で展開する。
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| SOLID | — | 原則は Robert C. Martin がまとめた（2000 年ごろ、*Agile Software Development* 2003）。頭字語は Michael Feathers | 下の 5 原則の総称 | 略語のまま。「SOLID 原則」と書く |
+| 単一責任の原則 | single responsibility principle（SRP） | Martin（2003）。Parnas の情報隠蔽と DeMarco の凝集に由来 | モジュールを変える理由は 1 つであるべき | `core/logger` 以外の core はログしない、のような「誰が何をするか」の線引き |
+| 開放閉鎖の原則 | open-closed principle（OCP） | Bertrand Meyer, *Object-Oriented Software Construction*（1988） | 拡張に開き、修正に閉じる | 差し込み口（`consistency.Bus` など）に実装を足し、core は変えない |
+| リスコフの置換原則 | Liskov substitution principle（LSP） | Barbara Liskov（1987）。Liskov & Wing, "A Behavioral Notion of Subtyping"（1994） | 派生型は基底型の約束を破らずに置き換えられる | v2 アダプタは同じ usecase の約束を守る。契約による設計と対で読む |
+| インタフェース分離の原則 | interface segregation principle（ISP） | Martin（1996） | 使わないメソッドに依存させない | `Bus` と `Handler` を別のインタフェースにする |
+| 依存性逆転の原則 | dependency inversion principle（DIP） | Martin, "The Dependency Inversion Principle"（1996） | 上位は下位の実装でなく抽象に依存する | core が口を持ち、実装モジュールが core に依存する（ADR 0022） |
+| 依存性注入 | dependency injection（DI） | Martin Fowler, "Inversion of Control Containers and the Dependency Injection pattern"（2004） | 依存を外から渡す | 合成ルート（cmd / app）で組み立てる。TracerProvider の明示渡し |
+| 制御の反転 | inversion of control（IoC） | Fowler（2004）。語は Johnson & Foote（1988） | 呼ぶ側と呼ばれる側を逆にする。フレームワークが自分のコードを呼ぶ | DI と区別する。IoC は性質、DI はその一手法 |
+| 合成ルート | composition root | Mark Seemann, *Dependency Injection in .NET*（2011） | 依存を組み立てる唯一の場所 | 各サービスの cmd / app（ADR 0003） |
+| 非循環依存の原則 | acyclic dependencies principle（ADP） | Martin（1996、パッケージ原則） | モジュールの依存に循環を作らない | `go.mod` の replace から作る依存グラフ。affected の前提 |
+| 安定依存の原則 | stable dependencies principle（SDP） | 同上 | 変わりやすいものから変わりにくいものへ依存する | core は軽依存に保つ |
+| DRY | Don't Repeat Yourself | Hunt & Thomas, *The Pragmatic Programmer*（1999） | 知識の表現を 1 か所にする | タイトル規約を schema と検査スクリプトで同じ関数にする |
+| KISS | Keep It Simple, Stupid | Kelly Johnson（1960 年代、Lockheed） | 単純に保つ | |
+| デメテルの法則 | Law of Demeter | Lieberherr, Holland, Riel（1988） | 直接の相手にだけ話す。`a.b().c().d()` を書かない | |
+| Tell, Don't Ask | Tell, Don't Ask | Andy Hunt & Dave Thomas（Pragmatic Programmers, 2003） | 状態を聞いて判断せず、やってほしいことを伝える | ドメインモデルに振る舞いを置く理由 |
+| 継承より合成 | composition over inheritance | GoF（1994）の原則の一つ | 振る舞いの再利用は継承でなく合成で | ミドルウェアはデコレータで積む |
+| 最小驚き | principle of least astonishment | 1960 年代後半から。Geoffrey James, *The Tao of Programming*（1987）などで定式化 | 使う人が驚かない振る舞いにする | 既定値の決め方 |
+| 最小権限 | principle of least privilege | Saltzer & Schroeder, "The Protection of Information in Computer Systems"（1975） | 必要な権限だけを与える | task role、スコープ `internal:*`、非 root |
+| フェイルセーフ既定値 | fail-safe defaults | 同上（1975） | 許可は明示、既定は拒否 | fail closed の原典。「未設定は本番として扱う」（ADR 0016） |
+| 多層防御 | defense in depth | 軍事用語から。NSA の文書（2000 年代）で定式化 | 1 つの防御に頼らない | ネットワーク・認証・認可・DB の GRANT を重ねる |
+| ゼロトラスト | zero trust | John Kindervag, Forrester（2010） | ネットワークの位置を信用しない | 「到達制御の実効性はネットワーク層でなく GRANT・scope・JWT 検証に置く」 |
 
 ### XP と TDD — Beck『エクストリームプログラミング』『テスト駆動開発』、Fowler『リファクタリング』
 
@@ -429,7 +455,10 @@ Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦�
 - Winston Royce（1970）、Barry Boehm, "A Spiral Model of Software Development and Enhancement"（1986）。Donald Knuth, "Structured Programming with go to Statements"（1974）
 - Jon Postel, RFC 761（1980）/ RFC 1122（1989）。Saltzer, Reed, Clark, "End-to-End Arguments in System Design"（1984）。Leslie Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System"（1978）
 - Jim Gray, "The Transaction Concept"（1981）。Haerder & Reuter, "Principles of Transaction-Oriented Database Recovery"（1983）。Eric Brewer（CAP, 2000）。Werner Vogels, "Eventually Consistent"（2008）
-- Bertrand Meyer, *Object-Oriented Software Construction*（1988 / 1997）。Barbara Liskov（1987）。Gamma, Helm, Johnson, Vlissides, *Design Patterns*（1994）
+- Bertrand Meyer, *Object-Oriented Software Construction*（1988 / 1997）。Barbara Liskov（1987）、Liskov & Wing（1994）。Gamma, Helm, Johnson, Vlissides, *Design Patterns*（1994）
+- Robert C. Martin, "The Dependency Inversion Principle"（1996）、*Agile Software Development: Principles, Patterns, and Practices*（2003）。Martin Fowler, [Inversion of Control Containers and the Dependency Injection pattern](https://martinfowler.com/articles/injection.html)（2004）。Mark Seemann, *Dependency Injection in .NET*（2011）
+- Hunt & Thomas, *The Pragmatic Programmer*（1999）。Lieberherr, Holland, Riel, "Object-Oriented Programming: An Objective Sense of Style"（1988）
+- Saltzer & Schroeder, "The Protection of Information in Computer Systems"（1975）。John Kindervag, "No More Chewy Centers"（Forrester, 2010）
 - Kent Beck, *Extreme Programming Explained*（1999 / 2004）、*Test-Driven Development: By Example*（2002）。Martin Fowler, *Refactoring*（1999 / 2018）
 - Titus Winters, Tom Manshreck, Hyrum Wright (eds.), *Software Engineering at Google*（O'Reilly, 2020）。[オンライン版](https://abseil.io/resources/swe-book)
 - Sam Newman, *Building Microservices*（O'Reilly, 2015 / 2021）、*Monolith to Microservices*（2019）。Susan J. Fowler, *Production-Ready Microservices*（O'Reilly, 2016）
