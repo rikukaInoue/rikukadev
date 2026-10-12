@@ -1,0 +1,144 @@
+---
+title: "用語の標準表 — 原語・定訳・使わない言い換え"
+date: 2026-10-13
+tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
+description: "記事を書くたびに「昇格ゲート」「引くレバー」「被弾」のような独自の訳語や比喩が混ざり、読む側の変換コストになっていた。このブログと greenfield の文書で使う技術用語を、グループごとに「標準の語・文脈による使い分け・使わない言い換え・出典」の表にまとめる。原語が英語なら英語のまま、定訳があればそれ、比喩は作らない。"
+---
+
+記事を書くたびに、同じ概念に別の語を当ててしまうことがあった。promotion gate を
+「昇格ゲート」と訳し、巻き戻しの手段を「レバー」と呼び、失敗したリクエストを
+「被弾」と書いた。どれも書いた側には通じるが、読む側には変換コストになる。
+定着した語があるなら、それをそのまま使えばよい。
+
+この記事は、このブログと [greenfield](https://github.com/rikukaInoue/greenfield) の
+文書で使う技術用語の標準表である。先に規則を書き、グループごとの表を置き、
+最後に使わない言い換えの一覧と出典をまとめる。表は増やしていく。
+
+## 規則
+
+1. **原語が英語の用語は英語のまま書く。** promotion gate、bake、expand / contract、
+   outbox。訳語を新しく作らない。カタカナ表記が定着しているもの（デプロイ、
+   カナリア、ロールバック、バックフィル）はカタカナでよい
+2. **定訳があればそれを使う。** fitness function は『進化的アーキテクチャ』の訳書に
+   従って適応度関数、observability は可観測性。定訳と原語の両方が通る場合は、
+   初出で「適応度関数（fitness function）」のように併記する
+3. **比喩を作らない。** 「レバー」「被弾」「置く・当てる・見せる」のような言い換えは、
+   具体的な語（巻き戻しの手段、失敗したリクエスト、デプロイ・トラフィック切替・
+   リリース）で書く
+4. **文脈で語が変わるものは、どの文脈でどれを使うかを決める。** 同じ「戻す」でも、
+   デプロイはロールバック、フラグは OFF に戻す、一般論は巻き戻し
+5. **固有の語は固有の語として書く。** ECS の `stopDeployment`、Keycloak の
+   `client_credentials` のような API や設定の名前は、コード体で原文どおり
+6. **書いたら機械で確認する。** 使わない言い換えの一覧を grep で当てる。
+   タイトルの長さ規約と同じく、人の記憶に頼らない
+
+## デリバリー
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| デプロイ | deploy / deployment | 新しいバイナリを本番環境に配置する | 「デプロイする」。配置の完了と公開は別 | 置く、投入 |
+| トラフィック切替 | traffic shifting | 実ユーザーのリクエストをどの版にどれだけ向けるか | 表記は「切替」に統一 | 当てる、振り分け |
+| リリース | release | 機能をユーザーの目に触れさせる | フラグによる公開も含む | 見せる、公開（単独では使わない） |
+| プログレッシブデリバリー | progressive delivery | デプロイ・トラフィック切替・リリースを分解し、段階的・可逆的にする考え方 | | 段階的デリバリー |
+| Blue/Green、B/G | blue/green deployment | 新旧 2 系統を並走させ、向き先を一斉に掛け替える | 本文は Blue/Green、表や図は B/G | 青緑 |
+| カナリア | canary | まず n% だけ新版に向けて観測する | 「カナリア 20%」のように割合を添える | 試験投入 |
+| promotion gate | promotion gate | 本番トラフィックを向ける前に、テスト経路で新版を検証する段 | ECS では deployment lifecycle hook（`POST_TEST_TRAFFIC_SHIFT`）で実装 | 昇格ゲート |
+| bake | bake（bake time） | 全量切替の後も旧版を落とさず併走させる監視時間 | 「bake 2 分」 | 焼き込み、様子見 |
+| ロールバック | rollback | デプロイを前の版に戻す | デプロイの文脈。ECS では `stopDeployment` | 巻き戻し（デプロイの文脈では） |
+| 巻き戻し | — | デプロイ・トラフィック・フラグを問わず「戻す」一般 | 複数の手段をまとめて言うとき | 戻し |
+| フィーチャーフラグ | feature flag / feature toggle | コードをデプロイしたまま機能の公開を制御する | OpenFeature に合わせて flag。Fowler の原語は toggle | スイッチ、トグル |
+| キルスイッチ | kill switch | 機能を即座に止めるためのフラグ | | 緊急停止フラグ |
+| リリーストレイン | release train | 決まった時刻にまとめて出す方式 | 歴史の文脈 | リリース列車 |
+| 無停止 | zero-downtime | 切替をまたいでも失敗したリクエストが無い | 「非 200 ゼロ」のように数字を添える | ノーダウンタイム |
+| 失敗したリクエスト | failed requests | 壊れた版に流れて失敗したリクエストの数 | 「0 / 1,679」のように分母を添える | 被弾、犠牲 |
+
+## DB マイグレーション
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| expand / contract | expand / contract（Parallel Change） | 互換を保って先に広げ、旧版が消えてから縮める | 「expand を適用」「contract は後続リリースで」 | 拡張 / 縮退 |
+| バックフィル | backfill | 新カラムに過去分のデータを埋める | 「batch 50、pause 100ms」のように刻みを添える | 埋め戻し |
+| 無停止移行 | online migration | サービスを止めずにスキーマを変える | | オンラインマイグレーション（併記は可） |
+| N-1 互換性 | N-1 compatibility | 新旧 1 世代差のバイナリが同時に正しく動く | トラフィック切替の前提として | 後方互換（API の文脈と混ざる） |
+| `ALGORITHM=INSTANT` | MySQL の DDL オプション | メタデータだけで終わる DDL | コード体で原文 | 即時 DDL |
+| COPY | `ALGORITHM=COPY` | テーブル全体を作り直す DDL | 「COPY は 2M 行 56 秒」 | フルコピー |
+| カラム改名 | column rename | expand → バックフィル → 切替 → contract で改名する | 「改名」で統一 | リネーム |
+
+## 進化的アーキテクチャ
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| 適応度関数 | fitness function | 守りたい性質が保たれているかを機械で判定する検査 | 定訳。初出で原語を併記 | フィットネス関数、健全性チェック |
+| 漸進的変更 | incremental change | 小さく変えて小さく確かめる | 定訳 | インクリメンタルな変更 |
+| アーキテクチャ量子 | architectural quantum | 独立して変えられる最小の単位 | 定訳 | クォンタム |
+| fail open / fail closed | fail open / fail closed | 検査自体が壊れたとき、通す側に倒れるか止める側に倒れるか | 英語のまま | 開放故障、閉鎖故障 |
+| 境界 | boundary | モジュール・サービス・DB の分かれ目 | 「境界を機械で守る」 | バウンダリ |
+| 分散モノリス | distributed monolith | 分かれているのに独立してデプロイできない状態 | | |
+| 共有カーネル | shared kernel | 分割せず参照データとして共有する中核 | DDD の語 | 共通部品 |
+
+## 可観測性
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| 可観測性 | observability | 外から見える出力で内部の状態を推定できること | 定訳。「o11y」は会話のみ | 監視（monitoring とは別） |
+| 三本柱 | three pillars | メトリクス・トレース・ログ | | |
+| トレース、スパン | trace / span | 1 リクエストの経路と、その中の 1 区間 | `trace_id` / `span_id` はコード体 | 追跡 |
+| 構造化ログ | structured logging | 1 行 1 JSON のログ | | JSON ログ |
+| canonical log line | canonical log line | 1 リクエスト 1 行に詰めたアクセスログ | 英語のまま | 要約ログ |
+| 相関 ID | correlation ID | ログとトレースを結ぶ鍵。W3C Trace Context の `trace_id` | | 追跡 ID |
+| 昇格シグナル | — | 構成を見直すべきかの判断材料となるメトリクス（プール使用率・authz レイテンシ・outbox 滞留） | greenfield の固有語。初出で説明を添える | |
+| エラーバジェット | error budget | SLO を満たしつつ許容できる失敗の量 | | 許容誤差 |
+
+## 認証・認可
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| 認証 / 認可 | authentication / authorization | 誰かを決める / 何をしてよいかを決める | 必ず分けて書く | 認証認可（ひとまとめ） |
+| OIDC | OpenID Connect | ログインのプロトコル | 発行元は issuer | |
+| issuer | issuer | トークンの発行元 URL（`iss`） | 英語のまま | 発行者 |
+| M2M | machine-to-machine | サービス間の認証。`client_credentials` | 「M2M トークン」 | サービス間認証（併記は可） |
+| ステップアップ認証 | step-up authentication | 危険操作の前に追加の認証を求める | | 再認証（一般語と混ざる） |
+| AAL | Authenticator Assurance Level | 認証の強度。NIST SP 800-63B | 「AAL2」 | 認証レベル |
+| ReBAC | relationship-based access control | 関係タプルで判定する認可 | OpenFGA の文脈 | 関係ベース認可 |
+| スコープ | scope | トークンに付く権限の範囲 | `internal:*` はコード体 | 権限（authorization と混ざる） |
+
+## 構造とデータ連携
+
+| 標準の語 | 原語 | 意味 | 文脈による使い分け | 使わない |
+|---|---|---|---|---|
+| モノレポ | monorepo | 複数のサービスを 1 つのリポジトリで持つ | | 単一リポジトリ |
+| outbox / inbox | outbox / inbox pattern | 業務の書き込みと同じトランザクションでイベントを記録し、別経路で配送・受信する | 英語のまま | 送信箱、受信箱 |
+| relay | relay | outbox の未送信をバスへ送る常駐処理 | 英語のまま | 中継 |
+| at-least-once | at-least-once delivery | 重複はあるが欠落はない配送 | 英語のまま | 最低 1 回配送 |
+| 冪等キー | idempotency key | 同じ操作の試行を同一と見なす鍵 | `Idempotency-Key` はコード体 | 重複防止キー |
+| 結果整合性 | eventual consistency | 時間がたてば整合する | 定訳 | 最終的整合性 |
+| 配送 | delivery（メッセージ） | バスがメッセージを届けること | SNS → SQS の文脈 | 配信（放送の語感） |
+
+## 使わない言い換えの一覧
+
+これまでに記事で使い、直したもの。grep で当てる対象でもある。
+
+| 使わない | 代わりに | なぜ |
+|---|---|---|
+| 昇格ゲート | promotion gate | 原語が英語。訳語を作ると検索でも通じない |
+| レバー、引くレバー | 手段、巻き戻しの手段、操作 | 比喩。何を指すかが文脈に依存する |
+| 被弾 | 失敗したリクエスト、影響を受けた | 比喩。数字（0 / 1,679）と並べると分母が見えなくなる |
+| 置く・当てる・見せる | デプロイ・トラフィック切替・リリース | 定着した語がある概念に新しい日本語動詞を当てていた |
+| 配線 | 依存の解決（go.mod と import） | DI の「配線（wiring）」と紛らわしい |
+| リリース列車 | リリーストレイン | カタカナが定着している |
+
+## 出典
+
+用語の意味と原語は次を参照した。表の「原語」はこれらの語に合わせている。
+
+- Martin Fowler, [Feature Toggles](https://martinfowler.com/articles/feature-toggles.html)、[ParallelChange](https://martinfowler.com/bliki/ParallelChange.html)
+- Neal Ford, Rebecca Parsons, Patrick Kua, *Building Evolutionary Architectures*（O'Reilly, 2017）。邦訳『進化的アーキテクチャ』（オライリー・ジャパン, 2018）。適応度関数・漸進的変更・アーキテクチャ量子の定訳はこれに従う
+- [Amazon ECS Developer Guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/)。blue/green、canary、bake time、deployment lifecycle hooks、`stopDeployment`
+- [Argo Rollouts](https://argo-rollouts.readthedocs.io/en/stable/)。canary、promotion、analysis
+- [OpenFeature Specification](https://openfeature.dev/specification/)。feature flag、evaluation、provider
+- [Google SRE Book](https://sre.google/sre-book/table-of-contents/)。error budget、SLO
+- [NIST SP 800-63B](https://pages.nist.gov/800-63-3/sp800-63b.html)。AAL
+- [W3C Trace Context](https://www.w3.org/TR/trace-context/)。`traceparent`、trace-id、span-id
+- [OpenTelemetry Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/)。`service.name` などのフィールド名
+- [MySQL 8.4 Reference Manual: Online DDL Operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)。`ALGORITHM=INSTANT` / `INPLACE` / `COPY`
+- greenfield の文書（`docs/conventions/`、ADR）。昇格シグナルなど固有語の定義元
