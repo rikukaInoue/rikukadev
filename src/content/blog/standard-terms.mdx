@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携の各グループについて、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -140,6 +140,217 @@ description: "技術文書で使う用語の標準表。デリバリー・DB マ
 | 結果整合性 | eventual consistency | 時間がたてば整合する | 定訳 | 最終的整合性 |
 | 配送 | delivery（メッセージ） | バスがメッセージを届けること | SNS → SQS の文脈 | 配信（放送の語感） |
 
+## 古典の書籍の語
+
+設計の語の多くは特定の本が定義し、その邦訳が定訳になっている。本ごとに、
+この文書群で使う語と、コードの中での対応を書く。
+
+### PoEAA — Fowler『エンタープライズアプリケーションアーキテクチャパターン』
+
+Martin Fowler, *Patterns of Enterprise Application Architecture*（Addison-Wesley, 2002）。
+邦訳は翔泳社（2005）。パターン名はこの邦訳の表記に従う。
+
+| 標準の語（定訳） | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| ドメインモデル | Domain Model | 振る舞いとデータを持つオブジェクトでドメインを表す | `domain` パッケージ。書き込み経路だけが通る | ドメインオブジェクト層 |
+| トランザクションスクリプト | Transaction Script | 手続きを 1 本の関数で書く | usecase が長くなったときの退化形として対比に使う | 手続き型 |
+| サービスレイヤ | Service Layer | アプリケーションの操作の入口を定義する層 | `usecase`。業務の手順を持ち、バージョンを持たない | サービス層 |
+| アクティブレコード | Active Record | 行に対応するオブジェクトが自分で DB を読み書きする | Yii 1.x / Rails の ORM の型。habakiri の解析対象 | ActiveRecord（クラス名として書くとき以外） |
+| データマッパー | Data Mapper | オブジェクトと DB の対応を別の層が担う | sqlc の生成コード + `repository` | ORM（一般語なので限定して使う） |
+| リポジトリ | Repository | コレクションのようにオブジェクトを出し入れする口 | `repository`。Atomic な書き込み | DAO（別のパターン） |
+| ユニットオブワーク | Unit of Work | 1 業務の変更をまとめて 1 トランザクションで確定する | `Atomic.Do`。outbox への追記も同じトランザクション | 作業単位 |
+| アイデンティティマップ | Identity Map | 同じ行を 1 トランザクション内で 1 つのオブジェクトに保つ | 使っていない。対比でのみ | |
+| レイジーロード | Lazy Load | 必要になるまで読み込みを遅らせる | ORM の挙動として言及するとき | 遅延読み込み（併記は可） |
+| 楽観的オフラインロック | Optimistic Offline Lock | バージョン番号で競合を検出する | 冪等キーと組み合わせる場面で | 楽観ロック（併記は可） |
+| 悲観的オフラインロック | Pessimistic Offline Lock | 先にロックを取って競合を防ぐ | DDL のロック待ち（1205）の対比で | 悲観ロック（併記は可） |
+| ゲートウェイ | Gateway | 外部システムへのアクセスを 1 つのオブジェクトに包む | `gearlink`（他サービスの client）、`blobstore` | ラッパー |
+| リモートファサード | Remote Facade | 粗い粒度のリモート呼び出し口 | internal リスナーの API | |
+| データトランスファーオブジェクト | Data Transfer Object（DTO） | 呼び出しの間でデータを運ぶだけのオブジェクト | huma の入出力型。「DTO」と略してよい | 転送オブジェクト |
+| セパレートインタフェース | Separated Interface | インタフェースと実装を別のパッケージに置く | 差し込み口（`consistency.Bus`、`blobstore`、`flagsource`）。core は口だけを持つ | 差し込み口（独自語なので初出で対応を書く） |
+| プラグイン | Plugin | 実装を設定で差し替える | `eventbus/snssqs` のような実装モジュール | |
+| レジストリ | Registry | よく使うオブジェクトを探すための既知の場所 | 使っていない。グローバルの TracerProvider は後勝ちになるので明示渡しにした | |
+| バリューオブジェクト | Value Object | 同一性でなく値で比べる小さなオブジェクト | DDD の値オブジェクトと同じ | 値型 |
+| スペシャルケース | Special Case | null の代わりに特別な振る舞いを持つオブジェクトを返す | no-op の Tracer | ヌルオブジェクト（併記は可） |
+| フロントコントローラ | Front Controller | 全リクエストを 1 か所で受けて振り分ける | `core/httpapi` のルータと基盤ミドルウェア | |
+
+### DDD — Evans『エリック・エヴァンスのドメイン駆動設計』
+
+Eric Evans, *Domain-Driven Design*（Addison-Wesley, 2003）。邦訳は翔泳社（2011）。
+
+| 標準の語（定訳） | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| エンティティ | Entity | 同一性で識別されるオブジェクト | `domain` の型 | |
+| 値オブジェクト | Value Object | 値で比べるオブジェクト | PoEAA のバリューオブジェクトと同じ。表記は「値オブジェクト」 | |
+| 集約 | Aggregate | 1 つのトランザクションで整合を保つ境界 | Atomic の範囲。FK グラフから集約の境界を推定する話は habakiri | アグリゲート |
+| リポジトリ | Repository | 集約の出し入れ口 | PoEAA と同じ | |
+| ドメインサービス | Domain Service | エンティティに属さない業務の操作 | | |
+| 境界づけられたコンテキスト | Bounded Context | モデルが一貫して通用する範囲 | サービス（photo / gear）の単位 | 境界コンテキスト、バウンデッドコンテキスト |
+| ユビキタス言語 | Ubiquitous Language | チームとコードで同じ語を使うこと | この用語表の目的 | 共通言語 |
+| コンテキストマップ | Context Map | コンテキスト間の関係の図 | C4 の Context 図に相当する部分 | |
+| 共有カーネル | Shared Kernel | 複数のコンテキストが共有するモデル | hub として割らないテーブル群 | 共通部品 |
+| 腐敗防止層 | Anti-Corruption Layer | 他コンテキストのモデルを変換して受ける層 | `replicaview`（他サービス由来の表示用データ） | ACL |
+| 公開ホストサービス | Open Host Service | 他コンテキスト向けに公開する一連のサービス | internal API | |
+| 公表された言語 | Published Language | コンテキスト間でやり取りする共通の形式 | OpenAPI、イベントの envelope | |
+
+### EIP — Hohpe & Woolf『Enterprise Integration Patterns』
+
+Gregor Hohpe, Bobby Woolf, *Enterprise Integration Patterns*（Addison-Wesley, 2003）。
+パターン名は英語のまま使う（邦訳の表記が定着していない）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| Publish-Subscribe Channel | 同 | 1 つのメッセージを複数の受け手へ | SNS トピック → 受け手ごとの SQS キュー | pub/sub（略記は可） |
+| Point-to-Point Channel | 同 | 1 つのメッセージを 1 つの受け手へ | SQS キュー | |
+| Guaranteed Delivery | 同 | 送り手が落ちてもメッセージを失わない | outbox（DB に永続化してから送る） | 到達保証 |
+| Transactional Client | 同 | メッセージの送受信をトランザクションに含める | outbox への追記を業務のトランザクションに含める | |
+| Idempotent Receiver | 同 | 同じメッセージを 2 回受けても結果が 1 回分 | inbox による重複排除 | 冪等な受信者 |
+| Competing Consumers | 同 | 複数の受け手が 1 つのキューを分担する | SQS の consumer を複数にしたとき | |
+| Polling Consumer | 同 | 受け手が能動的に取りに行く | gear の consumer | ポーリング |
+| Correlation Identifier | 同 | 要求と応答・ログを結ぶ ID | `trace_id`（W3C Trace Context） | 相関 ID（併記は可） |
+| Dead Letter Channel | 同 | 処理できないメッセージの退避先 | SQS の dead-letter queue | デッドレター（併記は可） |
+| Message Translator | 同 | 形式を変換する | 腐敗防止層の実装手段 | |
+
+### Release It! — Nygard
+
+Michael T. Nygard, *Release It!*（Pragmatic Bookshelf, 2007、第 2 版 2018）。邦訳はオーム社（2009）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| サーキットブレーカー | Circuit Breaker | 失敗が続く呼び先への呼び出しを遮断する | 可観測性の表と同じ | 遮断器 |
+| バルクヘッド | Bulkhead | 障害を区画に閉じ込める | DB 接続プールのサービス分離 | 隔壁 |
+| タイムアウト | Timeouts | 待ち続けない | タイムアウトヒエラルキー、デッドライン伝播 | |
+| フェイルファスト | Fail Fast | 続行できないならすぐ失敗する | 通らない DDL をエラーで返す | 早期失敗 |
+| 定常状態 | Steady State | 人手なしで動き続けられる状態 | 回収ジョブ、ログの保持期間 | |
+| ハンドシェイク | Handshaking | 受け付けられるかを先に確かめる | readiness | |
+
+### 継続的デリバリー — Humble & Farley
+
+Jez Humble, David Farley, *Continuous Delivery*（Addison-Wesley, 2010）。邦訳は
+アスキー・メディアワークス（2012）。Blue/Green とカナリアの出典はここである。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| デプロイメントパイプライン | deployment pipeline | コミットから本番までの自動化された段 | CI → image-release → deploy.yml | ビルドパイプライン |
+| コミットステージ | commit stage | コミットごとに走る最初の検査 | `mise run check` と CI | |
+| Blue/Green デプロイ | blue-green deployment | 新旧 2 系統を並走させて切り替える | デリバリーの表と同じ | |
+| カナリアリリース | canary releasing | 一部のユーザーにだけ新版を出す | デリバリーの表のカナリア | |
+| 構成管理 | configuration management | 環境と設定をコードで管理する | compose、Terraform、realm-as-code | |
+
+### ヘキサゴナル / クリーンアーキテクチャ
+
+Alistair Cockburn, *Hexagonal Architecture*（2005）。Robert C. Martin, *Clean Architecture*
+（Prentice Hall, 2017。邦訳はアスキードワンゴ、2018）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| ポートとアダプタ | Ports and Adapters | 中心のロジックを口（ポート）で囲み、外側の実装（アダプタ）を差し替える | handler は HTTP のアダプタ。v1 / v2 は同じ usecase への別アダプタ | ヘキサゴナル（通称。初出で併記） |
+| ユースケース | Use Case | アプリケーション固有の業務の手順 | `usecase` パッケージ | アプリケーションサービス（DDD の語。同じものを指すときは usecase に寄せる） |
+| 依存の向き | dependency rule | 内側は外側を知らない | core は差し込み口だけを持ち、実装は外のモジュール | |
+
+### XP と TDD — Beck『エクストリームプログラミング』『テスト駆動開発』、Fowler『リファクタリング』
+
+Kent Beck, *Extreme Programming Explained*（Addison-Wesley, 1999 / 2nd ed. 2004。邦訳はオーム社, 2015）、
+*Test-Driven Development: By Example*（2002。邦訳『テスト駆動開発』オーム社, 2017）。
+Martin Fowler, *Refactoring*（1999 / 2nd ed. 2018。邦訳『リファクタリング』オーム社, 2019）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| 継続的インテグレーション | continuous integration（CI） | 変更を頻繁に統合し、毎回自動で検査する | CI は略語として使う。「CI が止める」 | 継続的統合 |
+| テスト駆動開発 | test-driven development（TDD） | 失敗するテストを先に書き、通してから整理する | 「red / green / refactor」は英語のまま | テストファースト（手順の一部） |
+| リファクタリング | refactoring | 振る舞いを変えずに構造を変える | 「用語を直す」はリファクタリングではない | リファクタ |
+| コードの臭い | code smell | 構造に問題がある兆候 | | コードスメル（併記は可） |
+| ペアプログラミング | pair programming | 2 人で 1 つのコードを書く | | ペアプロ（会話のみ） |
+| 小さなリリース | small releases | 小さく頻繁に出す | デプロイ分離・プログレッシブデリバリーの背景 | |
+| シンプルな設計 | simple design | 今必要なものだけを作る | | |
+| YAGNI | You Aren't Gonna Need It | 必要になるまで作らない | 英語のまま。「使われない公開 API を先に生やさない」 | |
+| 共同所有 | collective ownership | コードは誰でも直してよい | | 共同所有権 |
+| 持続可能なペース | sustainable pace | 残業に頼らない速さで続ける | | |
+| 10 分ビルド | ten-minute build | ビルドと検査を 10 分以内に | affected で変更モジュールだけ検査する動機 | |
+
+### Google のソフトウェアエンジニアリング — Winters, Manshreck, Wright
+
+Titus Winters, Tom Manshreck, Hyrum Wright (eds.), *Software Engineering at Google*
+（O'Reilly, 2020）。邦訳『Googleのソフトウェアエンジニアリング』（オライリー・ジャパン, 2021）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| ハイラムの法則 | Hyrum's Law | 利用者が十分いれば、契約に書いていない振る舞いにも依存される | API の破壊的変更の検査を機械にする理由 | |
+| トランクベース開発 | trunk-based development | 長命なブランチを作らず main に小さく入れる | PR は短命、main へ squash | |
+| モノレポ | monorepo | 1 つのリポジトリで複数のシステムを持つ | 構造の表と同じ | |
+| 大規模変更 | large-scale change（LSC） | リポジトリ全体に及ぶ機械的な変更 | 用語の一括修正、依存の一括更新 | |
+| フレーキーテスト | flaky test | 同じコードで成功と失敗が揺れるテスト | 差分運用で「揺れる検査」を扱う話 | 不安定なテスト（併記は可） |
+| テストサイズ | test sizes（small / medium / large） | 使う資源で分類する。DB を使うテストは medium 以上 | 「DB 系のテストは mysql 到達時のみ」 | 単体 / 統合（分類軸が違う） |
+| 廃止 | deprecation | 古いものを計画的に止める | API の旧版は `deprecated` を 1 リリース挟む | 非推奨（状態の語としては可） |
+| 左シフト | shift left | 問題の検出をプロセスの早い段階へ寄せる | 手元の `mise run check` を CI と同じにする | シフトレフト（併記は可） |
+| 可読性 | readability | コードが読めることを組織で保証する仕組み | | |
+| 時間で積分したプログラミング | programming integrated over time | ソフトウェアエンジニアリングの定義。寿命を考える | 適応度関数が要る理由 | |
+
+### マイクロサービス — Newman、S. Fowler
+
+Sam Newman, *Building Microservices*（O'Reilly, 2015 / 2nd ed. 2021。邦訳『マイクロサービスアーキテクチャ』オライリー・ジャパン, 2016 / 2022）、
+*Monolith to Microservices*（2019。邦訳『モノリスからマイクロサービスへ』2020）。
+Susan J. Fowler, *Production-Ready Microservices*（O'Reilly, 2016。邦訳『プロダクションレディマイクロサービス』2017）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| 情報隠蔽 | information hiding | 境界の内側を外に見せない | 「サービスは他サービスの内部を知らない」 | カプセル化（オブジェクトの語） |
+| 疎結合、高凝集 | loose coupling / high cohesion | 境界をまたぐ依存を少なく、中は密に | モジュラリティ Q の意味 | |
+| コレオグラフィ / オーケストレーション | choreography / orchestration | イベントで各自が動く / 指揮役が順に呼ぶ | outbox → SNS → SQS はコレオグラフィ | 振り付け |
+| サーガ | saga | 複数サービスにまたがる処理を、補償で整合させる | pending 状態パターン、回収ジョブ | |
+| コンシューマ駆動契約 | consumer-driven contracts | 利用側がテストとして契約を持つ | api:breaking は提供側の契約検査。対比で | |
+| API ゲートウェイ | API gateway | 外部からの入口を 1 つに束ねる | ALB の 3 責務（TLS 終端・振り分け・到達制御） | |
+| ストラングラー | strangler fig | 旧システムを少しずつ置き換える | 構造の表と同じ | |
+| 並行実行 | parallel run | 新旧を同時に動かして結果を比べる | カラム改名の columncheck | |
+| 合成トランザクション | synthetic transaction | 本物に似た操作を流して正しさを測る | promotion gate のフックが流すテスト書き込み | 合成監視（併記は可） |
+| プロダクションレディ | production-ready | 安定性・信頼性・スケーラビリティ・耐障害性・大惨事対応・性能・監視・ドキュメントの基準を満たす | 守りの既定値の検査、Runbook、アラート | 本番対応 |
+| 耐障害性 | fault tolerance | 依存先が落ちても自分は動く | フラグ基盤が死んでも既定値で稼働 | フォールトトレランス（併記は可） |
+| 大惨事対応 | catastrophe-preparedness | 障害を起こしてみて備える | Multi-AZ フェイルオーバーとリストアの実測 | |
+| Runbook | runbook | アラートごとの対処手順 | `docs/runbooks/`。英語のまま | 手順書（一般語） |
+
+### ソフトウェアアーキテクチャの基礎 / ハードパーツ — Richards, Ford ほか
+
+Mark Richards, Neal Ford, *Fundamentals of Software Architecture*（O'Reilly, 2020。邦訳『ソフトウェアアーキテクチャの基礎』オライリー・ジャパン, 2022）。
+Neal Ford, Mark Richards, Pramod Sadalage, Zhamak Dehghani, *Software Architecture: The Hard Parts*
+（O'Reilly, 2021。邦訳『ソフトウェアアーキテクチャ・ハードパーツ』2022）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| アーキテクチャ特性 | architecture characteristics | 機能以外に満たすべき性質 | 適応度関数が測る対象 | 非機能要件（併記は可） |
+| トレードオフ | trade-off | 何かを取れば何かを失う | 「すべてはトレードオフ」。ADR の「却下した代替」 | 妥協 |
+| ADR | architecture decision record | 判断と根拠と却下した案を記録する | `docs/adr/` | 設計判断記録（併記は可） |
+| コナーセンス | connascence | 片方を変えるともう片方も変えなければならない関係 | 結合の強さの語彙。静的 / 動的 | |
+| アーキテクチャ量子 | architectural quantum | 独立してデプロイでき、高凝集で、静的・動的に結合した単位 | 進化的アーキテクチャの表と同じ | |
+| 静的結合 / 動的結合 | static / dynamic quantum coupling | 依存で結ばれる / 実行時の通信で結ばれる | 同期の内部 API は動的結合。契約・一貫性・通信の 3 軸 | |
+| 分解 | decomposition | モノリスを部品に分ける | コンポーネントベース分解と戦術的フォーク | 分割（粒度の語と混ざる） |
+| 戦術的フォーク | tactical forking | 全体を複製して不要な部分を削る分解法 | 境界の引き直しドリルの対比 | |
+| データの所有権 | data ownership | どのサービスがどのテーブルに書くか | `lint:queries`、DB をまたぐ FK の禁止 | |
+| データ分解の駆動要因 | data disintegrators / integrators | 分ける理由と、まとめる理由 | FK グラフから分割を出す話の背景 | |
+| 契約（厳格 / 緩い） | strict / loose contracts | スキーマで固く結ぶか、名前だけで緩く結ぶか | OpenAPI は厳格、イベントの envelope は緩い | |
+
+### Accelerate『LeanとDevOpsの科学』— Forsgren, Humble, Kim
+
+Nicole Forsgren, Jez Humble, Gene Kim, *Accelerate*（IT Revolution, 2018）。邦訳『LeanとDevOpsの科学』（インプレス, 2018）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| 4 つの指標 | four key metrics | デプロイ頻度・変更のリードタイム・変更失敗率・復旧時間 | デプロイ分離が効く先 | DORA 指標（併記は可） |
+| デプロイ頻度 | deployment frequency | 本番へ出す回数 | | |
+| 変更のリードタイム | lead time for changes | コミットから本番までの時間 | affected CI 20 秒、独立ロールバック 32 秒 | |
+| 変更失敗率 | change failure rate | 本番で障害になった変更の割合 | promotion gate が下げる | |
+| 復旧時間 | time to restore service | 障害から戻るまでの時間 | stopDeployment 32 秒、フラグ 14 秒 | MTTR（併記は可） |
+
+### チームトポロジー — Skelton, Pais
+
+Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦訳『チームトポロジー』（日本能率協会マネジメントセンター, 2021）。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| ストリームアラインドチーム | stream-aligned team | 価値の流れに沿って担当するチーム | サービス単位のチーム | 機能チーム |
+| プラットフォームチーム | platform team | 他チームの認知負荷を下げる基盤を提供する | `platform/`（authz）、Keycloak の運用 | 共通基盤チーム |
+| イネイブリングチーム | enabling team | 他チームが能力を得るのを助ける | | |
+| 認知負荷 | cognitive load | チームが抱えられる複雑さの量 | サービスの粒度を決める基準 | |
+| チーム API | team API | チームが外に約束する接点 | internal API と Runbook | |
+
 ## 使わない言い換えの一覧
 
 これまでに記事で使い、直したもの。grep で当てる対象でもある。
@@ -170,5 +381,17 @@ description: "技術文書で使う用語の標準表。デリバリー・DB マ
 - Martin Fowler, [CircuitBreaker](https://martinfowler.com/bliki/CircuitBreaker.html)、[StranglerFigApplication](https://martinfowler.com/bliki/StranglerFigApplication.html)
 - Martin Kleppmann, *Designing Data-Intensive Applications*（O'Reilly, 2017）。配送の保証（at-least-once / exactly-once）と整合性の語
 - [Kubernetes: Liveness, Readiness, and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
-- Eric Evans, *Domain-Driven Design*（2003）。共有カーネル、腐敗防止層
+- Martin Fowler, *Patterns of Enterprise Application Architecture*（Addison-Wesley, 2002）。邦訳『エンタープライズアプリケーションアーキテクチャパターン』（翔泳社, 2005）。パターンの一覧は [martinfowler.com/eaaCatalog](https://martinfowler.com/eaaCatalog/)
+- Eric Evans, *Domain-Driven Design*（Addison-Wesley, 2003）。邦訳『エリック・エヴァンスのドメイン駆動設計』（翔泳社, 2011）
+- Gregor Hohpe, Bobby Woolf, *Enterprise Integration Patterns*（Addison-Wesley, 2003）。パターンの一覧は [enterpriseintegrationpatterns.com](https://www.enterpriseintegrationpatterns.com/patterns/messaging/)
+- Michael T. Nygard, *Release It!*（Pragmatic Bookshelf, 2007 / 2nd ed. 2018）。邦訳（オーム社, 2009）
+- Jez Humble, David Farley, *Continuous Delivery*（Addison-Wesley, 2010）。邦訳『継続的デリバリー』（アスキー・メディアワークス, 2012）
+- Alistair Cockburn, [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)（2005）
+- Robert C. Martin, *Clean Architecture*（Prentice Hall, 2017）。邦訳（アスキードワンゴ, 2018）
+- Kent Beck, *Extreme Programming Explained*（1999 / 2004）、*Test-Driven Development: By Example*（2002）。Martin Fowler, *Refactoring*（1999 / 2018）
+- Titus Winters, Tom Manshreck, Hyrum Wright (eds.), *Software Engineering at Google*（O'Reilly, 2020）。[オンライン版](https://abseil.io/resources/swe-book)
+- Sam Newman, *Building Microservices*（O'Reilly, 2015 / 2021）、*Monolith to Microservices*（2019）。Susan J. Fowler, *Production-Ready Microservices*（O'Reilly, 2016）
+- Mark Richards, Neal Ford, *Fundamentals of Software Architecture*（O'Reilly, 2020）。Neal Ford ほか, *Software Architecture: The Hard Parts*（O'Reilly, 2021）
+- Nicole Forsgren, Jez Humble, Gene Kim, *Accelerate*（IT Revolution, 2018）
+- Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）
 - greenfield の文書（`docs/conventions/`、ADR）。昇格シグナルなど固有語の定義元
