@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、リファクタリング、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -309,18 +309,49 @@ Alistair Cockburn, *Hexagonal Architecture*（2005）。Robert C. Martin, *Clean
 | 多層防御 | defense in depth | 軍事用語から。NSA の文書（2000 年代）で定式化 | 1 つの防御に頼らない | ネットワーク・認証・認可・DB の GRANT を重ねる |
 | ゼロトラスト | zero trust | John Kindervag, Forrester（2010） | ネットワークの位置を信用しない | 「到達制御の実効性はネットワーク層でなく GRANT・scope・JWT 検証に置く」 |
 
-### XP と TDD — Beck『エクストリームプログラミング』『テスト駆動開発』、Fowler『リファクタリング』
+### リファクタリング — Fowler『リファクタリング』
+
+Martin Fowler, *Refactoring: Improving the Design of Existing Code*（Addison-Wesley, 1999 / 2nd ed. 2018）。
+邦訳『リファクタリング（第 2 版）』（オーム社, 2019）。臭いとリファクタリングの名前は第 2 版の邦訳に従う。
+
+| 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
+|---|---|---|---|---|
+| リファクタリング | refactoring | 外から見た振る舞いを変えずに内部構造を変える。小さな手順の名前付きカタログ | 「用語を直す」「ファイルを移す」はリファクタリングではない | リファクタ、作り直し |
+| 2 つの帽子 | two hats | 機能追加とリファクタリングを同時にやらない | PR を「振る舞いの変更」と「構造の変更」で分ける | |
+| 準備のためのリファクタリング | preparatory refactoring | 変更を楽にするために先に構造を直す | expand の前の整理 | |
+| 機会的リファクタリング | opportunistic refactoring | 触ったついでに少し良くする | ボーイスカウトルールと同じ | |
+| コードの臭い | code smell | 構造に問題がある兆候。語は Kent Beck | 臭いの名前は下の行の表記で | コードスメル（併記は可） |
+| 重複したコード | Duplicated Code | 同じ知識が複数の場所にある | DRY と対で読む | 重複コード |
+| 長い関数 | Long Function | 1 つの関数が長すぎる | 第 1 版は「長いメソッド」 | |
+| 変更の偏り | Divergent Change | 1 つのモジュールが別々の理由で何度も変わる | 単一責任の原則の裏返し | 発散的変更 |
+| 変更の分散 | Shotgun Surgery | 1 つの変更のために多くのモジュールを触る | 境界の引き直しドリルで数えた「34 ファイル・230 箇所」はこの臭い | 散弾銃手術 |
+| 特性の横恋慕 | Feature Envy | 他のオブジェクトのデータばかり使う | ドメインモデルに振る舞いを置く理由 | 属性の横恋慕 |
+| データの群れ | Data Clumps | いつも一緒に現れるデータの組 | パラメータオブジェクトの導入へ | |
+| 基本データ型への執着 | Primitive Obsession | ID や金額を文字列や数値のまま持つ | 値オブジェクトへ | プリミティブ型への執着 |
+| 疑わしき一般化 | Speculative Generality | いつか使うための仕組み | YAGNI と対で読む。「使われない公開 API を先に生やさない」 | |
+| メッセージの連鎖 | Message Chains | `a.b().c().d()` | デメテルの法則と対で読む | |
+| 仲介人 | Middle Man | 委譲するだけのクラス | | |
+| 内部的相互依存 | Insider Trading | モジュールどうしが内部をやり取りしすぎる | 境界を越える import を lint で止める | 不適切な関係（第 1 版） |
+| データクラス | Data Class | データだけで振る舞いが無いクラス | DTO は意図的なデータクラス | |
+| 関数の抽出 | Extract Function | 関数の一部を名前付きの関数にする | 第 1 版は「メソッドの抽出」 | |
+| 関数のインライン化 | Inline Function | 抽出の逆 | | |
+| 変数名の変更 | Rename Variable | 名前を意図に合わせる | 用語表に合わせる改名はこれ | |
+| 関数の移動 | Move Function | 関数を使う側に近いモジュールへ移す | | |
+| クラスの抽出 | Extract Class | 責務ごとにクラスを分ける | | |
+| パラメータオブジェクトの導入 | Introduce Parameter Object | データの群れを 1 つの型にする | | |
+| 条件記述のポリモーフィズムによる置き換え | Replace Conditional with Polymorphism | 型による分岐を多相で置き換える | | |
+| 抽象によるブランチ | Branch By Abstraction | 差し替えたいものの前に抽象を置き、新旧を並走させて切り替える | Paul Hammant（2007）、Fowler の bliki（2014）。expand/contract と同じ構造を コードで行う。長命なブランチを作らない | 抽象化ブランチ |
+| 技術的負債 | technical debt | 今の近道が将来の利子になる | Ward Cunningham（1992）。Fowler は「負債の象限」（2009）で意図的 / 無謀の軸を足した | 技術的借金 |
+
+### XP と TDD — Beck『エクストリームプログラミング』『テスト駆動開発』
 
 Kent Beck, *Extreme Programming Explained*（Addison-Wesley, 1999 / 2nd ed. 2004。邦訳はオーム社, 2015）、
 *Test-Driven Development: By Example*（2002。邦訳『テスト駆動開発』オーム社, 2017）。
-Martin Fowler, *Refactoring*（1999 / 2nd ed. 2018。邦訳『リファクタリング』オーム社, 2019）。
 
 | 標準の語 | 原語 | 意味 | この文書群での対応 | 使わない |
 |---|---|---|---|---|
 | 継続的インテグレーション | continuous integration（CI） | 変更を頻繁に統合し、毎回自動で検査する | CI は略語として使う。「CI が止める」 | 継続的統合 |
 | テスト駆動開発 | test-driven development（TDD） | 失敗するテストを先に書き、通してから整理する | 「red / green / refactor」は英語のまま | テストファースト（手順の一部） |
-| リファクタリング | refactoring | 振る舞いを変えずに構造を変える | 「用語を直す」はリファクタリングではない | リファクタ |
-| コードの臭い | code smell | 構造に問題がある兆候 | | コードスメル（併記は可） |
 | ペアプログラミング | pair programming | 2 人で 1 つのコードを書く | | ペアプロ（会話のみ） |
 | 小さなリリース | small releases | 小さく頻繁に出す | デプロイ分離・プログレッシブデリバリーの背景 | |
 | シンプルな設計 | simple design | 今必要なものだけを作る | | |
@@ -459,7 +490,8 @@ Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦�
 - Robert C. Martin, "The Dependency Inversion Principle"（1996）、*Agile Software Development: Principles, Patterns, and Practices*（2003）。Martin Fowler, [Inversion of Control Containers and the Dependency Injection pattern](https://martinfowler.com/articles/injection.html)（2004）。Mark Seemann, *Dependency Injection in .NET*（2011）
 - Hunt & Thomas, *The Pragmatic Programmer*（1999）。Lieberherr, Holland, Riel, "Object-Oriented Programming: An Objective Sense of Style"（1988）
 - Saltzer & Schroeder, "The Protection of Information in Computer Systems"（1975）。John Kindervag, "No More Chewy Centers"（Forrester, 2010）
-- Kent Beck, *Extreme Programming Explained*（1999 / 2004）、*Test-Driven Development: By Example*（2002）。Martin Fowler, *Refactoring*（1999 / 2018）
+- Martin Fowler, *Refactoring*（Addison-Wesley, 1999 / 2nd ed. 2018）。邦訳『リファクタリング（第 2 版）』（オーム社, 2019）。カタログは [refactoring.com/catalog](https://refactoring.com/catalog/)。[BranchByAbstraction](https://martinfowler.com/bliki/BranchByAbstraction.html)、[TechnicalDebtQuadrant](https://martinfowler.com/bliki/TechnicalDebtQuadrant.html)。Ward Cunningham, "The WyCash Portfolio Management System"（OOPSLA 1992）
+- Kent Beck, *Extreme Programming Explained*（1999 / 2004）、*Test-Driven Development: By Example*（2002）
 - Titus Winters, Tom Manshreck, Hyrum Wright (eds.), *Software Engineering at Google*（O'Reilly, 2020）。[オンライン版](https://abseil.io/resources/swe-book)
 - Sam Newman, *Building Microservices*（O'Reilly, 2015 / 2021）、*Monolith to Microservices*（2019）。Susan J. Fowler, *Production-Ready Microservices*（O'Reilly, 2016）
 - Mark Richards, Neal Ford, *Fundamentals of Software Architecture*（O'Reilly, 2020）。Neal Ford ほか, *Software Architecture: The Hard Parts*（O'Reilly, 2021）
