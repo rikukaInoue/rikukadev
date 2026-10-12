@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、リファクタリング、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携、基礎理論（情報理論・データベース理論・グラフ理論と統計）と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、リファクタリング、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -139,6 +139,75 @@ description: "技術文書で使う用語の標準表。デリバリー・DB マ
 | 冪等キー | idempotency key | 同じ操作の試行を同一と見なす鍵 | `Idempotency-Key` はコード体 | 重複防止キー |
 | 結果整合性 | eventual consistency | 時間がたてば整合する | 定訳 | 最終的整合性 |
 | 配送 | delivery（メッセージ） | バスがメッセージを届けること | SNS → SQS の文脈 | 配信（放送の語感） |
+
+## 基礎理論の語
+
+設計の語の下にある理論の語。原典の著者と年を添える。
+
+### 情報理論と符号
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| 情報量、ビット | information / bit | Claude Shannon, "A Mathematical Theory of Communication"（1948）。bit の語は John Tukey | 不確かさの減り方を測る単位 | |
+| エントロピー | entropy | Shannon（1948） | 情報源の不確かさの平均 | 比喩として「コードのエントロピー」とは書かない。使うなら乱数の品質など本来の意味で |
+| 冗長性 | redundancy | Shannon（1948） | 伝えたい量より多く送る分。誤りの検出と訂正に使う | 冗長構成（Multi-AZ）とは別の語。文脈で区別する |
+| 信号と雑音、SN 比 | signal / noise、signal-to-noise ratio | 通信工学。Shannon–Hartley の定理（1948） | 本物の信号と、それを隠す揺れ | アラートの「ノイズ」、差分運用で「揺れる検査を飼う」はこの比喩。使うときは何が信号かを書く |
+| 誤り検出、誤り訂正 | error detection / correction | Richard Hamming, "Error Detecting and Error Correcting Codes"（1950） | 受け取った側で壊れを見つける / 直す | チェックサム、CRC |
+| チェックサム、CRC | checksum / cyclic redundancy check | CRC は W. Wesley Peterson（1961） | データの壊れを検出する短い値 | 転送や保存の検証 |
+| ハッシュ、ダイジェスト | hash / digest | 暗号学的ハッシュは Merkle–Damgård 構成（1979）。SHA-2 は NIST FIPS 180-2（2001） | 任意長の入力から固定長の値を作る。暗号学的ハッシュは衝突を見つけにくい | イメージの digest、cosign の署名対象、秘密の比較はハッシュで |
+| 圧縮（可逆 / 非可逆） | lossless / lossy compression | Huffman 符号（1952）、Lempel–Ziv（1977 / 1978） | 元に戻せる圧縮 / 戻せない圧縮 | ログの保管、画像 |
+| 符号化 | encoding | — | 情報を別の表現にする（圧縮も暗号化も含む広い語） | base64 は符号化であって暗号化ではない。混同しない |
+| 乱数、疑似乱数 | random / pseudorandom | — | 真の乱数 / 決定的に生成した乱数列 | trace_id、冪等キーには暗号学的に安全な乱数を使う |
+
+### データベース理論
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| 関係モデル | relational model | Edgar F. Codd, "A Relational Model of Data for Large Shared Data Banks"（1970） | データを関係（表）で表し、関係代数で操作する | リレーショナルモデルと併記は可 |
+| 関係代数 | relational algebra | Codd（1970） | 選択・射影・結合などの演算 | SQL の背後にある語 |
+| SQL | Structured Query Language | Chamberlin & Boyce（1974）。ISO/IEC 9075 | 関係データベースの問い合わせ言語 | |
+| 正規化、正規形 | normalization / normal forms | Codd（1971–74）。BCNF は Boyce & Codd（1974） | 更新時の矛盾を防ぐために関数従属に沿って表を分ける | 第 3 正規形、ボイス・コッド正規形 |
+| 関数従属 | functional dependency | Codd（1971） | ある属性が決まれば別の属性が決まる | 正規化の判定基準 |
+| 非正規化 | denormalization | — | 読みの速さのために意図的に冗長を持つ | readmodel、replicaview |
+| 候補キー、主キー、外部キー | candidate / primary / foreign key | Codd（1970） | 行を一意に決める属性の組 / 選んだもの / 他の表の主キーへの参照 | 外部キーのグラフが habakiri の入力 |
+| 参照整合性 | referential integrity | Codd（1970）。SQL の制約として SQL-89 | 外部キーの先が必ず存在する | DB をまたぐ外部キーを禁じる話。CASCADE はライフサイクル一体の印 |
+| 結合 | join | Codd（1970） | 複数の表を条件で組み合わせる | 内部 / 外部 / 自己結合 |
+| トランザクション、ACID | transaction / ACID | Gray（1981）、Haerder & Reuter（1983） | 古典の表と同じ | |
+| 直列化可能性 | serializability | Eswaran, Gray, Lorie, Traiger（1976）。Papadimitriou（1979） | 並行実行の結果が、何らかの直列実行と同じになる | 分離レベルの最上位 |
+| 分離レベル | isolation levels | ANSI SQL-92。批判は Berenson ほか, "A Critique of ANSI SQL Isolation Levels"（1995） | READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SERIALIZABLE | 異常の語: ダーティリード、ノンリピータブルリード、ファントムリード |
+| 2 相ロック | two-phase locking（2PL） | Eswaran ほか（1976） | ロックを取る段階と放す段階を分けて直列化可能性を保証する | 2 相コミット（2PC）とは別の語 |
+| MVCC | multiversion concurrency control | David Reed（1978）。Bernstein & Goodman（1981） | 行の複数の版を持ち、読みがロックを待たない | InnoDB の読み。「読みがロック待ち行列に並ばない」 |
+| スナップショット分離 | snapshot isolation | Berenson ほか（1995） | トランザクション開始時点の版を読む | |
+| ロック待ち、デッドロック | lock wait / deadlock | — | 他のトランザクションのロックを待つ / 互いに待ち合う | MySQL の 1205 はロック待ちのタイムアウト、1213 がデッドロック。区別する |
+| WAL | write-ahead logging | Gray（1978）。ARIES は Mohan ほか（1992） | 変更を先にログへ書き、障害後に復元する | 永続性の実装。レプリケーションもこれを使う |
+| B ツリー、B+ ツリー | B-tree / B+ tree | Bayer & McCreight（1972） | ディスク向きの平衡木。RDB のインデックスの標準 | インデックスの追加は `ALGORITHM=INPLACE` |
+| LSM ツリー | log-structured merge-tree | O'Neil, Cheng, Gawlick, O'Neil（1996） | 追記して後でまとめる。書き込み重視のストア | RDB との対比でのみ |
+| インデックス | index | — | 検索を速くするための補助構造 | 索引と書かない |
+| レプリケーション | replication | — | 同じデータを複数のノードに持つ | プライマリ / レプリカ。マスター / スレーブとは書かない |
+| 読み取りレプリカ | read replica | — | 読みだけを受けるレプリカ | ReplicaView の語源 |
+| パーティショニング、シャーディング | partitioning / sharding | — | 1 つの表を範囲やハッシュで分ける / 複数のノードに分ける | DB をサービスごとに分けるのはどちらでもない。「分離」と書く |
+| マテリアライズドビュー | materialized view | — | 問い合わせの結果を表として保存する | readmodel の一形態 |
+| オンライン DDL | online DDL | MySQL 5.6（2013）以降の機能名 | 読み書きを止めずにスキーマを変える | DB マイグレーションの表と同じ |
+| CQRS | Command Query Responsibility Segregation | Greg Young（2010） | 書きと読みのモデルを分ける | CQS（Meyer）はメソッドの原則、CQRS はアーキテクチャ。greenfield は CQS |
+| イベントソーシング | event sourcing | Martin Fowler, bliki（2005） | 状態でなく出来事の列を保存する | 複式簿記からの説明は別の記事 |
+| 冪等 | idempotent | Benjamin Peirce（1870、代数学） | 何度適用しても結果が同じ | 冪等キー、Idempotent Receiver |
+
+### グラフ理論と統計（構造の分析で使うもの）
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| グラフ、頂点、辺 | graph / vertex / edge | Euler（1736）に始まる | 点と、点をつなぐ線 | テーブルを頂点、外部キーを辺にする |
+| 次数 | degree | — | 頂点につながる辺の数 | hub の判定（次数の閾値） |
+| 連結成分 | connected component | — | 互いに辿れる頂点の集まり | 孤立テーブル = 大きさ 1 の成分 |
+| 橋、2-辺連結成分 | bridge / 2-edge-connected component | Tarjan（1974） | 取ると分断される辺 / 橋を含まない塊 | 切断点、ブロック |
+| 媒介中心性 | betweenness centrality | Linton Freeman（1977） | 最短経路がどれだけその辺（頂点）を通るか | Girvan–Newman の判定基準 |
+| コミュニティ検出 | community detection | — | 内側が密で外とは疎な部分集合を見つける | 分割案 |
+| Girvan–Newman 法 | Girvan–Newman algorithm | Girvan & Newman（2002） | 媒介中心性の高い辺から順に取り除く | 決定的なので採用。大規模では遅い |
+| モジュラリティ Q | modularity | Newman & Girvan（2004） | 分割の良さ。偶然より内側の辺がどれだけ多いか | 0.3 以上で構造あり、の目安 |
+| Louvain 法 / Leiden 法 | Louvain / Leiden | Blondel ほか（2008）/ Traag ほか（2019） | モジュラリティを貪欲に最適化する速い手法 | 大規模入力の代替候補 |
+| 調整済みランド指数 | adjusted Rand index（ARI） | Hubert & Arabie（1985） | 2 つの分割の一致度。1 で同じ、0 で偶然と同程度 | Physical × Logical の比較 |
+| 自己相互情報量、NPMI | pointwise mutual information / normalized PMI | Church & Hanks（1990）。正規化は Bouma（2009） | 2 つの出来事が偶然より一緒に起きる度合い | 同一トランザクション共起の重み |
+| 変異テスト | mutation testing | DeMillo, Lipton, Sayward（1978） | コードを少し壊してテストが落ちるかを見る | ゲート自身を壊して確かめる |
 
 ## 古典の書籍の語
 
@@ -481,6 +550,10 @@ Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦�
 - Jez Humble, David Farley, *Continuous Delivery*（Addison-Wesley, 2010）。邦訳『継続的デリバリー』（アスキー・メディアワークス, 2012）
 - Alistair Cockburn, [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)（2005）
 - Robert C. Martin, *Clean Architecture*（Prentice Hall, 2017）。邦訳（アスキードワンゴ, 2018）
+- Claude Shannon, "A Mathematical Theory of Communication"（1948）。Richard Hamming（1950）。David Huffman（1952）。Lempel & Ziv（1977 / 1978）
+- Edgar F. Codd, "A Relational Model of Data for Large Shared Data Banks"（1970）、正規形の論文（1971–74）。Eswaran, Gray, Lorie, Traiger, "The Notions of Consistency and Predicate Locks in a Database System"（1976）。Berenson ほか, "A Critique of ANSI SQL Isolation Levels"（1995）。Bayer & McCreight（1972）。O'Neil ほか, "The Log-Structured Merge-Tree"（1996）。Mohan ほか, "ARIES"（1992）
+- Greg Young, "CQRS Documents"（2010）。Martin Fowler, [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)（2005）
+- Girvan & Newman, "Community structure in social and biological networks"（2002）。Newman & Girvan（2004）。Hubert & Arabie, "Comparing partitions"（1985）。Freeman（1977）。Tarjan（1974）。Church & Hanks（1990）。DeMillo, Lipton, Sayward（1978）
 - Melvin Conway, "How Do Committees Invent?"（1968）。David Parnas, "On the Criteria To Be Used in Decomposing Systems into Modules"（1972）。Yourdon & Constantine, *Structured Design*（1979）。Dijkstra, "On the role of scientific thought"（1974）
 - Frederick Brooks, *The Mythical Man-Month*（1975）、"No Silver Bullet"（1986）。Meir Lehman, "Programs, Life Cycles, and Laws of Software Evolution"（1980）
 - Winston Royce（1970）、Barry Boehm, "A Spiral Model of Software Development and Enhancement"（1986）。Donald Knuth, "Structured Programming with go to Statements"（1974）
