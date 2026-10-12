@@ -2,7 +2,7 @@
 title: "用語の標準表 — 原語・定訳・使わない言い換え"
 date: 2026-10-13
 tags: ["設計", "ドキュメント", "デプロイ", "アーキテクチャ", "運用"]
-description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携、基礎理論（情報理論・データベース理論・グラフ理論と統計）と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、リファクタリング、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
+description: "技術文書で使う用語の標準表。デリバリー・DB マイグレーション・進化的アーキテクチャ・可観測性・認証認可・データ連携、基礎理論（情報理論・データベース理論・グラフ理論と統計・ネットワーク・OS）と、古典の書籍（1960〜90 年代の論文と本、SOLID とその周辺の設計原則、リファクタリング、PoEAA・DDD・EIP・Release It!・継続的デリバリー・ヘキサゴナル・XP/TDD・Google のソフトウェアエンジニアリング・マイクロサービス・ソフトウェアアーキテクチャの基礎とハードパーツ・Accelerate・チームトポロジー）の語について、標準の語・原語・近い語との使い分け・使わない言い換え・出典をまとめる。原語が英語なら英語のまま、定訳があればそれ、列挙では英語に統一し、比喩は作らない。"
 ---
 
 技術文書で使う用語の標準表である。先に規則を書き、グループごとの表を置き、
@@ -208,6 +208,67 @@ description: "技術文書で使う用語の標準表。デリバリー・DB マ
 | 調整済みランド指数 | adjusted Rand index（ARI） | Hubert & Arabie（1985） | 2 つの分割の一致度。1 で同じ、0 で偶然と同程度 | Physical × Logical の比較 |
 | 自己相互情報量、NPMI | pointwise mutual information / normalized PMI | Church & Hanks（1990）。正規化は Bouma（2009） | 2 つの出来事が偶然より一緒に起きる度合い | 同一トランザクション共起の重み |
 | 変異テスト | mutation testing | DeMillo, Lipton, Sayward（1978） | コードを少し壊してテストが落ちるかを見る | ゲート自身を壊して確かめる |
+
+### ネットワークとプロトコル
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| TCP/IP | Transmission Control Protocol / Internet Protocol | Cerf & Kahn（1974）。RFC 791 / 793（1981） | インターネットの基盤。IP が届け、TCP が順序と再送を保証する | |
+| OSI 参照モデル | OSI reference model | ISO 7498（1984） | 7 層のモデル。L4 / L7 の呼び方の由来 | ALB は L7、NLB は L4 |
+| DNS、名前解決 | Domain Name System / name resolution | Paul Mockapetris, RFC 1034 / 1035（1987） | 名前から IP アドレスを引く | issuer の名前を全員が同じ名前で解決できることが要る |
+| スプリットホライズン DNS | split-horizon DNS | — | 同じ名前を、問い合わせ元の場所によって別の宛先に解決する | 本番で Keycloak の issuer を 1 つに固定しつつ VPC 内から到達させる手段 |
+| TTL | time to live | IP ヘッダ（RFC 791）。DNS のキャッシュ期間にも転用 | 生存時間。期限が来たら捨てる | DNS キャッシュ、フラグ定義のキャッシュ |
+| HTTP | Hypertext Transfer Protocol | Berners-Lee（1991）。現行は RFC 9110–9112（2022） | Web の要求と応答 | |
+| HTTP/2、SETTINGS | HTTP/2 | RFC 7540（2015）→ RFC 9113（2022） | 1 接続で多重化する版。SETTINGS フレームは接続の設定交換 | CVE-2026-78669 は SETTINGS の洪水による DoS |
+| TLS、終端 | Transport Layer Security / TLS termination | RFC 8446（TLS 1.3、2018） | 通信の暗号化と相手の認証 / 暗号化を解く場所 | ALB の 3 責務の 1 つ。アプリは TLS を知らない |
+| mTLS | mutual TLS | TLS の仕様内（クライアント証明書） | 双方が証明書で認証する | サービス間認証の代替案。greenfield は M2M トークンを選んだ |
+| リバースプロキシ、ロードバランサ | reverse proxy / load balancer | — | 手前で受けて振り分ける | Caddy（ローカル）、ALB（AWS） |
+| CIDR、サブネット | Classless Inter-Domain Routing / subnet | RFC 1519（1993）→ RFC 4632 | アドレスの範囲の書き方 / 分けた範囲 | VPC の設計 |
+| NAT | network address translation | RFC 1631（1994） | 内側のアドレスを外側に変換する | NAT Gateway を置かない判断（費用） |
+| VPC、セキュリティグループ | virtual private cloud / security group | AWS の語（2009） | 仮想ネットワーク / インスタンス単位のステートフルな到達制御 | 到達制御は SG で行う |
+| Transit Gateway（TGW） | AWS Transit Gateway | AWS（2018） | 複数の VPC とアカウントをハブで接続する | 本番系の接続方式。greenfield は模擬しない |
+| PrivateLink、VPC エンドポイント | AWS PrivateLink / VPC endpoint | AWS（2017） | インターネットを通さずにサービスへ到達する | SNS / SQS をアカウント越えで使うときの選択肢 |
+| ingress / egress | ingress / egress | — | 入ってくる通信 / 出ていく通信 | 英語のまま。「イングレス」と書かない |
+| idle timeout、keep-alive | idle timeout / keep-alive | HTTP/1.1（RFC 2068、1997）で keep-alive が既定 | 無通信で切る時間 / 接続を使い回す | ALB の idle timeout とアプリのタイムアウトヒエラルキー |
+| Cookie、SameSite | HTTP cookie / SameSite | RFC 6265（2011）。SameSite は RFC 6265bis | ブラウザが保持する小さな状態 / 他サイトからの送信制限 | SSR はブラウザに Cookie だけを渡す |
+| CORS | Cross-Origin Resource Sharing | W3C（2014）→ Fetch Standard | 他オリジンからの読み取りをサーバが許可する仕組み | |
+| OAuth 2.0、OIDC | OAuth 2.0 / OpenID Connect | RFC 6749（2012）/ OpenID Foundation（2014） | 認可の委譲 / その上の認証層 | 認証・認可の表と同じ |
+| JWT、JWKS | JSON Web Token / JSON Web Key Set | RFC 7519 / RFC 7517（2015） | 署名付きのクレーム / 検証用の公開鍵の集合 | issuer の JWKS を取って JWT を検証する |
+| PKCE | Proof Key for Code Exchange | RFC 7636（2015） | 認可コードの横取りを防ぐ | SSR と agent クライアント |
+| client_credentials | client credentials grant | RFC 6749 §4.4 | サービス自身がトークンを得る | M2M |
+| ステップアップ認証チャレンジ | OAuth 2.0 Step Up Authentication Challenge | RFC 9470（2023） | 401 で `acr_values` を要求し、再認証後に通す | 危険操作の前の AAL2 要求 |
+| Problem Details | Problem Details for HTTP APIs | RFC 7807（2016）→ RFC 9457（2023） | エラー応答の標準形式 | 「エラーは problem で返す」。パニックも problem に変換する |
+| `Idempotency-Key` | Idempotency-Key header | IETF draft（draft-ietf-httpapi-idempotency-key-header） | 同じ要求の再送を同一と見なすヘッダ | サービス間の紐付け |
+| `traceparent` | W3C Trace Context | W3C 勧告（2020） | trace-id と parent-id を運ぶヘッダ | 可観測性の表と同じ。壊れていれば捨てて採番し直す |
+| バックプレッシャー | backpressure | Reactive Streams（2014）で定式化 | 受け手が処理できる量まで送り手を抑える | キューの消費速度、relay のバックオフ |
+| レイテンシ、スループット | latency / throughput | — | 1 件にかかる時間 / 単位時間あたりの件数 | 「rps」「p99」のように単位を添える |
+
+### OS とランタイム
+
+| 標準の語 | 原語 | 出典（著者・年） | 意味 | この文書群での対応 |
+|---|---|---|---|---|
+| プロセス、スレッド | process / thread | Unix（1971–）。POSIX スレッド（1995） | 独立したアドレス空間を持つ実行単位 / その中の実行の流れ | allinone は 1 プロセスに複数サービス |
+| カーネル空間、ユーザー空間、システムコール | kernel / user space、system call | — | OS の中 / アプリの側 / その境界を越える呼び出し | |
+| 標準入出力、標準エラー | stdin / stdout / stderr | Unix | プロセスの 3 つの既定ストリーム | ログは stdout だけ。stderr と混ぜると行の順序が保証されない |
+| 終了コード | exit status | Unix。0 が成功 | プロセスが返す整数 | `go run` は終了コードを伝播しないので先にビルドする |
+| シグナル | signal（SIGTERM / SIGINT / SIGKILL） | Unix。POSIX.1 | プロセスへの非同期の通知 | SIGTERM を受けてグレースフルシャットダウン。SIGKILL は捕まえられない |
+| 環境変数 | environment variable | Unix | プロセスに渡す名前と値の組 | つなぎ先は全部環境変数。秘密は SSM から |
+| パイプ、リダイレクト | pipe / redirect | Unix（1973） | プロセスの出力を次の入力へ / ファイルへ | `tee` でログをファイルにも書く |
+| ソケット | socket | BSD 4.2（1983） | 通信の端点 | Listen するポートだけをアプリが知る |
+| ファイルディスクリプタ、ulimit | file descriptor / ulimit | Unix | 開いたファイルや接続の番号 / その上限 | 接続プールの上限と合わせる |
+| 名前空間、cgroups | namespaces / control groups | Linux（namespaces 2002–、cgroups 2007） | 見える範囲を分ける / 資源を制限する | コンテナの実体 |
+| コンテナ、イメージ、OCI | container / image / Open Container Initiative | Docker（2013）。OCI（2015） | 名前空間と cgroups で隔離した実行環境 / その雛形 / 標準規格 | Dockerfile、ECR、digest |
+| 非 root、capabilities | non-root / Linux capabilities | Linux 2.2（1999） | 管理者権限で動かさない / 権限を細かく分ける | 最終ステージに USER。secure-defaults の検査 |
+| 読み取り専用ルートファイルシステム | read-only root filesystem | — | コンテナの / を書き込み不可にする | 非 root とセットで設計 |
+| 競合状態 | race condition | — | 実行の順序で結果が変わる不具合 | |
+| TOCTOU | time-of-check to time-of-use | McPhee（1974）に遡る | 確認と使用の間に状態が変わる競合 | シンボリックリンクの差し替えなど。検査の後に対象が変わる |
+| デッドロックの 4 条件 | Coffman conditions | Coffman, Elphick, Shoshani（1971） | 相互排除・保持と待機・横取り不可・循環待ち | DB のデッドロックも同じ条件 |
+| 時刻：壁時計と単調時計 | wall clock / monotonic clock | — | 現在時刻 / 進むだけで戻らない時計 | 経過時間は単調時計で測る。デッドライン伝播を相対時間にする理由 |
+| UTC、RFC 3339、ISO 8601 | — | ISO 8601（1988）。RFC 3339（2002） | 協定世界時 / 日時の文字列形式 | ログの時刻は RFC 3339 の UTC 固定 |
+| NTP、時計のずれ | Network Time Protocol / clock skew | RFC 958（1985）→ RFC 5905 | 時刻を合わせる / サーバ間の差 | 絶対時刻でデッドラインを送らない理由 |
+| fsync、ページキャッシュ | fsync / page cache | Unix | ディスクへ書き切る / OS がメモリに持つファイルの写し | 永続性（ACID の D）の実装 |
+| OOM killer | out-of-memory killer | Linux | メモリ不足時にプロセスを強制終了する | メモリ上限と cgroups |
+| 単一障害点 | single point of failure（SPOF） | — | そこが落ちると全体が止まる要素 | Single-AZ の RDS は検証用。Multi-AZ の実測 |
 
 ## 古典の書籍の語
 
@@ -554,6 +615,8 @@ Matthew Skelton, Manuel Pais, *Team Topologies*（IT Revolution, 2019）。邦�
 - Edgar F. Codd, "A Relational Model of Data for Large Shared Data Banks"（1970）、正規形の論文（1971–74）。Eswaran, Gray, Lorie, Traiger, "The Notions of Consistency and Predicate Locks in a Database System"（1976）。Berenson ほか, "A Critique of ANSI SQL Isolation Levels"（1995）。Bayer & McCreight（1972）。O'Neil ほか, "The Log-Structured Merge-Tree"（1996）。Mohan ほか, "ARIES"（1992）
 - Greg Young, "CQRS Documents"（2010）。Martin Fowler, [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)（2005）
 - Girvan & Newman, "Community structure in social and biological networks"（2002）。Newman & Girvan（2004）。Hubert & Arabie, "Comparing partitions"（1985）。Freeman（1977）。Tarjan（1974）。Church & Hanks（1990）。DeMillo, Lipton, Sayward（1978）
+- Cerf & Kahn, "A Protocol for Packet Network Intercommunication"（1974）。RFC 791 / 793（1981）、RFC 1034 / 1035（1987）、RFC 6265（2011）、RFC 6749（2012）、RFC 7519 / 7517 / 7636（2015）、RFC 8446（2018）、RFC 9110–9113（2022）、RFC 9457 / 9470（2023）。[W3C Trace Context](https://www.w3.org/TR/trace-context/)
+- Coffman, Elphick, Shoshani, "System Deadlocks"（1971）。RFC 3339（2002）。OCI（2015）
 - Melvin Conway, "How Do Committees Invent?"（1968）。David Parnas, "On the Criteria To Be Used in Decomposing Systems into Modules"（1972）。Yourdon & Constantine, *Structured Design*（1979）。Dijkstra, "On the role of scientific thought"（1974）
 - Frederick Brooks, *The Mythical Man-Month*（1975）、"No Silver Bullet"（1986）。Meir Lehman, "Programs, Life Cycles, and Laws of Software Evolution"（1980）
 - Winston Royce（1970）、Barry Boehm, "A Spiral Model of Software Development and Enhancement"（1986）。Donald Knuth, "Structured Programming with go to Statements"（1974）
