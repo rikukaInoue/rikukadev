@@ -717,7 +717,7 @@ graph TB
 ```mermaid
 graph TB
     subgraph photo["photo サービス"]
-        P1["expand デプロイ"] --> P2["バックフィル"] --> P3["フラグ 1% → 100%"] --> P4["contract デプロイ"]
+        P1["expand"] --> P2["backfill"] --> P3["feature flag 1% → 100%"] --> P4["contract"]
     end
     subgraph gear["gear サービス"]
         G1["普通の機能追加を<br/>普通にデプロイ"]
