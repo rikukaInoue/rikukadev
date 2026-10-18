@@ -2,71 +2,54 @@
 title: "GoのDIはいつからライブラリを入れるべきか"
 date: 2026-10-16
 tags: ["Go", "アーキテクチャ", "DI", "モノレポ", "マイクロサービス"]
-description: "Go のサービスに fx / dig / wire のような DI ライブラリを入れるべきか。手書きのコンストラクタ注入で何が守られて何が守られないのか、環境ごとの組み立て関数の重複をどう消すか、サービスが 10 に増えたときに本当に困るものは何かを、疑似コードで整理する。"
+description: "Go のサービスに fx / dig / wire のような DI ライブラリを入れるべきかを考えると、本当に決めるべきなのは依存の組み立てと実行のしかたの責務の分け方だった。プロセスに合成ルート、サービスに組み立て関数、ランタイムにワークロード管理という分け方と、ライブラリを入れる判断基準を疑似コードで整理する。"
 ---
 
 ## TL;DR
 
-1. **サービス 1 つの依存が 10〜20 個ほどなら、DI ライブラリは入れなくてよい。** 手書きのコンストラクタ注入でも、コンパイラが整合を検査してくれる
-2. ただし**環境ごとの組み立て関数**(ローカル用と本番用など)は重複しやすい。コンパイラが検査するのはコンストラクタの引数までなので、それ以外の重複は環境ごとにずれていく。**変わる部分と共通部分を分けて**重複を消す
-3. **サービスが 10 に増えて困るのは DI ではなく、サービスをまたいだコピー**。起動処理や環境の差し替えが、サービスの数だけ複製される。これは DI ライブラリの守備範囲の外で、**共通の起動処理に寄せる**ことで解く
-4. DI ライブラリが要るのは **1 つのサービスの中の依存が 30〜40 を超えたとき**。その場合の候補は、コンパイル時に検査できる wire
+1. **DI ライブラリを入れるかどうかの前に、責務を分ける。** 依存の組み立て方と、アプリケーションの実行のしかたを分けると、ライブラリが要る場面はかなり減る
+2. 分け方は **「プロセスに合成ルート、サービスに組み立て関数、ランタイムにワークロード管理」**。サービスは内部を組み立ててワークロード(HTTP サーバーやコンシューマ)を返すだけで、自分では起動しない
+3. ランタイムは**アプリケーションフレームワークではなく、プロセススーパーバイザ**として作る。共通の契約は `Run(ctx) error` だけにして、**HTTP 固有の概念を入れない**
+4. ライブラリを入れる判断は**依存の数ではなく、組み立ての複雑さ**で行う。google/wire は 2025 年にアーカイブされているので、入れるなら保守状況を確認する
 
 ---
 
-## 前提: DI とは何をすることか
+## 前提: DI と合成ルート
 
 DI(依存性注入)は、**使う側が依存を自分で作らず、外から受け取る**ことです。
 
 ```go
 // DI しない: 使う側が依存を自分で作る
-type OrderService struct{}
-
 func (s *OrderService) Place(ctx context.Context, o Order) error {
     db := sql.Open("mysql", "user:pass@/orders")  // 中で作っている
-    repo := NewMySQLOrderRepo(db)
-    return repo.Save(ctx, o)
+    return NewMySQLOrderRepo(db).Save(ctx, o)
 }
-```
 
-```go
 // DI する: 依存を interface で受け取る
 type OrderRepo interface {
     Save(ctx context.Context, o Order) error
 }
 
-type OrderService struct {
-    repo OrderRepo  // 外から渡される
-}
+type OrderService struct{ repo OrderRepo }
 
 func NewOrderService(repo OrderRepo) *OrderService {
     return &OrderService{repo: repo}
 }
 ```
 
-こうしておくと、テストでは偽物の `OrderRepo` を渡せますし、本番とローカルで実装を差し替えられます。
+テストでは偽物の `OrderRepo` を渡せますし、本番とローカルで実装を差し替えられます。
 
-**誰が依存を組み立てて渡すのか**が次の問題になります。その組み立てる場所を**合成ルート**(composition root)と呼びます。たいていは `main` かその近くに置きます。
+依存を組み立てて渡す場所を**合成ルート**(composition root)と呼びます。具体的な実装を知っているのはここだけで、それ以外のコードは interface しか知りません。
 
 ```go
-// 合成ルート: 具体的な実装を知っているのはここだけ
 func main() {
-    db := openDB(os.Getenv("DSN"))
-    repo := NewMySQLOrderRepo(db)
-    svc := NewOrderService(repo)
-    handler := NewOrderHandler(svc)
-    http.ListenAndServe(":8080", handler)
+    db := openDB(os.Getenv("ORDER_DSN"))
+    svc := NewOrderService(NewMySQLOrderRepo(db))
+    http.ListenAndServe(":8080", NewOrderHandler(svc))
 }
 ```
 
-```mermaid
-graph LR
-    MAIN["合成ルート(main)<br/>具体的な実装を知っている"] -->|"組み立てて渡す"| SVC["OrderService<br/>interface だけを知っている"]
-    MAIN --> REPO["MySQLOrderRepo"]
-    REPO -.->|"OrderRepo を満たす"| SVC
-```
-
-この「組み立てて渡す」を**手で書くか、ライブラリに任せるか**が、この記事の論点です。
+この「組み立てて渡す」を手で書くか、ライブラリに任せるか、が出発点の問いです。
 
 ---
 
@@ -74,175 +57,94 @@ graph LR
 
 Go でよく使われるものは、方式で 2 つに分かれます。
 
-| | 方式 | 配線の誤りが分かる時点 |
-|---|---|---|
-| **fx / dig**(Uber) | 実行時にリフレクションで依存を解決する | **起動時** |
-| **wire**(Google) | 依存を組み立てるコードを生成する | **コンパイル時** |
+| | 方式 | 配線の誤りが分かる時点 | 保守 |
+|---|---|---|---|
+| **fx / dig**(Uber) | 実行時にリフレクションで依存を解決する | **起動時** | 保守中 |
+| **wire**(Google) | 依存を組み立てるコードを生成する | **コンパイル時** | **2025 年にアーカイブ**(フォークの goforj/wire が保守中) |
 
-fx / dig では、コンストラクタを登録しておくと、型を手がかりにライブラリが組み立ててくれます。
+fx はコンストラクタを登録しておくと、型を手がかりに組み立ててくれます。起動と停止の順序の管理(ライフサイクル)まで持っていて、`fx.Module` で部品を複数のサービスで共有することもできます。一方で、何が何に渡るかはコードを読んでも分かりにくく、配線を間違えても**ビルドは成功し、起動して初めて失敗**します。
 
-```go
-// fx のイメージ
-fx.New(
-    fx.Provide(openDB, NewMySQLOrderRepo, NewOrderService, NewOrderHandler),
-    fx.Invoke(startServer),
-)
-```
-
-並べる順番を気にしなくてよく、起動と停止の順序の管理(ライフサイクル)まで持っています。一方で、何が何に渡るかはコードを読んでも分かりにくく、配線を間違えても**ビルドは成功し、起動して初めて失敗**します。
-
-wire は、組み立てるコードを生成します。生成されたコードは手書きとほぼ同じなので読みやすく、誤りもコンパイル時に分かります。代わりに、生成の手順と生成物を管理する手間が増えます。
+wire は生成されたコードが手書きとほぼ同じなので読みやすく、誤りもコンパイル時に分かります。代わりに生成の手順と生成物を管理する手間が増え、本家は保守が終わっています。
 
 ---
 
-## 小さいうちは入れなくてよい理由
+## 小さいうちは手で書けばよい
 
-サービス 1 つの依存が 10〜20 個ほどの段階を考えます。
-
-### 1. 手で並べても読める
+サービス 1 つの組み立てが一直線に読めるうちは、手で書くので十分です。
 
 ```go
-func buildDeps(cfg Config) (*Deps, error) {
+func buildOrder(cfg Config) (*OrderService, error) {
     db, err := openDB(cfg.DSN)
     if err != nil { return nil, err }
-    cache := NewRedisCache(cfg.RedisURL)
-    repo := NewMySQLOrderRepo(db)
-    payment := NewPaymentClient(cfg.PaymentURL)
-    svc := NewOrderService(repo, cache, payment)
-    return &Deps{Orders: svc}, nil
+    return NewOrderService(NewMySQLOrderRepo(db), NewRedisCache(cfg.RedisURL), NewPaymentClient(cfg.PaymentURL)), nil
 }
 ```
 
-上から読めば、何が何に渡されているか全部わかります。DI ライブラリが効いてくるのは、依存が数十を超えて、並べること自体が負担になってからです。
+手書きでも、`NewOrderService` に引数を 1 つ足せば呼んでいる場所が**すべてコンパイルエラー**になります。直し忘れはビルドの時点で止まります。
 
-### 2. 手書きでもコンパイラが整合を検査している
+### ただし、コンパイラが検査するのは引数までだ
 
-`NewOrderService` に引数を 1 つ足すと、それを呼んでいる場所が**すべてコンパイルエラー**になります。組み立てを複数の場所で書いていても、直し忘れはビルドの時点で止まります。
-
-### 3. 誤りを見つける時点を遅らせない
-
-fx / dig を入れると、配線の誤りが分かる時点が**ビルドから起動時へ遅れます**。誤りはできるだけ早い段階で止めたいので、この段階で入れる理由はありません。
-
----
-
-## ただし、環境ごとの組み立て関数は重複する
-
-実際のサービスでは、ローカル開発と本番で一部の実装を差し替えることがよくあります。たとえば認証です。
+ローカルと本番で一部の実装を差し替えるために、組み立て関数を 2 つ書いたとします。
 
 ```go
-// ローカル: 固定のユーザーで通す
 func LocalDeps(cfg Config) (*Deps, error) {
-    authn := NewFakeAuthenticator()          // ← 違う
-    authz := NewInMemoryAuthorizer()         // ← 違う
-
+    authn := NewFakeAuthenticator()           // ← 違う
+    authz := NewInMemoryAuthorizer()          // ← 違う
     db, err := openDB(cfg.DSN)
     if err != nil { return nil, err }
-    cache := NewRedisCache(cfg.RedisURL)
-    repo := NewMySQLOrderRepo(db)
-    payment := NewPaymentClient(cfg.PaymentURL)
     registerFlags(cfg.Flags)
-    svc := NewOrderService(repo, cache, payment, authz)
-    return &Deps{Authn: authn, Orders: svc, closers: []func() error{db.Close}}, nil
+    svc := NewOrderService(NewMySQLOrderRepo(db), authz)
+    return &Deps{Authn: authn, Orders: svc}, nil
 }
 
-// 本番: OIDC で認証し、認可サービスに問い合わせる
 func ProdDeps(cfg Config) (*Deps, error) {
     authn := NewOIDCAuthenticator(cfg.Issuer) // ← 違う
     authz := NewAuthzClient(cfg.AuthzURL)     // ← 違う
-
     db, err := openDB(cfg.DSN)                // ↓ ここから下はローカルと同じ
     if err != nil { return nil, err }
-    cache := NewRedisCache(cfg.RedisURL)
-    repo := NewMySQLOrderRepo(db)
-    payment := NewPaymentClient(cfg.PaymentURL)
     registerFlags(cfg.Flags)
-    svc := NewOrderService(repo, cache, payment, authz)
-    return &Deps{Authn: authn, Orders: svc, closers: []func() error{db.Close}}, nil
+    svc := NewOrderService(NewMySQLOrderRepo(db), authz)
+    return &Deps{Authn: authn, Orders: svc}, nil
 }
 ```
 
-違うのは最初の 2 行だけで、**残りは丸ごと同じコードが 2 回書かれています**。
+`ProdDeps` からだけ `registerFlags` を消しても、ビルドは成功します。コンパイラが検査するのはコンストラクタの引数の数と型で、**呼ぶかどうか、どの順で呼ぶか、何を閉じるか**は検査されません。重複している部分は、気づかないうちに環境ごとにずれていきます。
 
-### コンパイラが検査する範囲と、しない範囲
+### 差し替えは「環境」ではなく「能力」ごとに
 
-先ほど「コンパイラが整合を検査している」と書きましたが、それは**コンストラクタの引数**の話です。それ以外の重複は検査されません。
+この形にはもう 1 つ問題があります。**環境名ひとつで、認証と認可がまとめて切り替わる**ことです。ローカルで本物の OIDC を使いつつ、認可だけ偽物にする、といった組み合わせが作れません。
 
-```mermaid
-graph TB
-    subgraph checked["コンパイラが検査する"]
-        C1["コンストラクタの引数の数と型"]
-    end
-    subgraph unchecked["検査されない"]
-        U1["registerFlags を呼ぶかどうか"]
-        U2["終了時に閉じる接続の一覧"]
-        U3["エラー時のログの出し方"]
-        U4["呼び出しの順序"]
-    end
-```
-
-たとえば `ProdDeps` からだけ `registerFlags` を消しても、ビルドは成功します。本番でだけフィーチャーフラグが既定値のまま、という違反が検知されないまま残ります。
-
-**組み立てる場所を 1 つにしても、その中に環境ごとの経路が 2 つあれば、同じ種類の事故は起きます。**
-
-### 直し方: 変わる部分と共通部分を分ける
-
-環境ごとに変わる部分だけを返す関数と、共通の組み立てを分けます。
+差し替える能力ごとに実装を選んで、明示的に渡す形にします。
 
 ```go
-// 環境ごとに違うのはここだけ
-type Edge struct {
-    Authn Authenticator
-    Authz Authorizer
-}
-
-func localEdge(cfg Config) (Edge, error) {
-    return Edge{Authn: NewFakeAuthenticator(), Authz: NewInMemoryAuthorizer()}, nil
-}
-
-func prodEdge(cfg Config) (Edge, error) {
-    return Edge{Authn: NewOIDCAuthenticator(cfg.Issuer), Authz: NewAuthzClient(cfg.AuthzURL)}, nil
+// 差し替え可能な依存を、能力ごとに受け取る
+type Dependencies struct {
+    DB            *sql.DB
+    Authenticator Authenticator
+    Authorizer    Authorizer
 }
 
 // 共通の組み立ては 1 回だけ書く
-func assemble(cfg Config, e Edge) (*Deps, error) {
-    db, err := openDB(cfg.DSN)
-    if err != nil { return nil, err }
-    cache := NewRedisCache(cfg.RedisURL)
-    repo := NewMySQLOrderRepo(db)
-    payment := NewPaymentClient(cfg.PaymentURL)
-    registerFlags(cfg.Flags)
-    svc := NewOrderService(repo, cache, payment, e.Authz)
-    return &Deps{Authn: e.Authn, Orders: svc, closers: []func() error{db.Close}}, nil
+func Assemble(deps Dependencies) (*OrderService, error) {
+    registerFlags(...)
+    return NewOrderService(NewMySQLOrderRepo(deps.DB), deps.Authorizer), nil
+}
+
+// 何を渡すかは、呼ぶ側が能力ごとに決める
+deps := Dependencies{
+    DB:            openDB(cfg.DSN),
+    Authenticator: chooseAuthenticator(cfg),  // 設定から個別に選ぶ
+    Authorizer:    chooseAuthorizer(cfg),
 }
 ```
 
-```mermaid
-graph LR
-    subgraph before["直す前"]
-        L1["LocalDeps<br/>認証・認可<br/>+ 共通部分"]
-        P1["ProdDeps<br/>認証・認可<br/>+ 共通部分(コピー)"]
-    end
-    subgraph after["直したあと"]
-        L2["localEdge<br/>認証・認可"] --> A["assemble<br/>共通部分は 1 か所"]
-        P2["prodEdge<br/>認証・認可"] --> A
-    end
-```
-
-こうすると、
-
-- 重複がなくなり、**片方だけ直す事故が構造上起きなくなる**
-- 環境による違いが **`Edge` の中身だけ**に限定され、読む人にも分かる
-- ライブラリを入れなくても、DI ライブラリが提供する「差し替える部分を明示する」効果が得られる
+重複が消え、「本物の認証 + 偽物の認可」のような組み合わせも作れます。ここまではライブラリなしで済みます。
 
 ---
 
-## サービスが 10 に増えたら
+## サービスが増えると、困るのは組み立てではない
 
-ここからが本題です。サービスが 10 くらいに増えたら DI ライブラリが要るのかを考えます。
-
-### 各サービスの main は、ほとんど同じになる
-
-サービスが増えると、それぞれの `main` にこういう処理が並びます。
+サービスが 10 くらいに増えたら、さすがに DI ライブラリが要るのでしょうか。各サービスの `main` を並べてみます。
 
 ```go
 // order サービス
@@ -251,184 +153,339 @@ func main() {
     tracer := initTracing("order")
     defer tracer.Shutdown()
 
-    edge := chooseEdge(cfg)            // local か prod か
-    deps, err := assemble(cfg, edge)   // ← ここだけがサービス固有
+    svc, err := Assemble(dependenciesFrom(cfg))   // ← ここだけがサービス固有
     if err != nil { log.Fatal(err) }
 
-    srv := &http.Server{Addr: cfg.Addr, Handler: withTracing(routes(deps))}
+    srv := &http.Server{Addr: cfg.Addr, Handler: withTracing(routes(svc))}
     go srv.ListenAndServe()
-
     waitForSignal()
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    srv.Shutdown(ctx)   // 新しいリクエストを止め、処理中のものを待つ
-    deps.Close()        // そのあとで DB などを閉じる
+    shutdownGracefully(srv)
 }
+
+// inventory サービス — サービス名と Assemble / routes 以外は同じ
 ```
+
+実際に 2 つのサービスを持つプロジェクトで起動処理を比べると、**サービス名を揃えて 93 行のうち 80 行(86%)が一致**していました。
+
+ここで大事なのは、**サービスが増えても 1 サービスの中の依存は増えない**ことです。増えるのは、トレースの初期化、シグナル処理、グレースフルシャットダウンといった**起動まわりのコピー**です。DI コンテナは 1 つのプロセスの中の依存を組み立てる道具なので、それだけではサービスをまたいだコピーは減りません(fx の `fx.Module` のように、起動・停止の処理まで部品として共有できるものはあります)。
+
+では起動まわりを共通化しよう、となったとき、ここで設計を誤りやすいです。
+
+### 一枚岩の Run を作ると、HTTP に縛られる
+
+素直に共通化すると、こうなりがちです。
 
 ```go
-// inventory サービス
-func main() {
-    cfg := ConfigFromEnv()
-    tracer := initTracing("inventory")   // ← 名前が違うだけ
-    defer tracer.Shutdown()
-
-    edge := chooseEdge(cfg)
-    deps, err := assemble(cfg, edge)     // ← ここだけがサービス固有
-    // …… 以下、order とほぼ同じ
+// 避けたい形: 共通の起動処理が HTTP を前提にしている
+type Service struct {
+    Name     string
+    Assemble func(Dependencies) (Deps, error)
+    Routes   func(Deps) http.Handler     // ← HTTP 固有
 }
+func Run(s Service) { /* トレース、HTTP サーバー、シャットダウン */ }
 ```
 
-**サービス固有なのは `assemble` と `routes` だけ**で、トレースの初期化、サーバーの起動、シグナルを待ってのグレースフルシャットダウン、環境の選び方は、サービス名を除いて同じコードになります。
+これだと、HTTP を持たない実行形態が収まりません。キューを読むだけのコンシューマ、定期実行のジョブ、outbox の relay は、`Routes` を返しようがありません。今は HTTP しか無くても、**`Routes` を必須にしないだけで、後から実行形態を足す自由度が大きく変わります。**
 
-実際に、2 つのサービスを持つ検証用のプロジェクトで起動処理を比べたところ、**サービス名を揃えて比べると 93 行のうち 80 行(86%)が一致**していました。2 つの時点でこれなので、10 個になればこの処理が 10 部できます。
+---
 
-### 増えるもの、増えないもの
+## 本題: 組み立てと実行を分ける
 
-| サービスが 10 になると | 増えるか | DI ライブラリで解決するか |
+依存の組み立て方と、アプリケーションの実行のしかたを分けます。
+
+### 3 つの単位
+
+まず、混ざりやすい単位を分けておきます。
+
+| 単位 | 責務 |
+|---|---|
+| **モジュール** | 内部の依存関係の組み立てと、公開する契約 |
+| **サービス** | 提供するワークロードの組み合わせ |
+| **プロセス** | 共有する資源、起動・終了の管理 |
+
+DDD のモジュールと、デプロイ単位としてのサービスは、必ずしも一致しません。1 つのサービスが複数のモジュールを束ねることも、モジュールの境界を保ったままデプロイの切り方を変えることもあります。
+
+### 3 つの層
+
+この単位に沿って、責務を 3 層に分けます。
+
+| 層 | 所有者 | 責務 |
 |---|---|---|
-| 1 サービスの中の依存の数 | **増えない**。10〜20 個のまま | — |
-| 起動・シャットダウン・トレースの手順 | **10 部のコピーになる** | しない |
-| 環境ごとの差し替え(local / prod) | **10 × 2 になる** | しない |
-| DB 接続などの共通部品 | **10 か所に同じコードが並ぶ** | しない |
-
-ここが一番大事なところです。**DI ライブラリが解決するのは「1 つのバイナリの中の依存が多い」問題で、「サービスの数が多い」問題ではありません。** サービスはそれぞれ別のバイナリで、合成ルートもそれぞれ独立しているので、10 個になっても 1 つあたりの依存は小さいままです。
+| **合成ルート** | プロセスのエントリポイント(`main`)。**1 プロセスに 1 つ** | 設定、テレメトリ、共有資源の用意。どのサービスを起動するか。ワークロードの登録 |
+| **組み立て関数** | 各サービス | サービス内部を組み立て、**ワークロードを返す**。自分では起動しない |
+| **ランタイム** | 共通パッケージ | 登録されたワークロードの起動・停止・グレースフルシャットダウン |
 
 ```mermaid
 graph TB
-    subgraph di["DI ライブラリが解決する"]
-        D1["1 つのバイナリの中で<br/>依存が多い"]
+    subgraph process["プロセス(main)= 合成ルート"]
+        CFG["設定・テレメトリ・共有資源"]
+        subgraph svcA["order サービス"]
+            AA["組み立て関数<br/>usecase / repository / handler"]
+        end
+        subgraph svcB["inventory サービス"]
+            BA["組み立て関数<br/>usecase / repository / handler"]
+        end
+        RT["ランタイム<br/>(プロセススーパーバイザ)"]
     end
-    subgraph notdi["DI ライブラリでは解決しない"]
-        N1["サービスをまたいだ<br/>起動処理のコピー"]
-        N2["環境 × サービスの<br/>組み立て関数の数"]
-        N3["共通部品の重複"]
-    end
-    TEN["サービスが 10 に増えて困ること"] --> notdi
+    CFG --> AA
+    CFG --> BA
+    AA -->|"ワークロードを返す"| RT
+    BA -->|"ワークロードを返す"| RT
 ```
 
-困るのは**サービスをまたいだ重複**です。たとえばシャットダウンの順序に不具合が見つかったとき、10 サービス分を同じように直す必要があり、1 つ漏れてもビルドは成功するので気づけません。
+合成ルートの最終的な所有者は**プロセスのエントリポイント**で、サービス側の組み立て関数はその下位にある組み立て(sub-composition)です。
 
-### やること 1: 起動処理を共通パッケージに寄せる
+### サービス側: 組み立てて、ワークロードを返す
 
 ```go
-// 共通パッケージ runtime: 起動・トレース・シャットダウンを 1 か所で持つ
-package runtime
+// services/order/assemble.go
+func Assemble(deps Dependencies) (Workloads, error) {
+    repo := NewMySQLOrderRepo(deps.DB)
+    uc := NewOrderUseCase(repo, deps.Authorizer)
 
-type Service struct {
-    Name     string
-    Assemble func(cfg Config, e platform.Edge) (Deps, error)
-    Routes   func(Deps) http.Handler
+    return Workloads{
+        HTTP:     NewOrderHandler(uc),        // HTTP API
+        Consumer: NewPaymentEventHandler(uc), // 決済イベントのコンシューマ
+    }, nil
 }
+```
 
-func Run(s Service) {
-    cfg := ConfigFromEnv()
-    tracer := initTracing(s.Name)
-    defer tracer.Shutdown()
+HTTP のハンドラとコンシューマは**同じ usecase を使います**。ドメインのロジックは、どの形で実行されるかから独立します。
 
-    deps, err := s.Assemble(cfg, platform.ChooseEdge(cfg))
+### プロセス側: どれを、どう動かすかを決める
+
+```go
+// cmd/order/main.go — order だけを独立したプロセスで動かす
+func main() {
+    proc := bootstrap.Process("order")              // 設定・テレメトリ・シグナル
+    order, err := orderapp.Assemble(proc.DependenciesFor("order"))
     if err != nil { log.Fatal(err) }
 
-    srv := &http.Server{Addr: cfg.Addr, Handler: withTracing(s.Routes(deps))}
-    go srv.ListenAndServe()
-
-    waitForSignal()
-    shutdownGracefully(srv, deps)
+    runtime.Run(proc.Context(),
+        httpserver.New(order.HTTP),
+        sqsconsumer.New(order.Consumer),
+    )
 }
 ```
 
 ```go
-// 各サービスの main はこれだけになる
+// cmd/allinone/main.go — 同じ組み立て関数を、1 つのプロセスにまとめて動かす
 func main() {
-    runtime.Run(runtime.Service{
-        Name:     "order",
-        Assemble: assemble,
-        Routes:   routes,
-    })
+    proc := bootstrap.Process("allinone")
+    order, _ := orderapp.Assemble(proc.DependenciesFor("order"))
+    inventory, _ := inventoryapp.Assemble(proc.DependenciesFor("inventory"))
+
+    runtime.Run(proc.Context(),
+        httpserver.New(order.HTTP, inventory.HTTP),
+        sqsconsumer.New(order.Consumer),
+    )
 }
 ```
-
-各サービスが書くのは、**自分の依存の組み立てとルーティングだけ**です。シャットダウンの順序やトレースの初期化を直すときは、共通パッケージの 1 か所を直せば全サービスに反映されます。
-
-### やること 2: 環境の差し替えも共通パッケージに寄せる
-
-先ほどの `Edge`(認証・認可)は、どのサービスでも同じものを使います。サービスごとに持たず、**共通パッケージが 1 つだけ持つ**ようにします。
 
 ```mermaid
 graph LR
-    subgraph platform["共通パッケージ platform"]
-        LE["localEdge"]
-        PE["prodEdge"]
+    subgraph shared["変わらない"]
+        OA["order の組み立て関数"]
+        IA["inventory の組み立て関数"]
     end
-    subgraph services["各サービス"]
-        S1["order の assemble"]
-        S2["inventory の assemble"]
-        S3["……(10 個)"]
+    subgraph p1["独立したプロセス"]
+        M1["cmd/order"] --> OA
+        M2["cmd/inventory"] --> IA
     end
-    LE --> S1
-    LE --> S2
-    LE --> S3
-    PE --> S1
-    PE --> S2
-    PE --> S3
+    subgraph p2["1 つのプロセス"]
+        M3["cmd/allinone"] --> OA
+        M3 --> IA
+    end
 ```
 
-「10 サービス × 2 環境 = 20 個の組み立て関数」が、「**2 つの Edge + 10 個の assemble**」になります。
+**独立したプロセスで動かすときも、1 つのプロセスにまとめるときも、サービスの組み立て関数は変わりません。** 違うのはプロセス側だけです。開発中は 1 プロセスでまとめて起動し、本番ではサービスごとにデプロイする、という運用が同じコードでできます。
 
-### やること 3: 構造を検査で守る
+テレメトリ(トレーサーやメトリクス)は**プロセスに 1 つ**です。組み立て関数には引数で渡し、パッケージ変数では受け渡しません。パッケージ変数で渡すと、「テレメトリを先に初期化しないと DB を開けない」といった順序の依存が、コードの構造に現れなくなります。
 
-共通パッケージに寄せても、新しく作ったサービスが起動処理をコピーして独自に書き換えれば、また重複が始まります。
+### 1 プロセスでも、データの権限は共有しない
 
-そこで、アーキテクチャの決まりごとを**テストとして書いておきます**。
+ひとつ注意があります。**何を共有するかは、デプロイ形態だけでなくデータの所有権でも決まります。** 1 プロセスにまとめたからといって、全サービスに同じ DB 接続を渡してはいけません。
 
 ```go
-// 全サービスの main が runtime.Run を使っているかを調べるテスト
-func TestEveryServiceUsesRuntime(t *testing.T) {
-    for _, svc := range listServices("services/") {
-        src := readFile(svc + "/main.go")
-        if !strings.Contains(src, "runtime.Run(") {
-            t.Errorf("%s が共通の起動処理を使っていない", svc)
-        }
-        if strings.Contains(src, "http.Server{") {
-            t.Errorf("%s が http.Server を直接作っている", svc)
-        }
+func (p *Process) DependenciesFor(service string) Dependencies {
+    return Dependencies{
+        // サービスごとに、そのサービスの資格情報で開く
+        DB: openDB(p.cfg.DSN(service)),   // order は order_app、inventory は inventory_app
+        Authenticator: p.authn,            // 共有してよい
+        Telemetry:     p.telemetry,        // 共有してよい
     }
 }
 ```
 
-違反するサービスが出たら CI が失敗します。決まりごとを文書に書くだけだと守られなくなるので、検査として実行できる形にしておきます。
+order の DB ユーザーには inventory のテーブルへの権限を付けず、inventory も同様にします。1 つのプロセスで動いていても、他のサービスのデータに直接触れられない状態を保てます。
 
 ---
 
-## それでも DI ライブラリが要るのは
+## ランタイムはプロセススーパーバイザにする
 
-**1 つのサービスの中の依存が 30〜40 を超えたとき**です。たとえば 1 つのサービスが大きくなり、リポジトリや外部クライアントを大量に持つようになった場合です。手で並べると順序の管理だけで手間がかかり、読んでも全体を把握できなくなります。
+ランタイムを「アプリケーションフレームワーク」として作ると、ルーティングやハンドラといった概念を抱え込みます。そうではなく、**プロセスの中の実行単位を起動して、止めるだけのもの**(プロセススーパーバイザ)として作ります。
 
-その場合の候補は **wire** です。配線の誤りをコンパイル時に検出できるので、手書きで得ていた安全さを保ったまま、並べる手間だけを減らせます。fx / dig は、誤りが起動時まで分からないという性質を受け入れられる場合の選択肢です。
+### 契約は Run だけ
 
-ただ、1 つのサービスの依存がそこまで増えたら、DI ライブラリの前に**サービスを分けるべきかどうか**を考えたほうがよいと思います。依存が多すぎるのは、責務を持たせすぎている兆候でもあるからです。
+```go
+type Workload interface {
+    Run(ctx context.Context) error
+}
+```
+
+HTTP サーバーも、SQS のコンシューマも、定期実行のジョブも、この契約を満たせます。
+
+```go
+// HTTP サーバーのワークロード
+func (h *HTTPServer) Run(ctx context.Context) error {
+    errc := make(chan error, 1)
+    go func() { errc <- h.srv.ListenAndServe() }()
+
+    select {
+    case <-ctx.Done():
+        // 停止の合図: 受付を止め、処理中のリクエストを猶予時間内に終える
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), h.grace)
+        defer cancel()
+        return h.srv.Shutdown(shutdownCtx)
+    case err := <-errc:
+        return err   // 合図の前に止まった = 失敗
+    }
+}
+
+// コンシューマのワークロード
+func (c *Consumer) Run(ctx context.Context) error {
+    for {
+        msgs, err := c.queue.Receive(ctx)
+        if ctx.Err() != nil {
+            return nil   // 停止の合図。処理中のメッセージは終えてから返る
+        }
+        if err != nil {
+            return err
+        }
+        c.handle(ctx, msgs)
+    }
+}
+```
+
+### 終わり方の意味を決めておく
+
+`Run` だけの契約は単純な分、**どう終わったかの意味**を決めておかないと、ワークロードごとに解釈がばらつきます。
+
+| 状況 | ワークロードがすること | スーパーバイザがすること |
+|---|---|---|
+| 停止の合図(`ctx` の取り消し) | 新しい仕事の受付を止め、処理中を終えて **`nil` を返す** | 全ワークロードが返るのを待つ。全体の上限時間を超えたら待つのをやめる |
+| 回復できない失敗 | **エラーを返す** | 他のワークロードも止め、プロセスを異常終了にする |
+| 合図の前に返った(`nil` でも) | — | **異常として扱う**。常駐するものが自分から終わるのは想定外 |
+
+停止の順序も決めておきます。
+
+```mermaid
+sequenceDiagram
+    participant OS as OS
+    participant S as スーパーバイザ
+    participant W as ワークロード群
+    participant R as 資源(DB など)
+    participant T as テレメトリ
+    OS->>S: SIGTERM
+    S->>W: ctx を取り消す
+    W-->>S: 処理中を終えて返る
+    S->>R: 閉じる
+    S->>T: 送り切って閉じる
+```
+
+**ワークロードが動いている間に DB を閉じない**、**最後にテレメトリを送り切る**、の 2 つが要点です。逆にすると、処理中のリクエストが DB エラーで失敗したり、停止直前のトレースが失われたりします。
+
+### Start / Stop に分けない理由
+
+`Run(ctx)` は Go の慣習(`errgroup` など)にそのまま乗り、HTTP もコンシューマもこれで表せます。`Start` / `Stop` に分ける必要が出るのは、「HTTP が待ち受けを始めたのを確認してからコンシューマを起動したい」のような**準備完了の通知**が要るときです。そのときも契約を変えず、任意で実装するインターフェース(例: `Ready() <-chan struct{}`)を足せば済みます。
+
+### 1 回で終わる処理は載せない
+
+マイグレーションやバッチのように**1 回で終わる処理**は、常駐するワークロードではありません。スーパーバイザに載せると「合図の前に返った = 異常」と扱われてしまいます。プロセスの合成ルートが直接呼んで、その結果で終了します。
+
+```go
+func main() {
+    switch os.Args[1] {
+    case "migrate":
+        os.Exit(exitCode(runMigrate(ctx)))   // 1 回で終わる
+    default:
+        runtime.Run(ctx, workloads...)       // 常駐する
+    }
+}
+```
+
+---
+
+## 構造を検査で守る
+
+共通の仕組みを作っても、新しいサービスが起動処理をコピーして独自に書き換えれば、また重複が始まります。決まりごとはテストとして実行できる形にします。
+
+このとき、**文字列検索ではなく構文木で調べます**。文字列検索はコメントや文字列リテラルの中にも一致し、書き方を少し変えるだけで見逃します。Go なら `go/parser` と `go/ast` が標準ライブラリにあります。
+
+```go
+// 組み立て関数が http.Server を自分で作っていないかを、構文木で調べる
+func TestAssemblersDoNotStartServers(t *testing.T) {
+    for _, file := range goFilesUnder("services/") {
+        f, _ := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+        ast.Inspect(f, func(n ast.Node) bool {
+            lit, ok := n.(*ast.CompositeLit)
+            if !ok {
+                return true
+            }
+            if sel, ok := lit.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "Server" {
+                if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "http" {
+                    t.Errorf("%s: 組み立て関数が http.Server を作っている(起動はプロセス側の責務)", file)
+                }
+            }
+            return true
+        })
+    }
+}
+```
+
+モジュールの境界そのもの(他のサービスの内部を import できないこと)は、Go のモジュールで構造的に止めるのが確実です。コードの使い方の決まりは、こうした静的な検査で守ります。
+
+---
+
+## で、DI ライブラリはいつ要るのか
+
+ここまで分けると、残るのは**1 つのサービスの組み立て関数の中身**だけです。そこが手で保てなくなったときが、ライブラリを検討するときです。
+
+判断は**依存の数ではなく、組み立ての複雑さ**で行います。依存が 40 個あっても一直線に並ぶだけなら手書きで困りませんし、15 個でも構築の順序や差し替えの条件が入り組んでいれば辛くなります。
+
+次のどれかが手で保てなくなったら、検討を始めます。
+
+- 組み立てコードの変更頻度
+- 環境や機能による実装の差し替えの数
+- 資源の生成・破棄の順序の複雑さ
+- 組み立ての重複
+- 依存関係の追跡やテストのしにくさ
+
+検討するときも、まず**責務の分割を見直す**のが先です。組み立て関数が大きすぎるなら、サービスやモジュールの境界の引き方を見直すべき兆候でもあります。それでも配線の負担が残るなら、コード生成型(wire 系)と実行時解決型(fx / dig)を比べます。前者は誤りをコンパイル時に止められ、後者はライフサイクル管理まで持っています。**新規に入れるときは保守状況を確認してください**(google/wire は 2025 年にアーカイブされています)。
 
 ```mermaid
 graph TB
-    Q1{"1 サービスの依存が<br/>30〜40 を超えたか"}
-    Q1 -->|"いいえ"| A1["手書きのまま<br/>Edge + assemble で重複を消す"]
-    Q1 -->|"はい"| Q2{"サービスを<br/>分けるべきか"}
-    Q2 -->|"分ける"| A2["分割する<br/>(依存は再び小さくなる)"]
-    Q2 -->|"分けない"| A3["wire を検討する<br/>(コンパイル時に検査できる)"]
-    Q3{"サービスの数が<br/>増えてきたか"} -->|"はい"| A4["起動処理と Edge を<br/>共通パッケージに寄せる<br/>テストで構造を守る"]
+    Q0{"起動処理がサービスごとに<br/>コピーされているか"}
+    Q0 -->|"はい"| A0["合成ルートをプロセスへ寄せ<br/>ランタイムをスーパーバイザとして共通化"]
+    Q1{"1 サービスの組み立てが<br/>手で保てないほど複雑か"}
+    Q1 -->|"いいえ"| A1["手書きのまま<br/>差し替えは能力ごとに明示的に渡す"]
+    Q1 -->|"はい"| Q2{"境界の引き方に<br/>問題があるか"}
+    Q2 -->|"ある"| A2["サービスやモジュールを分け直す"]
+    Q2 -->|"ない"| A3["DI ライブラリを比較する<br/>(保守状況を確認)"]
 ```
 
 ---
 
 ## まとめ
 
-| 状況 | やること |
-|---|---|
-| **サービスが少なく、依存も 10〜20 個** | 手書きのまま。環境ごとの組み立ては `Edge` + `assemble` で重複を消す |
-| **サービスが 5〜10 に増えてきた** | **起動処理と `Edge` を共通パッケージに寄せる**。テストで構造を守る |
-| **1 サービスの依存が 30〜40 を超えた** | まず分割を検討する。分けないなら wire |
+| 責務 | 持つもの | ポイント |
+|---|---|---|
+| **合成ルート** | プロセスのエントリポイント(1 プロセスに 1 つ) | 設定・テレメトリ・共有資源。どのサービスを動かすかを決める |
+| **組み立て関数** | 各サービス | 内部を組み立ててワークロードを返す。自分では起動しない |
+| **ランタイム** | 共通パッケージ | プロセススーパーバイザ。`Run(ctx) error` だけを扱い、HTTP の概念を持たない |
 
-- **DI ライブラリは「1 つのバイナリの中の依存が多い」問題を解く。** サービスの数が増える問題は解かない
-- 手書きの注入でも、**コンパイラはコンストラクタの引数まで検査している**。検査されないのはそれ以外の重複で、そこはコードの構造で消す
-- サービスが増えて困るのは、**起動処理と環境の差し替えのコピー**。2 サービスの時点で起動処理の 86% が同じだった
-- 寄せるなら**サービスが少ないうち**。2 部のコピーなら比べて揃えるのは簡単だが、10 部になってからだと、どれが正しい版かを決めるところから始めることになる
+- **DI ライブラリの前に、組み立てと実行を分ける。** 分ければ、独立したプロセスでも 1 つのプロセスでも、同じ組み立て関数がそのまま使える
+- **差し替えは環境ではなく能力ごとに。** 環境名ひとつで複数の実装を切り替えると、組み合わせが作れない
+- **共通の契約に HTTP 固有の概念を入れない。** `Routes` を必須にしないだけで、後から実行形態を足せる
+- **1 プロセスにまとめても、データの権限は共有しない。**
+- **ライブラリの判断は依存の数ではなく、組み立ての複雑さで。** 入れるなら保守状況を確認する
