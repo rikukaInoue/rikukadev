@@ -1,0 +1,219 @@
+---
+title: "git worktree を依存・URL・Cookie・DB まで分離して数秒で作る"
+date: 2026-10-31
+tags: ["git", "開発環境", "macOS", "React Router", "MySQL"]
+description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。React Router + MySQL の TODO アプリで作成時間とディスク消費を実測し、macOS で踏んだ落とし穴もまとめる。"
+---
+
+## TL;DR
+
+1. **git worktree はソースコードしか分けない。** node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
+2. **node_modules は APFS の clonefile(`cp -c`)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない(差は誤差の範囲)
+3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。Cookie はホスト単位で保存されるので、これだけで混ざらなくなる
+4. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒。ただし DB は mysqld 起動時に書かれるファイルの分だけ、1 つ約 113MB 増える
+5. macOS では **`pgrep -E` が無い**、**bash 3.2 は `"$var（"` を unbound 扱いにする**、の 2 つで落ちた
+
+---
+
+## 何が困るのか
+
+git worktree を使うと、1 つのリポジトリから複数のブランチを別ディレクトリに同時に展開できます。Claude Code などのエージェントを並行で走らせるときにも便利です。
+
+ただし、worktree が分けるのは git が管理しているファイルだけです。新しい worktree を作った直後は次の状態になっています。
+
+| | 状態 | 困ること |
+|---|---|---|
+| node_modules | 無い | 毎回 install を待つ。ディスクも worktree の数だけ消費する |
+| `.env` | 無い | 手でコピーする必要がある |
+| dev サーバーのポート | 全部 5173 | 2 つ目が別のポートにずれ、どれがどれか分からなくなる |
+| Cookie | `localhost` で共有 | Cookie はポートを区別しないので、片方でログインするともう片方に混ざる |
+| DB | 共有 | 片方のマイグレーションやテストデータがもう片方に影響する |
+
+Cookie がポートを区別しないのは見落としやすい点です。`localhost:5173` と `localhost:5174` は、ブラウザから見ると同じホストです。
+
+これを 1 コマンドで解決します。
+
+```bash
+./scripts/wt-new.sh feat-a
+# → ../<repo>.feat-a が数秒でできて、node_modules と .env が揃っている
+cd ../<repo>.feat-a && npm run dev
+# → https://feat-a.<app>.localhost で起動。ポートも Cookie も DB も他の worktree と独立
+```
+
+---
+
+## 構成
+
+| 分けるもの | 方法 |
+|---|---|
+| node_modules | APFS の clonefile(`cp -cR`)で複製する。ロックファイルが元と違うときだけ install する |
+| `.env` など git 管理外の設定 | `cp -c` で複製する |
+| URL・ポート・Cookie | dev サーバーを [portless](https://www.npmjs.com/package/portless) で包み、worktree ごとのサブドメインにする |
+| DB | [sashiki](/blog/db-branch-sashiki-oss) でブランチ用の MySQL を作り、`.env.local` の `DATABASE_URL` を差し替える |
+
+題材は React Router(v8、Vite)+ MySQL の小さな TODO アプリです。表示名を Cookie に保存する機能を付けて、Cookie の分離を確かめられるようにしました。
+
+---
+
+## node_modules: clonefile で複製する
+
+APFS には `clonefile(2)` というシステムコールがあります。ファイルの中身をコピーせず、同じデータブロックを指す新しいファイルを作ります(copy-on-write)。書き込んだときに、書き込んだブロックだけが新しく確保されます。macOS の `cp` では `-c` で使えます。
+
+```bash
+cp -cR "$donor/node_modules" "$dst/node_modules"
+```
+
+ハードリンクとは違い、複製したファイルは別の inode です。片方の worktree で依存を追加・更新しても、もう片方には影響しません。
+
+### 複製元を固定する
+
+複製元(donor)はメインの checkout に固定しています。注意点は、**donor で install が走っている最中に複製しない**ことです。書きかけの node_modules を複製すると、壊れた状態がそのままコピーされます。
+
+スクリプトでは、install 系のコマンドを実行しているプロセスのうち、カレントディレクトリが donor のものを探して待ちます。
+
+```bash
+donor_installing() {
+  local pid cwd
+  for pid in $(pgrep -f '(npm|pnpm|yarn|bun)( [^ ]+)* (install|i|ci|add|remove|rm|update|up)( |$)' || true); do
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+    [[ $cwd == "$donor" || $cwd == "$donor"/* ]] && return 0
+  done
+  return 1
+}
+```
+
+### ロックファイルが違うときだけ install する
+
+worktree のブランチがメインと違う依存を持っていることもあります。複製したあとにロックファイルを比べ、違うときだけ install して差分を埋めます。
+
+```bash
+if ! cmp -s "$donor/$lockfile" "$dst/$lockfile"; then
+  (cd "$dst" && "$pm" install)
+fi
+```
+
+clonefile で複製した node_modules が土台にあるので、install は差分だけで済みます。実測では、1 パッケージ追加したブランチで 0.6 秒でした。
+
+`node_modules/.vite`(Vite の依存プリバンドル)も一緒に複製されるので、dev サーバーの初回起動も速くなります。逆に `.react-router/`(型生成の出力)は複製せず、各 worktree で生成させます。
+
+---
+
+## URL と Cookie: portless でサブドメインを分ける
+
+[portless](https://www.npmjs.com/package/portless) は、ポート番号の代わりに `https://<name>.localhost` という URL を割り当てるローカルプロキシです。git の linked worktree の中で起動すると、ブランチ名をサブドメインに付けます。
+
+`package.json` の `dev` を包むだけです。元のコマンドは `dev:plain` として残します。
+
+```json
+{
+  "scripts": {
+    "dev": "portless run react-router dev",
+    "dev:plain": "react-router dev"
+  }
+}
+```
+
+React Router(Vite)は環境変数 `PORT` を見ませんが、portless が `--port` と `--host` を自動で付けて起動します。
+
+2 つの worktree で起動した状態はこうなります。
+
+```
+$ portless list
+  https://wt-test-b.worktree-lab.localhost:1355  ->  localhost:4350
+  https://wt-test-a.worktree-lab.localhost:1355  ->  localhost:4795
+```
+
+ブランチ名に `/` があるときは、最後のセグメントが使われます(`feat/slash-check` → `slash-check.worktree-lab.localhost`)。
+
+Cookie はホスト単位で保存されるので、サブドメインが違えば別の Cookie になります。A の URL で表示名を保存すると、Cookie は `wt-test-a.worktree-lab.localhost` に限定して保存され、B へのリクエストには付きませんでした。
+
+### 初回起動はグローバルな設定を変える
+
+portless は初回起動時に、ローカル CA を作ってシステムの信頼ストアに登録します。さらに、既定では 443 番ポートを使うため sudo で権限を昇格します。どちらもマシン全体に効く変更なので、自分で実行して確認しました。
+
+sudo のパスワードを入力できない状況では、1355 番ポートで起動します。その場合 URL に `:1355` が付きます。
+
+---
+
+## DB: sashiki でブランチごとに分ける
+
+アプリが手元の MySQL を見ている場合、worktree を分けても DB は共有のままです。[sashiki](/blog/db-branch-sashiki-oss) は、baseline からブランチ用の MySQL を秒単位で作るツールです。macOS では APFS の clonefile でデータディレクトリを複製し、mysqld を直接起動します。
+
+`wt-new.sh` の最後で、sashiki があればブランチ用の DB を作り、`.env.local` の `DATABASE_URL` を差し替えます。
+
+```bash
+"$sashiki_bin" create --exist-ok "$db_branch"
+db_port=$("$sashiki_bin" env "$db_branch" | sed -n 's/^DB_PORT=//p')
+# スキーマを流して DATABASE_URL を .env.local に書く
+```
+
+React Router の dev サーバーは `.env` と `.env.local` の両方を読むので、worktree ごとに接続先が切り替わります。A で追加した TODO は B には表示されませんでした。
+
+`.env.local` は `.gitignore` に入れておく必要があります。git 管理外の未追跡ファイルがあると、`git worktree remove` が `--force` なしでは消せなくなるためです。
+
+---
+
+## 実測
+
+macOS 26.5.1、node_modules は 125MB です。
+
+| 項目 | 結果 |
+|---|---|
+| `wt-new.sh` 1 回目 / 2 回目 | 3.3 秒 / 2.4 秒 |
+| node_modules の複製(clonefile) | 1.2 秒。空き容量の差は ±6MB で、何もしないときの変動と同程度 |
+| node_modules の複製(`cp -R`) | 3.6 秒。125MB を消費する |
+| sashiki のブランチ 1 つ | 約 113MB |
+| install | ロックファイルが同じなら走らない。1 パッケージの差分で 0.6 秒 |
+
+ディスクの消費は `du` ではなく `df` の空き容量の差で見ています。`du` は clonefile で共有しているブロックも満額で数えるため、実際の消費より大きく出ます。
+
+### DB は clonefile でも 113MB 増える
+
+node_modules の複製はほぼ容量を使いませんが、DB は 1 つ約 113MB 増えました。clonefile で複製したデータディレクトリで mysqld を起動すると、redo log、undo tablespace、`ibtmp1` などが新しく書かれ、その分は共有されないためです。
+
+worktree を 10 個作るなら DB で約 1GB です。気になる場合は `WT_DB=0` で DB を作らないようにできます。
+
+---
+
+## macOS で踏んだ落とし穴
+
+### `pgrep` に `-E` が無い
+
+Linux の `pgrep` に合わせて `pgrep -f -E` と書いたら、macOS では `illegal option -- E` で落ちました。macOS の `pgrep` は最初から拡張正規表現で解釈するので、`-E` は不要です。
+
+### bash 3.2 で `"$dst（"` が unbound になる
+
+macOS の `/usr/bin/env bash` は、標準では bash 3.2 です。次の行が `dst�: unbound variable` で落ちました。
+
+```bash
+echo "[wt-rm] removed: $dst（ブランチ $branch は残している）"
+```
+
+bash 3.2 は、変数名の直後に全角文字があると、そのバイト列を変数名の一部として読みます。`set -u` なので、存在しない変数として止まります。`${dst}` のように波括弧で囲むと直ります。
+
+日本語のメッセージを書くシェルスクリプトでは、変数の直後に全角文字が来る箇所を全部 `${…}` にしておくのが安全です。
+
+### `sashiki env` のホスト名が解決できない
+
+`sashiki env` は `DB_HOST=sashiki.local` を返しますが、この名前は解決できませんでした。手元ではプロキシが `127.0.0.1` で待ち受けているので、`127.0.0.1` で接続しています。
+
+---
+
+## 使い終わったら
+
+```bash
+./scripts/wt-rm.sh feat-a
+```
+
+`git worktree remove` で worktree を消し、sashiki のブランチも消します。未コミットの変更がある worktree では `git worktree remove` がエラーになるので、`--force` は付けていません。git のブランチは消しません。消すかどうかは人間が決めます。
+
+---
+
+## まとめ
+
+- git worktree はソースコードしか分けないので、node_modules、`.env`、URL、Cookie、DB は別に分ける
+- node_modules は clonefile で複製すれば、時間もディスクもほぼかからない
+- portless でサブドメインを分けると、ポートの衝突と Cookie の混線が同時になくなる
+- DB は sashiki で分けられるが、1 つ約 100MB 強のディスクを使う
+
+次は、フロントエンドとバックエンドを分けたモノレポで同じことを試す予定です。
