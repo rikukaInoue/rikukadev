@@ -2,7 +2,7 @@
 title: "CoW でつくる worktree で分離された並列環境"
 date: 2026-10-31
 tags: ["AI", "ClaudeCode", "git", "開発環境", "macOS", "モノレポ", "MySQL"]
-description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile(CoW)・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。git worktree・CoW・Cookie・リバースプロキシの仕組みを図で解説し、何本まで増やせるかの上限と、古い portless で、エラーにならずに別のエージェントの API と DB に接続していた件もまとめる。"
+description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile(CoW)・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。git worktree・CoW・Cookie・リバースプロキシの仕組みを図で解説し、何本まで増やせるかの上限と、ポートの衝突でエラーにならずに別のエージェントの API と DB に接続してしまう問題と対策もまとめる。"
 ---
 
 ## TL;DR
@@ -13,7 +13,7 @@ description: "Claude Code などのエージェントを何本も並行で走ら
 4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
 5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒
 6. **「無限」の上限はメモリで決まる。** web と API を動かす worktree 1 つで約 0.9GB 使った。64GB の Mac なら、ほかの用途を差し引いて数十本が目安
-7. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを検出できず、片方の web が**エラーにならずに別の worktree の API と DB に接続していた**。並行で動くエージェント同士が互いの DB を書き換えうる
+7. **portless のポート割り当てには TOCTOU の競合状態がある。** 同時に起動した dev サーバーに同じポートが渡ることがあり、`tsx watch` のように bind 失敗後も動き続けるものでは、片方の web が**エラーにならずに別の worktree の API と DB に接続する**。bind に失敗したら dev ごと止めるようにした
 
 ---
 
@@ -616,7 +616,7 @@ web の dev スクリプトで、これを環境変数に入れます。
 
 ```json
 // apps/web/package.json
-"dev": "API_URL=$(portless get api.monorepo-lab) portless run --name web.monorepo-lab react-router dev"
+"dev": "API_URL=${API_URL:-$(portless get api.monorepo-lab)} portless run --name web.monorepo-lab react-router dev"
 ```
 
 1 回の画面表示で、リクエストは次のように流れます。
@@ -641,6 +641,43 @@ sequenceDiagram
 ```
 
 API は HTTPS で、portless のローカル CA で署名されています。portless は子プロセスに `NODE_EXTRA_CA_CERTS` を渡すので、web のサーバー側の `fetch` からもそのまま呼べました。
+
+### フロントとバックを別ブランチで動かす
+
+モノレポでは、フロントエンドとバックエンドを別のブランチで動かしたいこともあります。たとえば、フロントエンドを `feat-ui` で作りながら、バックエンドは `feat-api` で作業中のものを使う場合です。
+
+上の dev スクリプトは `API_URL=${API_URL:-...}` と書いているので、`API_URL` が指定されていればそれを使い、無ければ同じ worktree の API を使います。フロントエンド側の worktree では、web だけを起動し、`API_URL` でバックエンド側の API を指定します。
+
+```bash
+# バックエンド側: DB あり、web と API を起動
+./scripts/wt-new.sh feat-api
+cd ../worktree-monorepo-lab.feat-api && pnpm dev
+
+# フロントエンド側: DB は使わないので WT_DB=0。web だけを起動する
+WT_DB=0 ./scripts/wt-new.sh feat-ui
+cd ../worktree-monorepo-lab.feat-ui
+API_URL=https://feat-api.api.monorepo-lab.localhost pnpm --filter web dev
+```
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph ui["worktree feat-ui(DB なし)"]
+        UW["web<br/>feat-ui.web.monorepo-lab<br/>.localhost"]
+    end
+    subgraph api["worktree feat-api"]
+        AW["web<br/>feat-api.web.monorepo-lab<br/>.localhost"]
+        AA["API<br/>feat-api.api.monorepo-lab<br/>.localhost"]
+        AD[("feat-api の MySQL")]
+    end
+    UW -->|"API_URL で指定"| AA
+    AW -->|"API_URL 無し<br/>→ 同じ worktree の API"| AA
+    AA --> AD
+```
+
+試したところ、`feat-ui` の web から追加した TODO は `feat-api` の API と DB に入り、`feat-api` の web にも表示されました。
+
+シェルで `API_URL` を export したままにすると、どの worktree の web もその API に接続します。指定はコマンドの先頭に付けて、そのコマンドだけに効かせます。
 
 ### 初回起動はグローバルな設定を変える
 
@@ -702,100 +739,13 @@ node_modules の複製はほぼ容量を使いませんが、DB は 1 つ約 113
 
 ---
 
-## 問題: portless のポート衝突で別の worktree の API に接続する
+## 問題: ポートの衝突で別の worktree の API に接続する
 
-モノレポで 2 つの worktree を同時に起動したところ、次の状態になりました。
+portless は、dev サーバーのポートを 4000〜4999 番からランダムに選びます。選んだ候補で一度 listen して空いていることを確かめ、閉じてから、そのポート番号を dev サーバーに渡します。dev サーバーはあらためてそのポートで listen します。
 
-```
-https://wt-test-a.api.monorepo-lab.localhost  ->  localhost:4138
-https://wt-test-b.api.monorepo-lab.localhost  ->  localhost:4138
-```
+### TOCTOU の競合状態
 
-A と B の API が同じポートを割り当てられています。何が起きたかを順に示します。
-
-```mermaid
-sequenceDiagram
-    participant PA as portless(A の API)
-    participant AA as A の API
-    participant PB as portless(B の API)
-    participant AB as B の API(tsx watch)
-    participant WB as B の web
-
-    PA->>PA: 4138 番が空いているか確認 → 空き
-    PA->>AA: PORT=4138 で起動
-    AA->>AA: 127.0.0.1:4138 で listen
-    PB->>PB: 4138 番が空いているか確認<br/>→ 「空き」と誤判定
-    PB->>AB: PORT=4138 で起動
-    AB--xAB: EADDRINUSE(bind 失敗)
-    Note over AB: tsx watch は「変更待ち」で動き続ける
-    Note over PB: 子プロセスが生きているので<br/>ルート B → 4138 番を残す
-    WB->>PB: B の API を呼ぶ
-    PB->>AA: 4138 番に転送 = A の API
-    Note over WB,AA: B の web が A の API と A の DB を<br/>エラー無しで読み書きする
-```
-
-**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。エージェントを並行で走らせている場面なら、B のエージェントが A のエージェントの DB を書き換えていたことになります。
-
-### 原因: 古い portless の空きポート確認が `127.0.0.1` のアプリを検出できない
-
-このとき手元に入っていた portless は 0.13.0 でした。portless は 4000〜4999 番からランダムにポートを選び、0.13.0 では次の方法で空いているかを確認していました(`findFreePort`)。
-
-```js
-const tryPort = (port) => new Promise((resolve) => {
-  const server = net.createServer();
-  server.listen(port, () => server.close(() => resolve(true)));
-  server.on("error", () => resolve(false));
-});
-```
-
-「そのポートで listen してみて、成功したら空き」という確認です。ただし `listen(port)` はホスト(どのアドレスで listen するか)を指定していません。この場合 Node.js は IPv6 の `::`(すべてのアドレス)で listen しようとします。
-
-一方、portless は dev サーバーに `HOST=127.0.0.1` を渡すので、dev サーバーは IPv4 の `127.0.0.1` で listen します。macOS では、この 2 つが同じポート番号で共存できてしまいます。
-
-```mermaid
-%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
-flowchart LR
-    subgraph mac["macOS"]
-        direction TB
-        MA["A の API<br/>127.0.0.1:4138 で listen 中"]
-        MP["portless の確認<br/>[::]:4138 で listen を試す"]
-        MP -->|成功してしまう| MR["「空き」と判定<br/>→ 4138 番を B に渡す"]
-    end
-
-    subgraph linux["Linux"]
-        direction TB
-        LA["A の API<br/>127.0.0.1:4138 で listen 中"]
-        LP["portless の確認<br/>[::]:4138 で listen を試す"]
-        LP -->|EADDRINUSE| LR["「使用中」と判定<br/>→ 別のポートを選ぶ"]
-    end
-
-    MA -.-|共存できてしまう| MP
-    LA -.-|衝突する| LP
-    mac ~~~ linux
-```
-
-保持側のアドレスを変えて、この確認で使用中と分かるかを調べました。
-
-| 保持側のアドレス | macOS 26.5.1 | Linux(node:22 コンテナ) |
-|---|---|---|
-| `127.0.0.1` | 検出できない(`::` への bind が成功) | 検出する |
-| `0.0.0.0` | 検出できない | 検出する |
-| `::1` | 検出できない | 検出する |
-| `::` | 検出する | 検出する |
-
-**macOS では、`::` で listen しているもの以外を検出できません。** つまり 0.13.0 では、**portless で起動したアプリ同士を、この確認では検出できません。**
-
-portless 本体でも確かめました。`Math.random` を差し替えて、最初の候補を `127.0.0.1` で使用中のポートにすると、0.13.0 はそのポートをそのまま渡しました。
-
-### 0.15.7 で修正済み
-
-この問題は [vercel-labs/portless#288](https://github.com/vercel-labs/portless/issues/288) として報告されていて、0.15.7 で修正されています([#447](https://github.com/vercel-labs/portless/pull/447))。修正後は、候補のポートを `127.0.0.1`・`::1`・`0.0.0.0`・`::` の 4 つすべてで確かめます。同じ方法で試すと、0.15.12 は使用中のポートを避けて別のポートを渡しました。
-
-`npm i -g portless` で入れたのに 0.13.0 だった理由は分かっていません。`portless --version` で確認しておくのが確実です。
-
-### 0.15.12 でも残るもの: TOCTOU の競合状態
-
-ただし、0.15.12 でも衝突がなくなるわけではありません。portless は空きを確認したらそのポートを閉じ、dev サーバーがあらためて listen します。確認と使用の間に別のプロセスが同じポートを使うと衝突する、TOCTOU(time-of-check to time-of-use)の競合状態が残っています。
+この「確認してから使う」流れには、確認と使用の間に別のプロセスが同じポートを使うと衝突する、TOCTOU(time-of-check to time-of-use)の競合状態があります。2 つの dev サーバーを同時に起動し、たまたま同じ候補を引くと、次のようになります。
 
 ```mermaid
 sequenceDiagram
@@ -813,16 +763,44 @@ sequenceDiagram
     AB--xAB: EADDRINUSE
 ```
 
-2 つを同時に起動して同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。
+portless 0.15.12 で、`Math.random` を差し替えて 2 つに同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。この競合状態は、portless 側では解決していません。
 
-### エラーになるかどうかは dev サーバー次第
+### 衝突すると何が起きるか
 
 衝突したときの挙動は、dev サーバーによって違います。
 
 | dev サーバー | 衝突したとき |
 |---|---|
-| Vite(React Router) | portless が `--strictPort` を付けて起動するので、Vite がエラーで終了する。気付ける |
+| Vite(React Router) | portless が `--strictPort` を付けて起動するので、Vite がエラーで終了する |
 | `tsx watch` | bind に失敗しても変更待ちで動き続ける。portless のルートが残り、エラーにならずに別の worktree のアプリに接続する |
+
+`tsx watch` の場合を順に示します。検証中に、2 つの worktree の API に同じポートが割り当てられたとき、実際にこの状態になりました。
+
+```
+https://wt-test-a.api.monorepo-lab.localhost  ->  localhost:4138
+https://wt-test-b.api.monorepo-lab.localhost  ->  localhost:4138
+```
+
+```mermaid
+sequenceDiagram
+    participant PA as portless(A の API)
+    participant AA as A の API
+    participant PB as portless(B の API)
+    participant AB as B の API(tsx watch)
+    participant WB as B の web
+
+    PA->>AA: PORT=4138 で起動
+    AA->>AA: 127.0.0.1:4138 で listen
+    PB->>AB: PORT=4138 で起動
+    AB--xAB: EADDRINUSE(bind 失敗)
+    Note over AB: tsx watch は「変更待ち」で動き続ける
+    Note over PB: 子プロセスが生きているので<br/>ルート B → 4138 番を残す
+    WB->>PB: B の API を呼ぶ
+    PB->>AA: 4138 番に転送 = A の API
+    Note over WB,AA: B の web が A の API と A の DB を<br/>エラー無しで読み書きする
+```
+
+**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。エージェントを並行で走らせている場面なら、B のエージェントが A のエージェントの DB を書き換えることになります。
 
 単一アプリ版は Vite だけなので、衝突しても起動に失敗するだけで済みます。`node --watch` や nodemon も、クラッシュ後に変更待ちに入る点は `tsx watch` と同じなので、同じ問題が起きるはずです(こちらは試していません)。
 
@@ -849,7 +827,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 
 わざと衝突させて確かめました。`127.0.0.1:4777` を別プロセスで使用中にし、`PORTLESS_APP_PORT=4777` で API を起動すると、API が止まり(`exit=1`)、portless のルートも `tsx watch` のプロセスも残りませんでした。
 
-これは止まるようにするだけで、衝突そのものは防げません。止まったらもう一度起動すれば、別のポートが選ばれます。portless 0.15.7 以降でも同時起動の衝突は残るので、この対策は残しています。
+これはエラーで止まるようにするだけで、衝突そのものは防げません。止まったらもう一度起動すれば、別のポートが選ばれます。
 
 ---
 
@@ -961,4 +939,4 @@ flowchart TB
 - Cookie はポートを区別しないので、portless でサブドメインを分ける。エージェントごとに固定の URL ができる。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API の URL を取得する
 - DB は sashiki で分けられる。1 つ約 100MB 強のディスクと約 130MB のメモリを使う
 - 上限は主にメモリと sashiki の `max_branches` で決まる。dev サーバーを確かめるときだけ起動すれば、本数はさらに増やせる
-- portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡し、並行するエージェント同士が互いの DB につながりうる。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
+- portless のポート割り当てには TOCTOU の競合状態があり、同時起動では衝突しうる。衝突すると、並行するエージェント同士が互いの API と DB に接続しうるので、bind に失敗した dev サーバーが動き続けないようにする
