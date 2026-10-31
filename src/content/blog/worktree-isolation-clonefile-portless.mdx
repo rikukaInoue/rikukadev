@@ -1,17 +1,18 @@
 ---
 title: "git worktree を依存・URL・Cookie・DB まで分離して数秒で作る"
 date: 2026-10-31
-tags: ["git", "開発環境", "macOS", "React Router", "MySQL"]
-description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。React Router + MySQL の TODO アプリで作成時間とディスク消費を実測し、macOS で踏んだ落とし穴もまとめる。"
+tags: ["git", "開発環境", "macOS", "React Router", "MySQL", "モノレポ", "pnpm"]
+description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。単一の React Router アプリと、web と API を分けた pnpm モノレポで実測し、portless の空きポート確認が macOS で別の worktree の API に黙ってつなげてしまう件と対策もまとめる。"
 ---
 
 ## TL;DR
 
 1. **git worktree はソースコードしか分けない。** node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
-2. **node_modules は APFS の clonefile(`cp -c`)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない(差は誤差の範囲)
-3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。Cookie はホスト単位で保存されるので、これだけで混ざらなくなる
-4. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒。ただし DB は mysqld 起動時に書かれるファイルの分だけ、1 つ約 113MB 増える
-5. macOS では **`pgrep -E` が無い**、**bash 3.2 は `"$var（"` を unbound 扱いにする**、の 2 つで落ちた
+2. **node_modules は APFS の clonefile(`cp -c`)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、symlink が相対パスなのでそのまま動く
+3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。Cookie はホスト単位で保存されるので、これで混ざらなくなる
+4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
+5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒。ただし DB は 1 つ約 113MB 増える
+6. **portless の空きポート確認は、macOS で `127.0.0.1` のアプリを見落とす。** 2 つの worktree の API が同じポートを割り当てられ、片方の web が**エラー無しで別の worktree の API と DB を見ていた**。bind に失敗した dev サーバーが動き続けないようにして対処した
 
 ---
 
@@ -51,7 +52,34 @@ cd ../<repo>.feat-a && npm run dev
 | URL・ポート・Cookie | dev サーバーを [portless](https://www.npmjs.com/package/portless) で包み、worktree ごとのサブドメインにする |
 | DB | [sashiki](/blog/db-branch-sashiki-oss) でブランチ用の MySQL を作り、`.env.local` の `DATABASE_URL` を差し替える |
 
-題材は React Router(v8、Vite)+ MySQL の小さな TODO アプリです。表示名を Cookie に保存する機能を付けて、Cookie の分離を確かめられるようにしました。
+題材は 2 つ用意しました。どちらも表示名を Cookie に保存する TODO アプリです。
+
+- **単一アプリ**: React Router(v8、Vite)+ MySQL。npm
+- **モノレポ**: pnpm workspace で、web と API を別々の dev サーバーとして動かす
+
+```
+worktree-monorepo-lab/
+├── apps/
+│   ├── web/        # React Router v8（SSR）。loader から API を呼ぶ
+│   └── api/        # Hono + mysql2
+├── packages/
+│   └── shared/     # web と api で共有する型
+└── scripts/
+    ├── wt-new.sh
+    └── wt-rm.sh
+```
+
+モノレポはルートの `pnpm dev` で web と api を並列に起動します。
+
+```json
+{
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter './apps/*' dev"
+  }
+}
+```
+
+`--filter './apps/*'` はクォートが必要です。クォートしないとシェルが glob を展開し、`None of the selected packages has a "./apps/web" script` で失敗します。
 
 ---
 
@@ -64,6 +92,25 @@ cp -cR "$donor/node_modules" "$dst/node_modules"
 ```
 
 ハードリンクとは違い、複製したファイルは別の inode です。片方の worktree で依存を追加・更新しても、もう片方には影響しません。
+
+### pnpm のモノレポでもそのまま複製できる
+
+pnpm の node_modules は、ルートの `node_modules/.pnpm` に実体があり、各パッケージの node_modules からは symlink で参照されます。
+
+```
+apps/web/node_modules/react -> ../../../node_modules/.pnpm/react@19.3.1/node_modules/react
+apps/web/node_modules/@lab/shared -> ../../../../packages/shared
+```
+
+symlink はすべて相対パスです。`node_modules/.modules.yaml` に入っている絶対パスも、pnpm の共有ストアの場所(`storeDir`)だけでした。そのため、ルートと `apps/*`・`packages/*` の node_modules を同じ相対位置に複製すれば、そのまま動きます。
+
+```bash
+for rel in node_modules apps/*/node_modules packages/*/node_modules; do
+  cp -cR "$donor/$rel" "$dst/$rel"
+done
+```
+
+`.pnpm` の中のファイルは pnpm のストアへのハードリンクですが、clonefile で複製すると別の inode になります。片方の worktree で `pnpm --filter api add left-pad` しても、メインと他の worktree には入りませんでした。
 
 ### 複製元を固定する
 
@@ -92,7 +139,7 @@ if ! cmp -s "$donor/$lockfile" "$dst/$lockfile"; then
 fi
 ```
 
-clonefile で複製した node_modules が土台にあるので、install は差分だけで済みます。実測では、1 パッケージ追加したブランチで 0.6 秒でした。
+clonefile で複製した node_modules が土台にあるので、install は差分だけで済みます。1 パッケージ追加したブランチで、npm は 0.6 秒、pnpm は 0.4 秒でした。
 
 `node_modules/.vite`(Vite の依存プリバンドル)も一緒に複製されるので、dev サーバーの初回起動も速くなります。逆に `.react-router/`(型生成の出力)は複製せず、各 worktree で生成させます。
 
@@ -119,13 +166,52 @@ React Router(Vite)は環境変数 `PORT` を見ませんが、portless が `--po
 
 ```
 $ portless list
-  https://wt-test-b.worktree-lab.localhost:1355  ->  localhost:4350
-  https://wt-test-a.worktree-lab.localhost:1355  ->  localhost:4795
+  https://wt-test-b.worktree-lab.localhost  ->  localhost:4350
+  https://wt-test-a.worktree-lab.localhost  ->  localhost:4795
 ```
 
 ブランチ名に `/` があるときは、最後のセグメントが使われます(`feat/slash-check` → `slash-check.worktree-lab.localhost`)。
 
 Cookie はホスト単位で保存されるので、サブドメインが違えば別の Cookie になります。A の URL で表示名を保存すると、Cookie は `wt-test-a.worktree-lab.localhost` に限定して保存され、B へのリクエストには付きませんでした。
+
+### モノレポではアプリ名を明示する
+
+portless は、名前を指定しないとパッケージ名から付けます。`apps/web` のパッケージ名が `web` だと `https://web.localhost` になり、他のプロジェクトの `web` とぶつかります。そこで、アプリごとに名前を明示します。
+
+```json
+// apps/api/package.json
+"dev": "portless run --name api.monorepo-lab tsx watch src/index.ts"
+```
+
+worktree の中では、これにブランチ名が付きます。
+
+```
+https://wt-test-a.api.monorepo-lab.localhost
+https://wt-test-a.web.monorepo-lab.localhost
+https://wt-test-b.api.monorepo-lab.localhost
+https://wt-test-b.web.monorepo-lab.localhost
+```
+
+### web から同じ worktree の API を見つける
+
+web の loader は API をサーバー側で呼びます。このとき、**自分と同じ worktree の API** を呼ぶ必要があります。
+
+`portless get <name>` は、`portless run` と同じ規則で URL を組み立てて出力します。worktree の中で実行すると、ブランチ名の付いた URL が返ります。
+
+```bash
+$ cd ../worktree-monorepo-lab.probe/apps/api
+$ portless get api.monorepo-lab
+https://probe.api.monorepo-lab.localhost
+```
+
+web の dev スクリプトで、これを環境変数に入れます。
+
+```json
+// apps/web/package.json
+"dev": "API_URL=$(portless get api.monorepo-lab) portless run --name web.monorepo-lab react-router dev"
+```
+
+API は HTTPS で、portless のローカル CA で署名されています。portless は子プロセスに `NODE_EXTRA_CA_CERTS` を渡すので、web のサーバー側の `fetch` からもそのまま呼べました。
 
 ### 初回起動はグローバルな設定を変える
 
@@ -147,23 +233,108 @@ db_port=$("$sashiki_bin" env "$db_branch" | sed -n 's/^DB_PORT=//p')
 # スキーマを流して DATABASE_URL を .env.local に書く
 ```
 
-React Router の dev サーバーは `.env` と `.env.local` の両方を読むので、worktree ごとに接続先が切り替わります。A で追加した TODO は B には表示されませんでした。
+単一アプリでは、React Router の dev サーバーが `.env` と `.env.local` の両方を読むので、worktree ごとに接続先が切り替わります。
+
+モノレポでは、`DATABASE_URL` をルートの `.env.local` に書き、API が起動時にルートの `.env.local` → `.env` の順に読みます。`process.loadEnvFile` はすでに設定されている環境変数を上書きしないので、先に読んだ `.env.local` が優先されます。
+
+```ts
+const root = resolve(import.meta.dirname, "../../..");
+for (const f of [".env.local", ".env"]) {
+  const p = resolve(root, f);
+  if (existsSync(p)) process.loadEnvFile(p);
+}
+```
+
+どちらの構成でも、A で追加した TODO は A にだけ、B で追加したものは B にだけ表示されました。
 
 `.env.local` は `.gitignore` に入れておく必要があります。git 管理外の未追跡ファイルがあると、`git worktree remove` が `--force` なしでは消せなくなるためです。
 
 ---
 
+## 落とし穴: portless のポート衝突で別の worktree の API につながる
+
+モノレポで 2 つの worktree を同時に起動したところ、次の状態になりました。
+
+```
+https://wt-test-a.api.monorepo-lab.localhost  ->  localhost:4138
+https://wt-test-b.api.monorepo-lab.localhost  ->  localhost:4138
+```
+
+A と B の API が同じポートを割り当てられています。B の API は `EADDRINUSE` で bind に失敗しましたが、`tsx watch` は「ファイルの変更待ち」で動き続けます。portless から見ると子プロセスは生きているので、B のルートは 4138 番を指したままです。
+
+結果として、**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。
+
+### 原因: 空きポート確認が `127.0.0.1` のアプリを見落とす
+
+portless は 4000〜4999 番からランダムにポートを選び、次の方法で空いているかを確認します(portless 0.13.0 の `findFreePort`)。
+
+```js
+const tryPort = (port) => new Promise((resolve) => {
+  const server = net.createServer();
+  server.listen(port, () => server.close(() => resolve(true)));
+  server.on("error", () => resolve(false));
+});
+```
+
+`listen(port)` はホストを指定していません。この場合 Node.js は IPv6 の `::` に bind します。macOS では、**別のプロセスが `127.0.0.1` の同じポートで待ち受けていても、`::` への bind は成功します。**
+
+```js
+// 127.0.0.1:4555 を使用中にしてから、portless と同じ方法で確認する
+net.createServer().listen(4555, "127.0.0.1", () => {
+  net.createServer().listen(4555, function () {
+    console.log(this.address()); // { address: '::', family: 'IPv6', port: 4555 } ← 成功する
+  });
+});
+```
+
+そして portless は、子プロセスに `HOST=127.0.0.1` を渡します。つまり、**portless で起動したアプリ同士は、この確認では互いに見えません。** 起動中のアプリが 1 つ増えるたびに、新しく起動するアプリが既存のポートを引く確率が約 1/1000 ずつ上がります。モノレポは 1 つの worktree で 2 つ以上のアプリを動かすので、増え方が速くなります。
+
+### 黙ってつながるかどうかは dev サーバー次第
+
+衝突したときの挙動は、dev サーバーによって違います。
+
+| dev サーバー | 衝突したとき |
+|---|---|
+| Vite(React Router) | portless が `--strictPort` を付けて起動するので、Vite がエラーで終了する。気付ける |
+| `tsx watch` | bind に失敗しても変更待ちで動き続ける。portless のルートが残り、別の worktree のアプリに黙ってつながる |
+
+単一アプリ版は Vite だけなので、衝突しても起動に失敗するだけで済みます。`node --watch` や nodemon も、クラッシュ後に変更待ちに入る点は `tsx watch` と同じなので、同じ問題が起きるはずです(こちらは試していません)。
+
+### 対策: bind に失敗したら親ごと止める
+
+API で bind の失敗を受け取ったら、親の `tsx watch` ごと止めるようにしました。portless の子プロセスが終了するので、portless もルートを外して終了します。
+
+```ts
+server.on("error", (err: NodeJS.ErrnoException) => {
+  console.error(`api: ${port} 番を使えない（${err.code}）。dev を止める`);
+  if (process.env.PORTLESS_URL) process.kill(process.ppid, "SIGTERM");
+  process.exit(1);
+});
+```
+
+わざと衝突させて確かめました。`127.0.0.1:4777` を別プロセスで使用中にし、`PORTLESS_APP_PORT=4777` で API を起動すると、API が止まり(`exit=1`)、portless のルートも `tsx watch` のプロセスも残りませんでした。
+
+これは止まるようにするだけで、衝突そのものは防げません。止まったらもう一度起動すれば、別のポートが選ばれます。
+
+---
+
 ## 実測
 
-macOS 26.5.1、node_modules は 125MB です。
+macOS 26.5.1 です。node_modules は単一アプリが 125MB、モノレポのルートが 132MB です。
+
+| 項目 | 単一アプリ(npm) | モノレポ(pnpm) |
+|---|---|---|
+| `wt-new.sh` の作成時間 | 2.4〜3.3 秒 | 3.2〜4.7 秒 |
+| install | ロックファイルが同じなら走らない。差分 1 パッケージで 0.6 秒 | 同じく走らない。差分 1 パッケージで 0.4 秒 |
+| URL | 2 つとも 200 | web・api の 4 つとも 200 |
+
+作成時間の大半は sashiki の DB 作成です。
 
 | 項目 | 結果 |
 |---|---|
-| `wt-new.sh` 1 回目 / 2 回目 | 3.3 秒 / 2.4 秒 |
 | node_modules の複製(clonefile) | 1.2 秒。空き容量の差は ±6MB で、何もしないときの変動と同程度 |
 | node_modules の複製(`cp -R`) | 3.6 秒。125MB を消費する |
 | sashiki のブランチ 1 つ | 約 113MB |
-| install | ロックファイルが同じなら走らない。1 パッケージの差分で 0.6 秒 |
 
 ディスクの消費は `du` ではなく `df` の空き容量の差で見ています。`du` は clonefile で共有しているブロックも満額で数えるため、実際の消費より大きく出ます。
 
@@ -175,7 +346,7 @@ worktree を 10 個作るなら DB で約 1GB です。気になる場合は `WT
 
 ---
 
-## macOS で踏んだ落とし穴
+## macOS で踏んだその他の落とし穴
 
 ### `pgrep` に `-E` が無い
 
@@ -212,8 +383,7 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 ## まとめ
 
 - git worktree はソースコードしか分けないので、node_modules、`.env`、URL、Cookie、DB は別に分ける
-- node_modules は clonefile で複製すれば、時間もディスクもほぼかからない
-- portless でサブドメインを分けると、ポートの衝突と Cookie の混線が同時になくなる
+- node_modules は clonefile で複製すれば、時間もディスクもほぼかからない。pnpm のモノレポでもそのまま使える
+- portless でサブドメインを分けると、ポート番号を覚える必要がなくなり、Cookie も混ざらない。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
+- portless の空きポート確認は、macOS で `127.0.0.1` のアプリを見落とす。ポートが衝突しうる前提で、bind に失敗した dev サーバーが動き続けないようにする
 - DB は sashiki で分けられるが、1 つ約 100MB 強のディスクを使う
-
-次は、フロントエンドとバックエンドを分けたモノレポで同じことを試す予定です。
