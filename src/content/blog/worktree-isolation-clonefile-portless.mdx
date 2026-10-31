@@ -2,7 +2,7 @@
 title: "git worktree を依存・URL・Cookie・DB まで分離して数秒で作る"
 date: 2026-10-31
 tags: ["git", "開発環境", "macOS", "React Router", "MySQL", "モノレポ", "pnpm"]
-description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。単一の React Router アプリと、web と API を分けた pnpm モノレポで実測し、portless の空きポート確認が macOS で別の worktree の API に黙ってつなげてしまう件と対策もまとめる。"
+description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。単一の React Router アプリと、web と API を分けた pnpm モノレポで実測し、古い portless が macOS で使用中のポートを渡し、別の worktree の API に黙ってつながった件と対策もまとめる。"
 ---
 
 ## TL;DR
@@ -12,7 +12,7 @@ description: "git worktree で並行作業するときに残る、node_modules �
 3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。Cookie はホスト単位で保存されるので、これで混ざらなくなる
 4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
 5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒。ただし DB は 1 つ約 113MB 増える
-6. **portless の空きポート確認は、macOS で `127.0.0.1` のアプリを見落とす。** 2 つの worktree の API が同じポートを割り当てられ、片方の web が**エラー無しで別の worktree の API と DB を見ていた**。bind に失敗した dev サーバーが動き続けないようにして対処した
+6. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを見落とし、2 つの worktree の API に同じポートを渡した。片方の web は**エラー無しで別の worktree の API と DB を見ていた**。0.15.7 で修正済みだが、同時起動の衝突は残るので、bind に失敗した dev サーバーが動き続けないようにもした
 
 ---
 
@@ -264,9 +264,9 @@ A と B の API が同じポートを割り当てられています。B の API 
 
 結果として、**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。
 
-### 原因: 空きポート確認が `127.0.0.1` のアプリを見落とす
+### 原因: 古い portless の空きポート確認が `127.0.0.1` のアプリを見落とす
 
-portless は 4000〜4999 番からランダムにポートを選び、次の方法で空いているかを確認します(portless 0.13.0 の `findFreePort`)。
+このとき手元に入っていた portless は 0.13.0 でした。portless は 4000〜4999 番からランダムにポートを選び、0.13.0 では次の方法で空いているかを確認していました(`findFreePort`)。
 
 ```js
 const tryPort = (port) => new Promise((resolve) => {
@@ -276,18 +276,26 @@ const tryPort = (port) => new Promise((resolve) => {
 });
 ```
 
-`listen(port)` はホストを指定していません。この場合 Node.js は IPv6 の `::` に bind します。macOS では、**別のプロセスが `127.0.0.1` の同じポートで待ち受けていても、`::` への bind は成功します。**
+`listen(port)` はホストを指定していません。この場合 Node.js は IPv6 の `::` に bind します。別のプロセスがあるアドレスでそのポートを使っているときに、この確認で使用中と分かるかを、保持側のアドレスを変えて調べました。
 
-```js
-// 127.0.0.1:4555 を使用中にしてから、portless と同じ方法で確認する
-net.createServer().listen(4555, "127.0.0.1", () => {
-  net.createServer().listen(4555, function () {
-    console.log(this.address()); // { address: '::', family: 'IPv6', port: 4555 } ← 成功する
-  });
-});
-```
+| 保持側のアドレス | macOS 26.5.1 | Linux(node:22 コンテナ) |
+|---|---|---|
+| `127.0.0.1` | 見落とす(`::` への bind が成功) | 検出する |
+| `0.0.0.0` | 見落とす | 検出する |
+| `::1` | 見落とす | 検出する |
+| `::` | 検出する | 検出する |
 
-そして portless は、子プロセスに `HOST=127.0.0.1` を渡します。つまり、**portless で起動したアプリ同士は、この確認では互いに見えません。** 起動中のアプリが 1 つ増えるたびに、新しく起動するアプリが既存のポートを引く確率が約 1/1000 ずつ上がります。モノレポは 1 つの worktree で 2 つ以上のアプリを動かすので、増え方が速くなります。
+**macOS では、`::` で待ち受けているもの以外を見落とします。** そして portless は、子プロセスに `HOST=127.0.0.1` を渡します。つまり、0.13.0 では **portless で起動したアプリ同士が、この確認では互いに見えません。**
+
+portless 本体でも確かめました。`Math.random` を差し替えて、最初の候補を `127.0.0.1` で使用中のポートにすると、0.13.0 はそのポートをそのまま渡しました。
+
+### 0.15.7 で修正済み
+
+この問題は [vercel-labs/portless#288](https://github.com/vercel-labs/portless/issues/288) として報告されていて、0.15.7 で修正されています([#447](https://github.com/vercel-labs/portless/pull/447))。修正後は、候補のポートを `127.0.0.1`・`::1`・`0.0.0.0`・`::` の 4 つすべてで確かめます。同じ方法で試すと、0.15.12 は使用中のポートを避けて別のポートを渡しました。
+
+`npm i -g portless` で入れたのに 0.13.0 だった理由は分かっていません。`portless --version` で確認しておくのが確実です。
+
+ただし、0.15.12 でも衝突がなくなるわけではありません。確認してからポートを閉じ、子プロセスが bind するまでに隙間があります。2 つを同時に起動して同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。
 
 ### 黙ってつながるかどうかは dev サーバー次第
 
@@ -314,7 +322,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 
 わざと衝突させて確かめました。`127.0.0.1:4777` を別プロセスで使用中にし、`PORTLESS_APP_PORT=4777` で API を起動すると、API が止まり(`exit=1`)、portless のルートも `tsx watch` のプロセスも残りませんでした。
 
-これは止まるようにするだけで、衝突そのものは防げません。止まったらもう一度起動すれば、別のポートが選ばれます。
+これは止まるようにするだけで、衝突そのものは防げません。止まったらもう一度起動すれば、別のポートが選ばれます。portless 0.15.7 以降でも同時起動の衝突は残るので、この対策は残しています。
 
 ---
 
@@ -385,5 +393,5 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 - git worktree はソースコードしか分けないので、node_modules、`.env`、URL、Cookie、DB は別に分ける
 - node_modules は clonefile で複製すれば、時間もディスクもほぼかからない。pnpm のモノレポでもそのまま使える
 - portless でサブドメインを分けると、ポート番号を覚える必要がなくなり、Cookie も混ざらない。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
-- portless の空きポート確認は、macOS で `127.0.0.1` のアプリを見落とす。ポートが衝突しうる前提で、bind に失敗した dev サーバーが動き続けないようにする
+- portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡す。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
 - DB は sashiki で分けられるが、1 つ約 100MB 強のディスクを使う
