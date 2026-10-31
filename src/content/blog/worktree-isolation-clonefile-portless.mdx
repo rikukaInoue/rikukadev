@@ -1,5 +1,5 @@
 ---
-title: "エージェントに無限に並行開発させる環境を git worktree で作る"
+title: "CoW でつくる worktree で分離された並列環境"
 date: 2026-10-31
 tags: ["AI", "ClaudeCode", "git", "開発環境", "macOS", "モノレポ", "MySQL"]
 description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。何本まで増やせるかの上限と、古い portless で別のエージェントの API と DB に黙ってつながった件もまとめる。"
