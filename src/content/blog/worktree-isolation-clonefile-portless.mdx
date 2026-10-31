@@ -709,13 +709,24 @@ flowchart LR
 - baseline のデータディレクトリを clonefile で複製し、ブランチごとに専用の mysqld を起動します
 - 接続先は全ブランチ共通の 1 つのポート(この環境では 28306)で、**ユーザー名の `@` 以降**でどのブランチにつなぐかを決めます
 
-`wt-new.sh` の最後で、sashiki があればブランチ用の DB を作り、`.env.local` の `DATABASE_URL` を差し替えます。
+`wt-new.sh` の最後で、sashiki があればブランチ用の DB を作り、接続先を worktree の `.env.local` に書きます。
 
 ```bash
-"$sashiki_bin" create --exist-ok "$db_branch"
-db_port=$("$sashiki_bin" env "$db_branch" | sed -n 's/^DB_PORT=//p')
-# スキーマを流して DATABASE_URL を .env.local に書く
+export SASHIKI_DB_HOST=127.0.0.1 SASHIKI_DB_PASSWORD=dev
+sashiki create --exist-ok "$db_branch"
+sashiki env "$db_branch" --url-var DATABASE_URL --db app --write "$dst/.env.local"
 ```
+
+`sashiki env --write` は、`.env.local` の同じキーの行だけを置き換え、人が書いたほかの行は残します。書かれる内容は次のとおりです。
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=28306
+DB_USER=dev@feat-a
+DATABASE_URL=mysql://dev%40feat-a:dev@127.0.0.1:28306/app
+```
+
+ユーザー名の `@` は `%40` にエスケープされます。そのままだと、ドライバがホストとの区切りと読み違えるためです。この `--url-var` と `--write` は、今回の用途のために sashiki に足しました(sashiki の main に入っていて、次のリリースに含まれます)。
 
 単一アプリでは、React Router の dev サーバーが `.env` と `.env.local` の両方を読むので、worktree ごとに接続先が切り替わります。
 
@@ -910,6 +921,19 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 ### `sashiki env` のホスト名が解決できない
 
 `sashiki env` は `DB_HOST=sashiki.local` を返しますが、この名前は解決できませんでした。手元ではプロキシが `127.0.0.1` で listen しているので、`127.0.0.1` で接続しています。
+
+---
+
+## 既存の worktree ツールと組み合わせる
+
+worktree を作って node_modules などを CoW で複製する部分は、既存のツールにもあります。たとえば次の 2 つは、作成後に任意のコマンドを実行できます(README で確認した範囲)。
+
+| ツール | CoW での複製 | 作成後のコマンド |
+|---|---|---|
+| [wtx](https://github.com/bkildow/wt-cli)(旧 wt-cli) | APFS・btrfs・XFS では reflink で複製し、それ以外は通常のコピーにする | `.worktree.yml` の `setup`。`WTX_BRANCH_NAME` などの環境変数が渡る |
+| [rabi](https://github.com/phantompane/phantom)(旧 phantom) | README からは確認できなかった | 作成後と削除前の hook |
+
+アプリごとに違うのは、DB と URL の部分です。既存のツールを使う場合も、作成後のコマンドから `sashiki create` と `sashiki env --write` を呼べば、ブランチ用の DB の接続先を worktree の `.env.local` に書けます。URL は、各アプリの dev スクリプトを `portless run` 経由にするだけです。
 
 ---
 
