@@ -1,38 +1,41 @@
 ---
-title: "git worktree を依存・URL・Cookie・DB まで分離して数秒で作る"
+title: "エージェントに無限に並行開発させる環境を git worktree で作る"
 date: 2026-10-31
-tags: ["git", "開発環境", "macOS", "React Router", "MySQL", "モノレポ", "pnpm"]
-description: "git worktree で並行作業するときに残る、node_modules の install 待ち、ポート衝突、Cookie の混線、DB の共有を、APFS の clonefile・portless・sashiki で分ける。単一の React Router アプリと、web と API を分けた pnpm モノレポで実測し、古い portless が macOS で使用中のポートを渡し、別の worktree の API に黙ってつながった件と対策もまとめる。"
+tags: ["AI", "ClaudeCode", "git", "開発環境", "macOS", "モノレポ", "MySQL"]
+description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。何本まで増やせるかの上限と、古い portless で別のエージェントの API と DB に黙ってつながった件もまとめる。"
 ---
 
 ## TL;DR
 
-1. **git worktree はソースコードしか分けない。** node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
+1. **エージェントを並行で走らせる単位は git worktree。** ただし worktree はソースコードしか分けないので、node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
 2. **node_modules は APFS の clonefile(`cp -c`)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、symlink が相対パスなのでそのまま動く
-3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。Cookie はホスト単位で保存されるので、これで混ざらなくなる
+3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。エージェントは自分の URL で動作を確かめられ、Cookie も混ざらない
 4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
-5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒。ただし DB は 1 つ約 113MB 増える
-6. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを見落とし、2 つの worktree の API に同じポートを渡した。片方の web は**エラー無しで別の worktree の API と DB を見ていた**。0.15.7 で修正済みだが、同時起動の衝突は残るので、bind に失敗した dev サーバーが動き続けないようにもした
+5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒
+6. **「無限」の上限はメモリで決まる。** web と API を動かす worktree 1 つで約 0.9GB 使った。64GB の Mac なら、ほかの用途を差し引いて数十本が目安
+7. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを見落とし、片方の web が**エラー無しで別の worktree の API と DB を見ていた**。並行で動くエージェント同士が互いの DB を書き換えうる
 
 ---
 
-## 何が困るのか
+## なぜ作業場所を分けるのか
 
-git worktree を使うと、1 つのリポジトリから複数のブランチを別ディレクトリに同時に展開できます。Claude Code などのエージェントを並行で走らせるときにも便利です。
+Claude Code などのコーディングエージェントは、1 つ指示すると数分から数十分ひとりで作業します。その間に別の作業を別のエージェントに任せられれば、人間は指示とレビューに専念できます。
+
+エージェントを並行で走らせるには、1 本ごとに独立した作業場所が要ります。同じディレクトリで 2 本が動くと、片方の変更がもう片方のテストを壊します。そこで使うのが git worktree です。1 つのリポジトリから複数のブランチを別ディレクトリに同時に展開でき、エージェント 1 本に worktree 1 つを割り当てられます。
 
 ただし、worktree が分けるのは git が管理しているファイルだけです。新しい worktree を作った直後は次の状態になっています。
 
-| | 状態 | 困ること |
+| | 状態 | 並行で動くエージェントにとって困ること |
 |---|---|---|
-| node_modules | 無い | 毎回 install を待つ。ディスクも worktree の数だけ消費する |
-| `.env` | 無い | 手でコピーする必要がある |
-| dev サーバーのポート | 全部 5173 | 2 つ目が別のポートにずれ、どれがどれか分からなくなる |
-| Cookie | `localhost` で共有 | Cookie はポートを区別しないので、片方でログインするともう片方に混ざる |
-| DB | 共有 | 片方のマイグレーションやテストデータがもう片方に影響する |
+| node_modules | 無い | 作業を始める前に毎回 install を待つ。ディスクも worktree の数だけ消費する |
+| `.env` | 無い | 起動できない。手でコピーする必要がある |
+| dev サーバーのポート | 全部 5173 | 2 本目以降が別のポートにずれ、エージェントがどの URL で確かめればよいか分からない |
+| Cookie | `localhost` で共有 | Cookie はポートを区別しないので、片方のログイン状態がもう片方に混ざる |
+| DB | 共有 | 片方のマイグレーションやテストデータが、もう片方のエージェントの結果を変える |
 
 Cookie がポートを区別しないのは見落としやすい点です。`localhost:5173` と `localhost:5174` は、ブラウザから見ると同じホストです。
 
-これを 1 コマンドで解決します。
+エージェントを好きなだけ増やすには、これらがすべて分かれた作業場所を、待たずに用意できる必要があります。ここでは 1 コマンド数秒で作れるようにします。
 
 ```bash
 ./scripts/wt-new.sh feat-a
@@ -40,6 +43,8 @@ Cookie がポートを区別しないのは見落としやすい点です。`loc
 cd ../<repo>.feat-a && npm run dev
 # → https://feat-a.<app>.localhost で起動。ポートも Cookie も DB も他の worktree と独立
 ```
+
+エージェントには、この worktree のディレクトリと URL を渡して作業させます。
 
 ---
 
@@ -326,6 +331,26 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 
 ---
 
+## 何本まで増やせるか
+
+「無限に」と言っても、実際には上限があります。モノレポ(web と API)の worktree を 1 つ起動して、使う資源を測りました。
+
+| 資源 | worktree 1 つあたり | 上限を決めるもの |
+|---|---|---|
+| メモリ(dev サーバー一式) | 約 790MB | pnpm と portless のラッパー、tsx、Vite(esbuild を含む)の RSS の合計 |
+| メモリ(mysqld) | 約 130MB | sashiki のブランチ 1 つ |
+| ディスク | 約 113MB | ほぼ DB の分。node_modules はほぼ 0 |
+| ポート | 2 つ | portless の割り当て範囲は 4000〜4999 の 1000 個 |
+| DB のブランチ数 | 1 つ | sashiki の設定 `max_branches`(この環境では 20) |
+
+RSS の合計は共有ページを重複して数えるので、実際の使用量はこれより少なめです。それでも目安として、**1 本あたり約 0.9GB** です。64GB の Mac で、OS やエディタ、エージェント本体の分を差し引くと、数十本が現実的な上限です。
+
+先に当たりやすいのは、メモリよりも設定の上限です。sashiki の `max_branches` はこの環境では 20 なので、それ以上並べるなら設定を上げます。DB を使わない作業なら `WT_DB=0` で作れば、DB の分の資源は要りません。
+
+また、dev サーバーは常に動かしておく必要はありません。エージェントが動作を確かめるときだけ `npm run dev` で起動し、終わったら止めれば、同時に動くのは確認中の数本だけになります。
+
+---
+
 ## 実測
 
 macOS 26.5.1 です。node_modules は単一アプリが 125MB、モノレポのルートが 132MB です。
@@ -390,8 +415,9 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 
 ## まとめ
 
-- git worktree はソースコードしか分けないので、node_modules、`.env`、URL、Cookie、DB は別に分ける
+- エージェントを並行で走らせる単位は git worktree。ただしソースコード以外(node_modules、`.env`、URL、Cookie、DB)は自分で分ける
 - node_modules は clonefile で複製すれば、時間もディスクもほぼかからない。pnpm のモノレポでもそのまま使える
-- portless でサブドメインを分けると、ポート番号を覚える必要がなくなり、Cookie も混ざらない。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
-- portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡す。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
-- DB は sashiki で分けられるが、1 つ約 100MB 強のディスクを使う
+- portless でサブドメインを分けると、エージェントごとに固定の URL ができ、Cookie も混ざらない。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
+- DB は sashiki で分けられる。1 つ約 100MB 強のディスクと約 130MB のメモリを使う
+- 上限は主にメモリと sashiki の `max_branches` で決まる。dev サーバーを確かめるときだけ起動すれば、本数はさらに増やせる
+- portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡し、並行するエージェント同士が互いの DB につながりうる。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
