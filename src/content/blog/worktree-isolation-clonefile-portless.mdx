@@ -2,13 +2,13 @@
 title: "CoW でつくる worktree で分離された並列環境"
 date: 2026-10-31
 tags: ["AI", "ClaudeCode", "git", "開発環境", "macOS", "モノレポ", "MySQL"]
-description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。何本まで増やせるかの上限と、古い portless で別のエージェントの API と DB に黙ってつながった件もまとめる。"
+description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile(CoW)・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。git worktree・CoW・Cookie・リバースプロキシの仕組みを図で解説し、何本まで増やせるかの上限と、古い portless で別のエージェントの API と DB に黙ってつながった件もまとめる。"
 ---
 
 ## TL;DR
 
 1. **エージェントを並行で走らせる単位は git worktree。** ただし worktree はソースコードしか分けないので、node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
-2. **node_modules は APFS の clonefile(`cp -c`)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、symlink が相対パスなのでそのまま動く
+2. **node_modules は APFS の clonefile(CoW)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、symlink が相対パスなのでそのまま動く
 3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。エージェントは自分の URL で動作を確かめられ、Cookie も混ざらない
 4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
 5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒
@@ -17,13 +17,82 @@ description: "Claude Code などのエージェントを何本も並行で走ら
 
 ---
 
+## 全体像
+
+最初に、できあがる環境の全体を示します。エージェント 1 本につき worktree を 1 つ割り当て、その worktree の中で依存・設定・URL・DB まで閉じるようにします。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    subgraph agents["エージェント"]
+        A1["エージェント A"]
+        A2["エージェント B"]
+        A3["エージェント C"]
+    end
+
+    subgraph wts["worktree(作業場所)"]
+        W1["feat-a<br/>ソース<br/>node_modules・.env"]
+        W2["feat-b<br/>ソース<br/>node_modules・.env"]
+        W3["feat-c<br/>ソース<br/>node_modules・.env"]
+    end
+
+    subgraph shared["共有しているもの"]
+        G[".git<br/>コミットとブランチ"]
+        D["APFS のデータブロック<br/>clonefile で共有"]
+        P["portless<br/>https://*.localhost の振り分け"]
+        S["sashiki<br/>DB の baseline"]
+    end
+
+    subgraph dbs["DB(ブランチごと)"]
+        M1[("feat-a の MySQL")]
+        M2[("feat-b の MySQL")]
+        M3[("feat-c の MySQL")]
+    end
+
+    A1 --> W1
+    A2 --> W2
+    A3 --> W3
+    W1 & W2 & W3 -.-> G
+    W1 & W2 & W3 -.-> D
+    W1 & W2 & W3 -.-> P
+    W1 --> M1
+    W2 --> M2
+    W3 --> M3
+    S -.-> M1 & M2 & M3
+```
+
+実線が「worktree ごとに分かれているもの」、点線が「裏で共有しているもの」です。共有しているものは、どれも書き込むと分かれるか、読むだけのものです。そのため、エージェント同士が互いの作業に影響しません。
+
+---
+
 ## なぜ作業場所を分けるのか
 
 Claude Code などのコーディングエージェントは、1 つ指示すると数分から数十分ひとりで作業します。その間に別の作業を別のエージェントに任せられれば、人間は指示とレビューに専念できます。
 
-エージェントを並行で走らせるには、1 本ごとに独立した作業場所が要ります。同じディレクトリで 2 本が動くと、片方の変更がもう片方のテストを壊します。そこで使うのが git worktree です。1 つのリポジトリから複数のブランチを別ディレクトリに同時に展開でき、エージェント 1 本に worktree 1 つを割り当てられます。
+エージェントを並行で走らせるには、1 本ごとに独立した作業場所が要ります。同じディレクトリで 2 本が動くと、片方の変更がもう片方のテストを壊します。
 
-ただし、worktree が分けるのは git が管理しているファイルだけです。新しい worktree を作った直後は次の状態になっています。
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph bad["同じディレクトリで 2 本動かす"]
+        direction TB
+        BA["エージェント A<br/>ログイン機能を修正中"] --> BD["repo/"]
+        BB["エージェント B<br/>決済機能を修正中"] --> BD
+        BD --> BX["A の書きかけの変更で<br/>B のテストが落ちる"]
+    end
+
+    subgraph good["worktree を分ける"]
+        direction TB
+        GA["エージェント A"] --> GD1["repo.feat-login/"]
+        GB["エージェント B"] --> GD2["repo.feat-payment/"]
+        GD1 --> GX["互いの変更が見えない"]
+        GD2 --> GX
+    end
+
+    bad ~~~ good
+```
+
+そこで使うのが git worktree です。ただし、worktree が分けるのは git が管理しているファイルだけです。新しい worktree を作った直後は次の状態になっています。
 
 | | 状態 | 並行で動くエージェントにとって困ること |
 |---|---|---|
@@ -32,8 +101,6 @@ Claude Code などのコーディングエージェントは、1 つ指示する
 | dev サーバーのポート | 全部 5173 | 2 本目以降が別のポートにずれ、エージェントがどの URL で確かめればよいか分からない |
 | Cookie | `localhost` で共有 | Cookie はポートを区別しないので、片方のログイン状態がもう片方に混ざる |
 | DB | 共有 | 片方のマイグレーションやテストデータが、もう片方のエージェントの結果を変える |
-
-Cookie がポートを区別しないのは見落としやすい点です。`localhost:5173` と `localhost:5174` は、ブラウザから見ると同じホストです。
 
 エージェントを好きなだけ増やすには、これらがすべて分かれた作業場所を、待たずに用意できる必要があります。ここでは 1 コマンド数秒で作れるようにします。
 
@@ -46,15 +113,301 @@ cd ../<repo>.feat-a && npm run dev
 
 エージェントには、この worktree のディレクトリと URL を渡して作業させます。
 
+以降、使う技術ごとに仕組みを説明してから、実際の作り方に入ります。
+
+---
+
+## 仕組み 1: git worktree
+
+### git の中身は 2 つに分かれている
+
+git のリポジトリは、大きく 2 つに分かれています。
+
+- **`.git` ディレクトリ**: すべてのコミット(ファイルの中身の履歴)と、ブランチがどのコミットを指しているかの情報
+- **作業ディレクトリ**: いま編集しているファイル。あるブランチの状態を `.git` から取り出したもの
+
+普通のリポジトリでは、作業ディレクトリは 1 つだけです。別のブランチで作業するには `git switch` で切り替える必要があり、同時に 2 つのブランチを開けません。
+
+### clone と worktree の違い
+
+同時に 2 つのブランチを開く方法は 2 つあります。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    subgraph clone["git clone を 2 回する"]
+        direction LR
+        C1["repo-1/"] --- CG1[".git<br/>(履歴を丸ごと持つ)"]
+        C2["repo-2/"] --- CG2[".git<br/>(履歴を丸ごと持つ)"]
+    end
+
+    subgraph wt["git worktree add する"]
+        direction LR
+        WM["repo/<br/>main"] --- WG[".git<br/>(履歴は 1 つだけ)"]
+        WA["repo.feat-a/<br/>feat-a"] -.-> WG
+        WB["repo.feat-b/<br/>feat-b"] -.-> WG
+    end
+
+    clone ~~~ wt
+```
+
+- **clone を 2 回**すると、`.git` も 2 つできます。履歴を二重に持つのでディスクを使い、片方で作ったブランチやコミットはもう片方から見えません(push と fetch が要ります)
+- **worktree** は、`.git` を 1 つのまま、作業ディレクトリだけを増やします。どの worktree で作ったコミットも、すぐに他の worktree から見えます
+
+### worktree の実体
+
+worktree のディレクトリにある `.git` は、ディレクトリではなく 1 行のファイルです。
+
+```
+$ cat ../worktree-lab.diagram/.git
+gitdir: /Users/inouetaishi/gh/worktree-lab/.git/worktrees/worktree-lab.diagram
+```
+
+指している先には、その worktree 専用の情報が入っています。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph main["repo/.git(本体)"]
+        OBJ["objects/<br/>コミットとファイルの中身"]
+        REF["refs/<br/>ブランチ"]
+        subgraph wtdir["worktrees/repo.feat-a/"]
+            HEAD["HEAD<br/>どのブランチか"]
+            IDX["index<br/>ステージした内容"]
+        end
+    end
+
+    FA["repo.feat-a/.git<br/>(1 行のファイル)"] -->|gitdir:| wtdir
+    wtdir -.->|共有| OBJ
+    wtdir -.->|共有| REF
+```
+
+- コミットとブランチ(`objects/`・`refs/`)は全 worktree で共有します
+- 「いまどのブランチか」(`HEAD`)と「ステージした内容」(`index`)は worktree ごとに分かれます
+
+1 つのブランチは、同時に 1 つの worktree でしか開けません。2 つ目で開こうとするとエラーになります。
+
+```
+$ git worktree add ../worktree-lab.d2 diagram-probe
+fatal: 'diagram-probe' is already checked out at '/Users/inouetaishi/gh/worktree-lab.d1'
+```
+
+これは安全装置です。同じブランチを 2 か所で編集すると、どちらの変更が正しいか分からなくなります。
+
+### worktree が分けないもの
+
+`git worktree add` が作業ディレクトリに取り出すのは、git が管理しているファイルだけです。`.gitignore` に入っているものは取り出されません。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph src["repo/(元)"]
+        S1["src/・package.json<br/>(git 管理)"]
+        S2["node_modules/<br/>(.gitignore)"]
+        S3[".env<br/>(.gitignore)"]
+    end
+
+    subgraph dst["repo.feat-a/(作った直後)"]
+        D1["src/・package.json"]
+        D2["node_modules/ が無い"]
+        D3[".env が無い"]
+    end
+
+    S1 -->|git が取り出す| D1
+    S2 -.-x|取り出されない| D2
+    S3 -.-x|取り出されない| D3
+```
+
+node_modules と `.env` は、自分で用意する必要があります。node_modules は install すれば作れますが、数十秒から数分かかり、ディスクも worktree の数だけ使います。これを一瞬で、ほぼディスクを使わずに用意するのが次の CoW です。
+
+---
+
+## 仕組み 2: CoW(copy-on-write)と clonefile
+
+### ファイルは「名前」と「中身のブロック」に分かれている
+
+ファイルシステムの中で、1 つのファイルは次の 2 つでできています。
+
+- **inode**: ファイルの管理情報。サイズや更新時刻と、「中身がディスクのどのブロックにあるか」を持つ
+- **データブロック**: ファイルの中身そのもの。ディスク上の決まった大きさの領域
+
+ディレクトリに並んでいるファイル名は、inode を指しています。
+
+### 3 つのコピーのしかた
+
+ファイルを「複製」する方法は 3 つあり、何を共有するかが違います。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    subgraph copy["普通のコピー(cp)"]
+        direction LR
+        CA["a.js"] --> CIA["inode 1"] --> CB1["ブロック X"]
+        CB["b.js"] --> CIB["inode 2"] --> CB2["ブロック X'<br/>(中身を複製)"]
+    end
+
+    subgraph hard["ハードリンク(ln)"]
+        direction LR
+        HA["a.js"] --> HI["inode 1"]
+        HB["b.js"] --> HI
+        HI --> HX["ブロック X"]
+    end
+
+    subgraph clone["clonefile(cp -c)"]
+        direction LR
+        KA["a.js"] --> KIA["inode 1"] --> KX["ブロック X<br/>(共有)"]
+        KB["b.js"] --> KIB["inode 2"] --> KX
+    end
+
+    copy ~~~ hard ~~~ clone
+```
+
+| | 時間 | ディスク | 片方を書き換えると |
+|---|---|---|---|
+| 普通のコピー | 中身の量に比例 | 中身の分だけ増える | もう片方は変わらない |
+| ハードリンク | 一瞬 | 増えない | **もう片方も変わる**(同じ inode なので) |
+| clonefile | 一瞬 | 増えない | もう片方は変わらない |
+
+ハードリンクは速くて省容量ですが、同じファイルを 2 つの名前で呼んでいるだけです。片方の worktree で依存を書き換えると、もう片方も書き換わってしまいます。
+
+clonefile は、inode は別々に作り、データブロックだけを共有します。速さと省容量はハードリンクと同じで、分離は普通のコピーと同じです。
+
+### 書き込んだときに初めて分かれる
+
+clonefile が別々のファイルとして振る舞えるのは、**書き込んだブロックだけを新しく確保する**からです。これを copy-on-write(CoW)と呼びます。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph before["複製した直後"]
+        direction TB
+        BA["a.js"] --> B1["ブロック 1"]
+        BA --> B2["ブロック 2"]
+        BA --> B3["ブロック 3"]
+        BB["b.js"] --> B1
+        BB --> B2
+        BB --> B3
+    end
+
+    subgraph after["b.js の 2 番目を書き換えた後"]
+        direction TB
+        AA["a.js"] --> A1["ブロック 1"]
+        AA --> A2["ブロック 2"]
+        AA --> A3["ブロック 3"]
+        AB["b.js"] --> A1
+        AB --> A2N["ブロック 2'<br/>(新しく確保)"]
+        AB --> A3
+    end
+
+    before ==>|b.js に書き込む| after
+```
+
+- 複製した直後は、どちらのファイルも同じ 3 ブロックを指しています。ディスクの使用量は 1 ファイル分です
+- b.js の 2 番目のブロックに書き込むと、新しいブロック 2' が確保され、b.js だけがそこを指すようになります。a.js は元のまま
+- 増えたディスクは、書き込んだ 1 ブロック分だけです
+
+macOS の標準ファイルシステムである APFS は、このしくみを `clonefile(2)` というシステムコールで提供しています。`cp` に `-c` を付けると使えます。
+
+```bash
+cp -cR "$donor/node_modules" "$dst/node_modules"
+```
+
+node_modules は、作ったあとはほとんど書き換えません。そのため、何万ファイルあっても複製はほぼ一瞬で、ディスクもほぼ使いません。
+
+### ディスク使用量は `du` ではなく `df` で見る
+
+CoW で複製したものの容量を測るときは注意が要ります。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph files["ファイルから見ると"]
+        F1["donor/node_modules<br/>125MB"]
+        F2["feat-a/node_modules<br/>125MB"]
+    end
+    subgraph disk["ディスクから見ると"]
+        BLK["共有ブロック<br/>125MB 分"]
+    end
+    F1 --> BLK
+    F2 --> BLK
+    DU["du: ファイルごとに足す<br/>→ 250MB"] -.-> files
+    DF["df: ディスクの空きを見る<br/>→ 125MB しか使っていない"] -.-> disk
+```
+
+`du` はファイルごとのサイズを足すので、共有しているブロックを二重に数えます。実際に何バイト使ったかは、`df` で空き容量の差を見る必要があります。
+
+---
+
+## 仕組み 3: ポート・Cookie・リバースプロキシ
+
+### Cookie はポートを区別しない
+
+ブラウザは、Cookie を**ホスト名ごと**に保存します。ポート番号は区別しません。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph bad["ポートで分けた場合"]
+        direction TB
+        P1["http://localhost:5173<br/>(エージェント A)"] --> J1["Cookie の保存先<br/>localhost"]
+        P2["http://localhost:5174<br/>(エージェント B)"] --> J1
+    end
+
+    subgraph good["サブドメインで分けた場合"]
+        direction TB
+        S1["https://feat-a.app.localhost"] --> J2["Cookie の保存先<br/>feat-a.app.localhost"]
+        S2["https://feat-b.app.localhost"] --> J3["Cookie の保存先<br/>feat-b.app.localhost"]
+    end
+
+    bad ~~~ good
+```
+
+ポートで分けると、A でログインした Cookie が B にも送られます。ログイン状態やセッションが混ざり、片方のエージェントの動作確認がもう片方の状態に左右されます。ホスト名(サブドメイン)を分ければ、Cookie の保存先も分かれます。
+
+### `.localhost` とリバースプロキシ
+
+`feat-a.app.localhost` のような名前を使えるのは、`.localhost` で終わる名前が自分のマシン(127.0.0.1)を指す決まりになっているからです。Chrome と Firefox は、DNS に問い合わせずにそう解決します。
+
+ただし、名前で分けても、届く先は同じ 127.0.0.1 です。どのアプリに渡すかを決めるのが **リバースプロキシ**です。リクエストのホスト名を見て、対応するアプリのポートに転送します。
+
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant P as portless(127.0.0.1:443)
+    participant A as feat-a の dev サーバー<br/>127.0.0.1:4795
+    participant C as feat-b の dev サーバー<br/>127.0.0.1:4350
+
+    B->>P: GET https://feat-a.app.localhost/<br/>(名前は 127.0.0.1 に解決)
+    Note over P: ホスト名 feat-a.app.localhost<br/>→ ルート表で 4795 番
+    P->>A: GET /
+    A-->>P: 200
+    P-->>B: 200
+    B->>P: GET https://feat-b.app.localhost/
+    Note over P: feat-b.app.localhost → 4350 番
+    P->>C: GET /
+    C-->>P: 200
+    P-->>B: 200
+```
+
+[portless](https://www.npmjs.com/package/portless) は、このリバースプロキシを開発用にまとめたツールです。
+
+- dev サーバーを `portless run` で起動すると、空いているポートを選んで dev サーバーに渡し、ホスト名とポートの対応(ルート)を登録する。dev サーバーが終了すると外す
+- 自前のローカル CA で証明書を作り、`https://` で受ける
+- git の linked worktree の中で起動すると、ブランチ名をホスト名の先頭に付ける
+
+Caddy や nginx で同じことをするなら、ホスト名とポートの対応を設定ファイルに書いておく必要があります。portless は、起動したアプリが自分でルートを登録するので、worktree を増やしても設定を書き足す必要がありません。
+
 ---
 
 ## 構成
+
+ここまでの仕組みを、次のように組み合わせます。
 
 | 分けるもの | 方法 |
 |---|---|
 | node_modules | APFS の clonefile(`cp -cR`)で複製する。ロックファイルが元と違うときだけ install する |
 | `.env` など git 管理外の設定 | `cp -c` で複製する |
-| URL・ポート・Cookie | dev サーバーを [portless](https://www.npmjs.com/package/portless) で包み、worktree ごとのサブドメインにする |
+| URL・ポート・Cookie | dev サーバーを portless で包み、worktree ごとのサブドメインにする |
 | DB | [sashiki](/blog/db-branch-sashiki-oss) でブランチ用の MySQL を作り、`.env.local` の `DATABASE_URL` を差し替える |
 
 題材は 2 つ用意しました。どちらも表示名を Cookie に保存する TODO アプリです。
@@ -86,28 +439,73 @@ worktree-monorepo-lab/
 
 `--filter './apps/*'` はクォートが必要です。クォートしないとシェルが glob を展開し、`None of the selected packages has a "./apps/web" script` で失敗します。
 
+### `wt-new.sh` がやること
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TD
+    START(["./scripts/wt-new.sh feat-a"]) --> CHK{"複製元(メインの checkout)で<br/>install が走っている?"}
+    CHK -->|はい| WAIT["終わるまで待つ<br/>(時間切れならエラー)"] --> CHK
+    CHK -->|いいえ| ADD["git worktree add<br/>../repo.feat-a"]
+    ADD --> CLONE["node_modules を<br/>clonefile で複製<br/>(ルート・apps/*・<br/>packages/*)"]
+    CLONE --> ENV[".env などを cp -c で複製"]
+    ENV --> LOCK{"ロックファイルが<br/>複製元と同じ?"}
+    LOCK -->|同じ| DB
+    LOCK -->|違う| INST["install して差分だけ埋める"] --> DB
+    DB{"sashiki がある?"}
+    DB -->|ある| MK["ブランチ用 DB を作り<br/>.env.local に DATABASE_URL"] --> URL
+    DB -->|無い| URL
+    URL(["URL を表示<br/>https://feat-a.app.localhost"])
+```
+
+以下、各段階を詳しく見ていきます。
+
 ---
 
 ## node_modules: clonefile で複製する
-
-APFS には `clonefile(2)` というシステムコールがあります。ファイルの中身をコピーせず、同じデータブロックを指す新しいファイルを作ります(copy-on-write)。書き込んだときに、書き込んだブロックだけが新しく確保されます。macOS の `cp` では `-c` で使えます。
 
 ```bash
 cp -cR "$donor/node_modules" "$dst/node_modules"
 ```
 
-ハードリンクとは違い、複製したファイルは別の inode です。片方の worktree で依存を追加・更新しても、もう片方には影響しません。
+複製したファイルは別の inode なので、片方の worktree で依存を追加・更新しても、もう片方には影響しません。
 
 ### pnpm のモノレポでもそのまま複製できる
 
-pnpm の node_modules は、ルートの `node_modules/.pnpm` に実体があり、各パッケージの node_modules からは symlink で参照されます。
+pnpm の node_modules は、ルートの `node_modules/.pnpm` に実体があり、各パッケージの node_modules からは symlink(別の場所を指す特殊なファイル)で参照されます。
 
-```
-apps/web/node_modules/react -> ../../../node_modules/.pnpm/react@19.3.1/node_modules/react
-apps/web/node_modules/@lab/shared -> ../../../../packages/shared
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph web["apps/web/node_modules/"]
+        R["react"]
+        SH["@lab/shared"]
+    end
+    subgraph root["node_modules/.pnpm/"]
+        RR["react@19.3.1/<br/>node_modules/react<br/>(実体)"]
+    end
+    subgraph pkgs["packages/"]
+        PS["shared/<br/>(実体)"]
+    end
+    R -->|"../../../node_modules/.pnpm/..."| RR
+    SH -->|"../../../../packages/shared"| PS
 ```
 
-symlink はすべて相対パスです。`node_modules/.modules.yaml` に入っている絶対パスも、pnpm の共有ストアの場所(`storeDir`)だけでした。そのため、ルートと `apps/*`・`packages/*` の node_modules を同じ相対位置に複製すれば、そのまま動きます。
+symlink はすべて**相対パス**です。`node_modules/.modules.yaml` に入っている絶対パスも、pnpm の共有ストアの場所(`storeDir`)だけでした。
+
+相対パスなので、ルートと `apps/*`・`packages/*` の node_modules を同じ相対位置に複製すれば、複製先の中で正しく解決されます。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph d["repo/(複製元)"]
+        DW["apps/web/<br/>node_modules/react"] --> DR[".pnpm/react@19.3.1"]
+    end
+    subgraph n["repo.feat-a/(複製先)"]
+        NW["apps/web/<br/>node_modules/react"] --> NR[".pnpm/react@19.3.1"]
+    end
+    d ==>|"cp -cR で同じ相対位置に"| n
+```
 
 ```bash
 for rel in node_modules apps/*/node_modules packages/*/node_modules; do
@@ -152,8 +550,6 @@ clonefile で複製した node_modules が土台にあるので、install は差
 
 ## URL と Cookie: portless でサブドメインを分ける
 
-[portless](https://www.npmjs.com/package/portless) は、ポート番号の代わりに `https://<name>.localhost` という URL を割り当てるローカルプロキシです。git の linked worktree の中で起動すると、ブランチ名をサブドメインに付けます。
-
 `package.json` の `dev` を包むだけです。元のコマンドは `dev:plain` として残します。
 
 ```json
@@ -177,7 +573,7 @@ $ portless list
 
 ブランチ名に `/` があるときは、最後のセグメントが使われます(`feat/slash-check` → `slash-check.worktree-lab.localhost`)。
 
-Cookie はホスト単位で保存されるので、サブドメインが違えば別の Cookie になります。A の URL で表示名を保存すると、Cookie は `wt-test-a.worktree-lab.localhost` に限定して保存され、B へのリクエストには付きませんでした。
+A の URL で表示名を保存すると、Cookie は `wt-test-a.worktree-lab.localhost` に限定して保存され、B へのリクエストには付きませんでした(curl とブラウザの開発者ツールで確認)。
 
 ### モノレポではアプリ名を明示する
 
@@ -190,16 +586,23 @@ portless は、名前を指定しないとパッケージ名から付けます�
 
 worktree の中では、これにブランチ名が付きます。
 
-```
-https://wt-test-a.api.monorepo-lab.localhost
-https://wt-test-a.web.monorepo-lab.localhost
-https://wt-test-b.api.monorepo-lab.localhost
-https://wt-test-b.web.monorepo-lab.localhost
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    N1["--name<br/>web.monorepo-lab"]
+    BR["ブランチ名<br/>wt-test-a"]
+    N2["--name<br/>api.monorepo-lab"]
+    H1["https://wt-test-a.<br/>web.monorepo-lab<br/>.localhost"]
+    H2["https://wt-test-a.<br/>api.monorepo-lab<br/>.localhost"]
+    N1 --> H1
+    BR --> H1
+    BR --> H2
+    N2 --> H2
 ```
 
 ### web から同じ worktree の API を見つける
 
-web の loader は API をサーバー側で呼びます。このとき、**自分と同じ worktree の API** を呼ぶ必要があります。
+web の loader は API をサーバー側で呼びます。このとき、**自分と同じ worktree の API** を呼ぶ必要があります。違う worktree の API を呼ぶと、違うエージェントの DB を読み書きすることになります。
 
 `portless get <name>` は、`portless run` と同じ規則で URL を組み立てて出力します。worktree の中で実行すると、ブランチ名の付いた URL が返ります。
 
@@ -216,6 +619,27 @@ web の dev スクリプトで、これを環境変数に入れます。
 "dev": "API_URL=$(portless get api.monorepo-lab) portless run --name web.monorepo-lab react-router dev"
 ```
 
+1 回の画面表示で、リクエストは次のように流れます。
+
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant P as portless
+    participant W as web(feat-a)
+    participant A as API(feat-a)
+    participant D as MySQL(feat-a)
+
+    B->>P: GET https://feat-a.web.monorepo-lab.localhost/
+    P->>W: GET /
+    Note over W: loader が API_URL を呼ぶ<br/>API_URL = portless get の結果
+    W->>P: GET https://feat-a.api.monorepo-lab.localhost/todos
+    P->>A: GET /todos
+    A->>D: SELECT ...(DATABASE_URL は feat-a のブランチ)
+    D-->>A: 行
+    A-->>W: JSON
+    W-->>B: HTML
+```
+
 API は HTTPS で、portless のローカル CA で署名されています。portless は子プロセスに `NODE_EXTRA_CA_CERTS` を渡すので、web のサーバー側の `fetch` からもそのまま呼べました。
 
 ### 初回起動はグローバルな設定を変える
@@ -228,7 +652,25 @@ sudo のパスワードを入力できない状況では、1355 番ポートで�
 
 ## DB: sashiki でブランチごとに分ける
 
-アプリが手元の MySQL を見ている場合、worktree を分けても DB は共有のままです。[sashiki](/blog/db-branch-sashiki-oss) は、baseline からブランチ用の MySQL を秒単位で作るツールです。macOS では APFS の clonefile でデータディレクトリを複製し、mysqld を直接起動します。
+アプリが手元の MySQL を見ている場合、worktree を分けても DB は共有のままです。[sashiki](/blog/db-branch-sashiki-oss) は、baseline(元になる DB の状態)からブランチ用の MySQL を秒単位で作るツールです。macOS では、ここでも APFS の clonefile を使います。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    BASE[("baseline<br/>MySQL のデータディレクトリ")]
+    BASE -->|clonefile| D1[("feat-a の<br/>データディレクトリ")]
+    BASE -->|clonefile| D2[("feat-b の<br/>データディレクトリ")]
+    D1 --- M1["mysqld<br/>(feat-a 専用)"]
+    D2 --- M2["mysqld<br/>(feat-b 専用)"]
+
+    APP1["feat-a の API"] -->|"ユーザー dev@feat-a<br/>127.0.0.1:28306"| PX["sashiki のプロキシ"]
+    APP2["feat-b の API"] -->|"ユーザー dev@feat-b<br/>127.0.0.1:28306"| PX
+    PX --> M1
+    PX --> M2
+```
+
+- baseline のデータディレクトリを clonefile で複製し、ブランチごとに専用の mysqld を起動します
+- 接続先は全ブランチ共通の 1 つのポート(この環境では 28306)で、**ユーザー名の `@` 以降**でどのブランチにつなぐかを決めます
 
 `wt-new.sh` の最後で、sashiki があればブランチ用の DB を作り、`.env.local` の `DATABASE_URL` を差し替えます。
 
@@ -254,6 +696,10 @@ for (const f of [".env.local", ".env"]) {
 
 `.env.local` は `.gitignore` に入れておく必要があります。git 管理外の未追跡ファイルがあると、`git worktree remove` が `--force` なしでは消せなくなるためです。
 
+### DB は clonefile でも 1 つ約 113MB 増える
+
+node_modules の複製はほぼ容量を使いませんが、DB は 1 つ約 113MB 増えました。CoW の図で言うと、mysqld が起動時にたくさんのブロックに書き込むからです。redo log、undo tablespace、`ibtmp1` などが新しく書かれ、その分は共有されません。
+
 ---
 
 ## 落とし穴: portless のポート衝突で別の worktree の API につながる
@@ -265,9 +711,30 @@ https://wt-test-a.api.monorepo-lab.localhost  ->  localhost:4138
 https://wt-test-b.api.monorepo-lab.localhost  ->  localhost:4138
 ```
 
-A と B の API が同じポートを割り当てられています。B の API は `EADDRINUSE` で bind に失敗しましたが、`tsx watch` は「ファイルの変更待ち」で動き続けます。portless から見ると子プロセスは生きているので、B のルートは 4138 番を指したままです。
+A と B の API が同じポートを割り当てられています。何が起きたかを順に示します。
 
-結果として、**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。
+```mermaid
+sequenceDiagram
+    participant PA as portless(A の API)
+    participant AA as A の API
+    participant PB as portless(B の API)
+    participant AB as B の API(tsx watch)
+    participant WB as B の web
+
+    PA->>PA: 4138 番が空いているか確認 → 空き
+    PA->>AA: PORT=4138 で起動
+    AA->>AA: 127.0.0.1:4138 で待ち受け
+    PB->>PB: 4138 番が空いているか確認<br/>→ 「空き」と誤判定
+    PB->>AB: PORT=4138 で起動
+    AB--xAB: EADDRINUSE(bind 失敗)
+    Note over AB: tsx watch は「変更待ち」で動き続ける
+    Note over PB: 子プロセスが生きているので<br/>ルート B → 4138 番を残す
+    WB->>PB: B の API を呼ぶ
+    PB->>AA: 4138 番に転送 = A の API
+    Note over WB,AA: B の web が A の API と A の DB を<br/>エラー無しで読み書きする
+```
+
+**B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。エージェントを並行で走らせている場面なら、B のエージェントが A のエージェントの DB を書き換えていたことになります。
 
 ### 原因: 古い portless の空きポート確認が `127.0.0.1` のアプリを見落とす
 
@@ -281,7 +748,33 @@ const tryPort = (port) => new Promise((resolve) => {
 });
 ```
 
-`listen(port)` はホストを指定していません。この場合 Node.js は IPv6 の `::` に bind します。別のプロセスがあるアドレスでそのポートを使っているときに、この確認で使用中と分かるかを、保持側のアドレスを変えて調べました。
+「そのポートで待ち受けてみて、成功したら空き」という確認です。ただし `listen(port)` はホスト(どのアドレスで待ち受けるか)を指定していません。この場合 Node.js は IPv6 の `::`(すべてのアドレス)で待ち受けようとします。
+
+一方、portless は dev サーバーに `HOST=127.0.0.1` を渡すので、dev サーバーは IPv4 の `127.0.0.1` で待ち受けます。macOS では、この 2 つが同じポート番号で共存できてしまいます。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph mac["macOS"]
+        direction TB
+        MA["A の API<br/>127.0.0.1:4138 で待ち受け中"]
+        MP["portless の確認<br/>[::]:4138 で待ち受けを試す"]
+        MP -->|成功してしまう| MR["「空き」と判定<br/>→ 4138 番を B に渡す"]
+    end
+
+    subgraph linux["Linux"]
+        direction TB
+        LA["A の API<br/>127.0.0.1:4138 で待ち受け中"]
+        LP["portless の確認<br/>[::]:4138 で待ち受けを試す"]
+        LP -->|EADDRINUSE| LR["「使用中」と判定<br/>→ 別のポートを選ぶ"]
+    end
+
+    MA -.-|共存できてしまう| MP
+    LA -.-|衝突する| LP
+    mac ~~~ linux
+```
+
+保持側のアドレスを変えて、この確認で使用中と分かるかを調べました。
 
 | 保持側のアドレス | macOS 26.5.1 | Linux(node:22 コンテナ) |
 |---|---|---|
@@ -290,7 +783,7 @@ const tryPort = (port) => new Promise((resolve) => {
 | `::1` | 見落とす | 検出する |
 | `::` | 検出する | 検出する |
 
-**macOS では、`::` で待ち受けているもの以外を見落とします。** そして portless は、子プロセスに `HOST=127.0.0.1` を渡します。つまり、0.13.0 では **portless で起動したアプリ同士が、この確認では互いに見えません。**
+**macOS では、`::` で待ち受けているもの以外を見落とします。** つまり 0.13.0 では、**portless で起動したアプリ同士が、この確認では互いに見えません。**
 
 portless 本体でも確かめました。`Math.random` を差し替えて、最初の候補を `127.0.0.1` で使用中のポートにすると、0.13.0 はそのポートをそのまま渡しました。
 
@@ -300,7 +793,27 @@ portless 本体でも確かめました。`Math.random` を差し替えて、最
 
 `npm i -g portless` で入れたのに 0.13.0 だった理由は分かっていません。`portless --version` で確認しておくのが確実です。
 
-ただし、0.15.12 でも衝突がなくなるわけではありません。確認してからポートを閉じ、子プロセスが bind するまでに隙間があります。2 つを同時に起動して同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。
+### 0.15.12 でも残るもの: 確認してから使うまでの隙間
+
+ただし、0.15.12 でも衝突がなくなるわけではありません。「確認してからポートを閉じ、dev サーバーが改めて待ち受ける」までの間に隙間があります。
+
+```mermaid
+sequenceDiagram
+    participant PA as portless(A)
+    participant PB as portless(B)
+    participant AA as A の dev サーバー
+    participant AB as B の dev サーバー
+
+    PA->>PA: 4388 番を確認 → 空き(閉じる)
+    PB->>PB: 4388 番を確認 → 空き(閉じる)
+    Note over PA,PB: まだ誰も待ち受けていないので<br/>両方とも「空き」
+    PA->>AA: PORT=4388
+    PB->>AB: PORT=4388
+    AA->>AA: 127.0.0.1:4388 で待ち受け
+    AB--xAB: EADDRINUSE
+```
+
+2 つを同時に起動して同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。
 
 ### 黙ってつながるかどうかは dev サーバー次第
 
@@ -316,6 +829,15 @@ portless 本体でも確かめました。`Math.random` を差し替えて、最
 ### 対策: bind に失敗したら親ごと止める
 
 API で bind の失敗を受け取ったら、親の `tsx watch` ごと止めるようにしました。portless の子プロセスが終了するので、portless もルートを外して終了します。
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    E["API: bind 失敗<br/>EADDRINUSE"] --> K["親の tsx watch に<br/>SIGTERM を送る"]
+    K --> X["tsx watch 終了"]
+    X --> R["portless が子の終了を検知<br/>→ ルートを外して終了"]
+    R --> V["エラーが表に出る<br/>(別の API にはつながらない)"]
+```
 
 ```ts
 server.on("error", (err: NodeJS.ErrnoException) => {
@@ -335,6 +857,22 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 
 「無限に」と言っても、実際には上限があります。モノレポ(web と API)の worktree を 1 つ起動して、使う資源を測りました。
 
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    subgraph one["worktree 1 つ(web + API + DB)"]
+        direction LR
+        WRAP["pnpm と portless の<br/>ラッパー"]
+        DEV["tsx・Vite・esbuild"]
+        MY["mysqld"]
+        DISK["ディスク<br/>ほぼ DB の分"]
+    end
+    WRAP --- M1["メモリ 約 790MB<br/>(dev 一式)"]
+    DEV --- M1
+    MY --- M2["メモリ 約 130MB"]
+    DISK --- M3["約 113MB"]
+```
+
 | 資源 | worktree 1 つあたり | 上限を決めるもの |
 |---|---|---|
 | メモリ(dev サーバー一式) | 約 790MB | pnpm と portless のラッパー、tsx、Vite(esbuild を含む)の RSS の合計 |
@@ -343,7 +881,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 | ポート | 2 つ | portless の割り当て範囲は 4000〜4999 の 1000 個 |
 | DB のブランチ数 | 1 つ | sashiki の設定 `max_branches`(この環境では 20) |
 
-RSS の合計は共有ページを重複して数えるので、実際の使用量はこれより少なめです。それでも目安として、**1 本あたり約 0.9GB** です。64GB の Mac で、OS やエディタ、エージェント本体の分を差し引くと、数十本が現実的な上限です。
+RSS(プロセスが使っている物理メモリ)の合計は、複数のプロセスで共有しているページを重複して数えるので、実際の使用量はこれより少なめです。それでも目安として、**1 本あたり約 0.9GB** です。64GB の Mac で、OS やエディタ、エージェント本体の分を差し引くと、数十本が現実的な上限です。
 
 先に当たりやすいのは、メモリよりも設定の上限です。sashiki の `max_branches` はこの環境では 20 なので、それ以上並べるなら設定を上げます。DB を使わない作業なら `WT_DB=0` で作れば、DB の分の資源は要りません。
 
@@ -369,13 +907,7 @@ macOS 26.5.1 です。node_modules は単一アプリが 125MB、モノレポの
 | node_modules の複製(`cp -R`) | 3.6 秒。125MB を消費する |
 | sashiki のブランチ 1 つ | 約 113MB |
 
-ディスクの消費は `du` ではなく `df` の空き容量の差で見ています。`du` は clonefile で共有しているブロックも満額で数えるため、実際の消費より大きく出ます。
-
-### DB は clonefile でも 113MB 増える
-
-node_modules の複製はほぼ容量を使いませんが、DB は 1 つ約 113MB 増えました。clonefile で複製したデータディレクトリで mysqld を起動すると、redo log、undo tablespace、`ibtmp1` などが新しく書かれ、その分は共有されないためです。
-
-worktree を 10 個作るなら DB で約 1GB です。気になる場合は `WT_DB=0` で DB を作らないようにできます。
+ディスクの消費は、前述のとおり `du` ではなく `df` の空き容量の差で見ています。
 
 ---
 
@@ -409,15 +941,24 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 ./scripts/wt-rm.sh feat-a
 ```
 
-`git worktree remove` で worktree を消し、sashiki のブランチも消します。未コミットの変更がある worktree では `git worktree remove` がエラーになるので、`--force` は付けていません。git のブランチは消しません。消すかどうかは人間が決めます。
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
+flowchart TB
+    RM(["./scripts/wt-rm.sh feat-a"]) --> Q{"未コミットの変更がある?"}
+    Q -->|ある| STOP["git worktree remove がエラー<br/>(--force は付けない)"]
+    Q -->|無い| DEL["worktree を消す"] --> DB["sashiki のブランチ DB を消す"]
+    DB --> KEEP["git のブランチは残す<br/>(消すかは人間が決める)"]
+```
+
+未コミットの変更がある worktree では `git worktree remove` がエラーになるので、`--force` は付けていません。エージェントの作業を誤って消さないためです。git のブランチも消しません。消すかどうかは人間が決めます。
 
 ---
 
 ## まとめ
 
-- エージェントを並行で走らせる単位は git worktree。ただしソースコード以外(node_modules、`.env`、URL、Cookie、DB)は自分で分ける
-- node_modules は clonefile で複製すれば、時間もディスクもほぼかからない。pnpm のモノレポでもそのまま使える
-- portless でサブドメインを分けると、エージェントごとに固定の URL ができ、Cookie も混ざらない。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
+- エージェントを並行で走らせる単位は git worktree。worktree は `.git` を共有したまま作業ディレクトリだけを増やすが、ソースコード以外(node_modules、`.env`、URL、Cookie、DB)は自分で分ける
+- node_modules は CoW(clonefile)で複製すれば、時間もディスクもほぼかからない。書き込んだブロックだけが分かれるので、worktree 同士は独立している。pnpm のモノレポでもそのまま使える
+- Cookie はポートを区別しないので、portless でサブドメインを分ける。エージェントごとに固定の URL ができる。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
 - DB は sashiki で分けられる。1 つ約 100MB 強のディスクと約 130MB のメモリを使う
 - 上限は主にメモリと sashiki の `max_branches` で決まる。dev サーバーを確かめるときだけ起動すれば、本数はさらに増やせる
 - portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡し、並行するエージェント同士が互いの DB につながりうる。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
