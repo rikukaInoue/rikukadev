@@ -28,6 +28,12 @@ jobs:
       - name: 記事タイトル検査(新規記事は20字以内)
         run: node scripts/check-title-length.mjs
 
+      - name: 用語検査(push で追加・変更した行に、使わない言い換えが無いか)
+        # ルールは standard-terms.mdx の「使わない言い換えの一覧」。pre-commit と同じ検査で、
+        # hook を通さずに push されたときに止める。ブランチ新規作成時は before が 0 埋めなので飛ばす
+        if: github.event.before != '0000000000000000000000000000000000000000'
+        run: node scripts/check-terms.mjs --diff ${{ github.event.before }}..${{ github.sha }}
+
       - name: Install Playwright Chromium (for Mermaid rendering)
         run: npx playwright install --with-deps chromium
 

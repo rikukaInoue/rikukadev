@@ -1,0 +1,23 @@
+#!/bin/sh
+# pre-commit。core.hooksPath=.githooks で有効になる(npm install の prepare が設定する)
+ROOT="$(git rev-parse --show-toplevel)"
+
+# 1. 使わない言い換えの検査。言い換え先が 1 つに決まるものは直してステージし直す。
+#    文脈で変わるものは候補を出して止める(ルール: src/content/blog/standard-terms.mdx)
+node "$ROOT/scripts/check-terms.mjs" --staged --fix || {
+  echo "❌ 用語検査で止めた。直してからコミットし直す"
+  exit 1
+}
+
+# 2. 新しい写真を CLIP で分類する
+PHOTOS=$(git diff --cached --name-only --diff-filter=A | grep '^public/photos/.*\.\(jpg\|jpeg\)$')
+if [ -n "$PHOTOS" ]; then
+  echo "📸 New photos detected, running CLIP classifier..."
+  FULL_PATHS=$(echo "$PHOTOS" | while read f; do echo "$ROOT/$f"; done)
+  python3 "$ROOT/scripts/classify-photos.py" $FULL_PATHS || {
+    echo "❌ Classification failed. Commit aborted."
+    exit 1
+  }
+  git add "$ROOT/src/data/photo-data.json"
+  echo "✅ photo-data.json updated and staged."
+fi
