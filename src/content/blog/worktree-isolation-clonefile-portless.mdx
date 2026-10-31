@@ -2,24 +2,24 @@
 title: "CoW でつくる worktree で分離された並列環境"
 date: 2026-10-31
 tags: ["AI", "ClaudeCode", "git", "開発環境", "macOS", "モノレポ", "MySQL"]
-description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile(CoW)・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。git worktree・CoW・Cookie・リバースプロキシの仕組みを図で解説し、何本まで増やせるかの上限と、古い portless で別のエージェントの API と DB に黙ってつながった件もまとめる。"
+description: "Claude Code などのエージェントを何本も並行で走らせるには、1 本ごとに依存・URL・Cookie・DB まで分かれた作業場所を、待たずに用意できる必要がある。git worktree に APFS の clonefile(CoW)・portless・sashiki を組み合わせて 1 コマンド数秒で作り、単一アプリと pnpm モノレポで実測した。git worktree・CoW・Cookie・リバースプロキシの仕組みを図で解説し、何本まで増やせるかの上限と、古い portless で、エラーにならずに別のエージェントの API と DB に接続していた件もまとめる。"
 ---
 
 ## TL;DR
 
-1. **エージェントを並行で走らせる単位は git worktree。** ただし worktree はソースコードしか分けないので、node_modules、`.env`、ポート、Cookie、DB は自分で分ける必要がある
-2. **node_modules は APFS の clonefile(CoW)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、symlink が相対パスなのでそのまま動く
-3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` で包むと、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。エージェントは自分の URL で動作を確かめられ、Cookie も混ざらない
+1. **エージェントを並行で走らせる単位は git worktree。** ただし worktree はソースコードしか分けないので、node_modules・`.env`・port・Cookie・DB は自分で分ける必要がある
+2. **node_modules は APFS の clonefile(CoW)で複製する。** 125MB の node_modules が 1.2 秒で複製でき、空き容量はほぼ減らない。pnpm のモノレポでも、シンボリックリンクが相対パスなのでそのまま動く
+3. **URL と Cookie は portless で分ける。** dev サーバーを `portless run` 経由で起動すると、worktree ごとに `https://<ブランチ名>.<アプリ名>.localhost` が割り当てられる。エージェントは自分の URL で動作を確かめられ、Cookie も混ざらない
 4. **モノレポでは、web から同じ worktree の API を `portless get` で見つける。** アプリ名は `web` ではなく `web.<project>` のように明示する
 5. **DB は sashiki でブランチごとに分ける。** worktree 1 つあたりの作成は約 3 秒
 6. **「無限」の上限はメモリで決まる。** web と API を動かす worktree 1 つで約 0.9GB 使った。64GB の Mac なら、ほかの用途を差し引いて数十本が目安
-7. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを見落とし、片方の web が**エラー無しで別の worktree の API と DB を見ていた**。並行で動くエージェント同士が互いの DB を書き換えうる
+7. **portless は 0.15.7 以降を使う。** 手元の 0.13.0 は macOS で使用中のポートを検出できず、片方の web が**エラーにならずに別の worktree の API と DB に接続していた**。並行で動くエージェント同士が互いの DB を書き換えうる
 
 ---
 
 ## 全体像
 
-最初に、できあがる環境の全体を示します。エージェント 1 本につき worktree を 1 つ割り当て、その worktree の中で依存・設定・URL・DB まで閉じるようにします。
+最初に、できあがる環境の全体を示します。エージェント 1 本につき worktree を 1 つ割り当て、依存・設定・URL・DB も worktree ごとに分けます。
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
@@ -61,7 +61,7 @@ flowchart TB
     S -.-> M1 & M2 & M3
 ```
 
-実線が「worktree ごとに分かれているもの」、点線が「裏で共有しているもの」です。共有しているものは、どれも書き込むと分かれるか、読むだけのものです。そのため、エージェント同士が互いの作業に影響しません。
+実線が「worktree ごとに分かれているもの」、点線が「共有しているもの」です。共有しているものは、どれも書き込むと分かれるか、読むだけのものです。そのため、エージェント同士が互いの作業に影響しません。
 
 ---
 
@@ -85,7 +85,7 @@ flowchart LR
         direction TB
         GA["エージェント A"] --> GD1["repo.feat-login/"]
         GB["エージェント B"] --> GD2["repo.feat-payment/"]
-        GD1 --> GX["互いの変更が見えない"]
+        GD1 --> GX["互いの変更に影響されない"]
         GD2 --> GX
     end
 
@@ -151,8 +151,8 @@ flowchart TB
     clone ~~~ wt
 ```
 
-- **clone を 2 回**すると、`.git` も 2 つできます。履歴を二重に持つのでディスクを使い、片方で作ったブランチやコミットはもう片方から見えません(push と fetch が要ります)
-- **worktree** は、`.git` を 1 つのまま、作業ディレクトリだけを増やします。どの worktree で作ったコミットも、すぐに他の worktree から見えます
+- **clone を 2 回**すると、`.git` も 2 つできます。履歴を二重に持つのでディスクを使い、片方で作ったブランチやコミットはもう片方から参照できません(push と fetch が要ります)
+- **worktree** は、`.git` を 1 つのまま、作業ディレクトリだけを増やします。どの worktree で作ったコミットも、すぐに他の worktree から参照できます
 
 ### worktree の実体
 
@@ -192,7 +192,7 @@ $ git worktree add ../worktree-lab.d2 diagram-probe
 fatal: 'diagram-probe' is already checked out at '/Users/inouetaishi/gh/worktree-lab.d1'
 ```
 
-これは安全装置です。同じブランチを 2 か所で編集すると、どちらの変更が正しいか分からなくなります。
+同じブランチを 2 か所で編集すると、どちらの変更が正しいか分からなくなるため、git がこの操作を拒否します。
 
 ### worktree が分けないもの
 
@@ -338,7 +338,7 @@ flowchart LR
 
 ---
 
-## 仕組み 3: ポート・Cookie・リバースプロキシ
+## 仕組み 3: port・Cookie・reverse proxy
 
 ### Cookie はポートを区別しない
 
@@ -407,7 +407,7 @@ Caddy や nginx で同じことをするなら、ホスト名とポートの対�
 |---|---|
 | node_modules | APFS の clonefile(`cp -cR`)で複製する。ロックファイルが元と違うときだけ install する |
 | `.env` など git 管理外の設定 | `cp -c` で複製する |
-| URL・ポート・Cookie | dev サーバーを portless で包み、worktree ごとのサブドメインにする |
+| URL・port・Cookie | dev サーバーを portless 経由で起動し、worktree ごとのサブドメインにする |
 | DB | [sashiki](/blog/db-branch-sashiki-oss) でブランチ用の MySQL を作り、`.env.local` の `DATABASE_URL` を差し替える |
 
 題材は 2 つ用意しました。どちらも表示名を Cookie に保存する TODO アプリです。
@@ -447,7 +447,7 @@ flowchart TD
     START(["./scripts/wt-new.sh feat-a"]) --> CHK{"複製元(メインの checkout)で<br/>install が走っている?"}
     CHK -->|はい| WAIT["終わるまで待つ<br/>(時間切れならエラー)"] --> CHK
     CHK -->|いいえ| ADD["git worktree add<br/>../repo.feat-a"]
-    ADD --> CLONE["node_modules を<br/>clonefile で複製<br/>(ルート・apps/*・<br/>packages/*)"]
+    ADD --> CLONE["node_modules を<br/>clonefile で複製<br/>(root・apps/*・<br/>packages/*)"]
     CLONE --> ENV[".env などを cp -c で複製"]
     ENV --> LOCK{"ロックファイルが<br/>複製元と同じ?"}
     LOCK -->|同じ| DB
@@ -472,7 +472,7 @@ cp -cR "$donor/node_modules" "$dst/node_modules"
 
 ### pnpm のモノレポでもそのまま複製できる
 
-pnpm の node_modules は、ルートの `node_modules/.pnpm` に実体があり、各パッケージの node_modules からは symlink(別の場所を指す特殊なファイル)で参照されます。
+pnpm の node_modules は、ルートの `node_modules/.pnpm` に実体があり、各パッケージの node_modules からは シンボリックリンク(symbolic link。別の場所を指す特殊なファイル)で参照されます。
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
@@ -491,7 +491,7 @@ flowchart LR
     SH -->|"../../../../packages/shared"| PS
 ```
 
-symlink はすべて**相対パス**です。`node_modules/.modules.yaml` に入っている絶対パスも、pnpm の共有ストアの場所(`storeDir`)だけでした。
+シンボリックリンクはすべて**相対パス**です。`node_modules/.modules.yaml` に入っている絶対パスも、pnpm の共有ストアの場所(`storeDir`)だけでした。
 
 相対パスなので、ルートと `apps/*`・`packages/*` の node_modules を同じ相対位置に複製すれば、複製先の中で正しく解決されます。
 
@@ -542,7 +542,7 @@ if ! cmp -s "$donor/$lockfile" "$dst/$lockfile"; then
 fi
 ```
 
-clonefile で複製した node_modules が土台にあるので、install は差分だけで済みます。1 パッケージ追加したブランチで、npm は 0.6 秒、pnpm は 0.4 秒でした。
+clonefile で複製した node_modules がすでにあるので、install はロックファイルの差分だけを入れます。1 パッケージ追加したブランチで、npm は 0.6 秒、pnpm は 0.4 秒でした。
 
 `node_modules/.vite`(Vite の依存プリバンドル)も一緒に複製されるので、dev サーバーの初回起動も速くなります。逆に `.react-router/`(型生成の出力)は複製せず、各 worktree で生成させます。
 
@@ -550,7 +550,7 @@ clonefile で複製した node_modules が土台にあるので、install は差
 
 ## URL と Cookie: portless でサブドメインを分ける
 
-`package.json` の `dev` を包むだけです。元のコマンドは `dev:plain` として残します。
+`package.json` の `dev` を `portless run` 経由にするだけです。元のコマンドは `dev:plain` として残します。
 
 ```json
 {
@@ -644,7 +644,7 @@ API は HTTPS で、portless のローカル CA で署名されています。po
 
 ### 初回起動はグローバルな設定を変える
 
-portless は初回起動時に、ローカル CA を作ってシステムの信頼ストアに登録します。さらに、既定では 443 番ポートを使うため sudo で権限を昇格します。どちらもマシン全体に効く変更なので、自分で実行して確認しました。
+portless は初回起動時に、ローカル CA を作ってシステムの信頼ストアに登録します。さらに、既定では 443 番ポートを使うため sudo で権限を昇格します。どちらもマシン全体に影響する変更なので、自分で実行して確認しました。
 
 sudo のパスワードを入力できない状況では、1355 番ポートで起動します。その場合 URL に `:1355` が付きます。
 
@@ -652,7 +652,7 @@ sudo のパスワードを入力できない状況では、1355 番ポートで�
 
 ## DB: sashiki でブランチごとに分ける
 
-アプリが手元の MySQL を見ている場合、worktree を分けても DB は共有のままです。[sashiki](/blog/db-branch-sashiki-oss) は、baseline(元になる DB の状態)からブランチ用の MySQL を秒単位で作るツールです。macOS では、ここでも APFS の clonefile を使います。
+アプリが手元の MySQL に接続している場合、worktree を分けても DB は共有のままです。[sashiki](/blog/db-branch-sashiki-oss) は、baseline(元になる DB の状態)からブランチ用の MySQL を秒単位で作るツールです。macOS では、ここでも APFS の clonefile を使います。
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
@@ -702,7 +702,7 @@ node_modules の複製はほぼ容量を使いませんが、DB は 1 つ約 113
 
 ---
 
-## 落とし穴: portless のポート衝突で別の worktree の API につながる
+## 問題: portless のポート衝突で別の worktree の API に接続する
 
 モノレポで 2 つの worktree を同時に起動したところ、次の状態になりました。
 
@@ -723,7 +723,7 @@ sequenceDiagram
 
     PA->>PA: 4138 番が空いているか確認 → 空き
     PA->>AA: PORT=4138 で起動
-    AA->>AA: 127.0.0.1:4138 で待ち受け
+    AA->>AA: 127.0.0.1:4138 で listen
     PB->>PB: 4138 番が空いているか確認<br/>→ 「空き」と誤判定
     PB->>AB: PORT=4138 で起動
     AB--xAB: EADDRINUSE(bind 失敗)
@@ -736,7 +736,7 @@ sequenceDiagram
 
 **B の web は A の API を呼び、A の DB を読み書きしていました。** 画面にもログにもエラーは出ません。エージェントを並行で走らせている場面なら、B のエージェントが A のエージェントの DB を書き換えていたことになります。
 
-### 原因: 古い portless の空きポート確認が `127.0.0.1` のアプリを見落とす
+### 原因: 古い portless の空きポート確認が `127.0.0.1` のアプリを検出できない
 
 このとき手元に入っていた portless は 0.13.0 でした。portless は 4000〜4999 番からランダムにポートを選び、0.13.0 では次の方法で空いているかを確認していました(`findFreePort`)。
 
@@ -748,24 +748,24 @@ const tryPort = (port) => new Promise((resolve) => {
 });
 ```
 
-「そのポートで待ち受けてみて、成功したら空き」という確認です。ただし `listen(port)` はホスト(どのアドレスで待ち受けるか)を指定していません。この場合 Node.js は IPv6 の `::`(すべてのアドレス)で待ち受けようとします。
+「そのポートで listen してみて、成功したら空き」という確認です。ただし `listen(port)` はホスト(どのアドレスで listen するか)を指定していません。この場合 Node.js は IPv6 の `::`(すべてのアドレス)で listen しようとします。
 
-一方、portless は dev サーバーに `HOST=127.0.0.1` を渡すので、dev サーバーは IPv4 の `127.0.0.1` で待ち受けます。macOS では、この 2 つが同じポート番号で共存できてしまいます。
+一方、portless は dev サーバーに `HOST=127.0.0.1` を渡すので、dev サーバーは IPv4 の `127.0.0.1` で listen します。macOS では、この 2 つが同じポート番号で共存できてしまいます。
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false}}}%%
 flowchart LR
     subgraph mac["macOS"]
         direction TB
-        MA["A の API<br/>127.0.0.1:4138 で待ち受け中"]
-        MP["portless の確認<br/>[::]:4138 で待ち受けを試す"]
+        MA["A の API<br/>127.0.0.1:4138 で listen 中"]
+        MP["portless の確認<br/>[::]:4138 で listen を試す"]
         MP -->|成功してしまう| MR["「空き」と判定<br/>→ 4138 番を B に渡す"]
     end
 
     subgraph linux["Linux"]
         direction TB
-        LA["A の API<br/>127.0.0.1:4138 で待ち受け中"]
-        LP["portless の確認<br/>[::]:4138 で待ち受けを試す"]
+        LA["A の API<br/>127.0.0.1:4138 で listen 中"]
+        LP["portless の確認<br/>[::]:4138 で listen を試す"]
         LP -->|EADDRINUSE| LR["「使用中」と判定<br/>→ 別のポートを選ぶ"]
     end
 
@@ -778,12 +778,12 @@ flowchart LR
 
 | 保持側のアドレス | macOS 26.5.1 | Linux(node:22 コンテナ) |
 |---|---|---|
-| `127.0.0.1` | 見落とす(`::` への bind が成功) | 検出する |
-| `0.0.0.0` | 見落とす | 検出する |
-| `::1` | 見落とす | 検出する |
+| `127.0.0.1` | 検出できない(`::` への bind が成功) | 検出する |
+| `0.0.0.0` | 検出できない | 検出する |
+| `::1` | 検出できない | 検出する |
 | `::` | 検出する | 検出する |
 
-**macOS では、`::` で待ち受けているもの以外を見落とします。** つまり 0.13.0 では、**portless で起動したアプリ同士が、この確認では互いに見えません。**
+**macOS では、`::` で listen しているもの以外を検出できません。** つまり 0.13.0 では、**portless で起動したアプリ同士を、この確認では検出できません。**
 
 portless 本体でも確かめました。`Math.random` を差し替えて、最初の候補を `127.0.0.1` で使用中のポートにすると、0.13.0 はそのポートをそのまま渡しました。
 
@@ -793,9 +793,9 @@ portless 本体でも確かめました。`Math.random` を差し替えて、最
 
 `npm i -g portless` で入れたのに 0.13.0 だった理由は分かっていません。`portless --version` で確認しておくのが確実です。
 
-### 0.15.12 でも残るもの: 確認してから使うまでの隙間
+### 0.15.12 でも残るもの: TOCTOU の競合状態
 
-ただし、0.15.12 でも衝突がなくなるわけではありません。「確認してからポートを閉じ、dev サーバーが改めて待ち受ける」までの間に隙間があります。
+ただし、0.15.12 でも衝突がなくなるわけではありません。portless は空きを確認したらそのポートを閉じ、dev サーバーがあらためて listen します。確認と使用の間に別のプロセスが同じポートを使うと衝突する、TOCTOU(time-of-check to time-of-use)の競合状態が残っています。
 
 ```mermaid
 sequenceDiagram
@@ -806,23 +806,23 @@ sequenceDiagram
 
     PA->>PA: 4388 番を確認 → 空き(閉じる)
     PB->>PB: 4388 番を確認 → 空き(閉じる)
-    Note over PA,PB: まだ誰も待ち受けていないので<br/>両方とも「空き」
+    Note over PA,PB: まだどちらも listen していないので<br/>両方とも「空き」
     PA->>AA: PORT=4388
     PB->>AB: PORT=4388
-    AA->>AA: 127.0.0.1:4388 で待ち受け
+    AA->>AA: 127.0.0.1:4388 で listen
     AB--xAB: EADDRINUSE
 ```
 
 2 つを同時に起動して同じ候補を引かせると、両方に同じポートが渡り、後の方が `EADDRINUSE` になりました。ランダムに選ぶので、同時に起動した 2 つが同じ候補を引く確率は約 1/1000 です。
 
-### 黙ってつながるかどうかは dev サーバー次第
+### エラーになるかどうかは dev サーバー次第
 
 衝突したときの挙動は、dev サーバーによって違います。
 
 | dev サーバー | 衝突したとき |
 |---|---|
 | Vite(React Router) | portless が `--strictPort` を付けて起動するので、Vite がエラーで終了する。気付ける |
-| `tsx watch` | bind に失敗しても変更待ちで動き続ける。portless のルートが残り、別の worktree のアプリに黙ってつながる |
+| `tsx watch` | bind に失敗しても変更待ちで動き続ける。portless のルートが残り、エラーにならずに別の worktree のアプリに接続する |
 
 単一アプリ版は Vite だけなので、衝突しても起動に失敗するだけで済みます。`node --watch` や nodemon も、クラッシュ後に変更待ちに入る点は `tsx watch` と同じなので、同じ問題が起きるはずです(こちらは試していません)。
 
@@ -836,7 +836,7 @@ flowchart TB
     E["API: bind 失敗<br/>EADDRINUSE"] --> K["親の tsx watch に<br/>SIGTERM を送る"]
     K --> X["tsx watch 終了"]
     X --> R["portless が子の終了を検知<br/>→ ルートを外して終了"]
-    R --> V["エラーが表に出る<br/>(別の API にはつながらない)"]
+    R --> V["dev がエラーで終了する<br/>(別の API には接続しない)"]
 ```
 
 ```ts
@@ -883,7 +883,7 @@ flowchart TB
 
 RSS(プロセスが使っている物理メモリ)の合計は、複数のプロセスで共有しているページを重複して数えるので、実際の使用量はこれより少なめです。それでも目安として、**1 本あたり約 0.9GB** です。64GB の Mac で、OS やエディタ、エージェント本体の分を差し引くと、数十本が現実的な上限です。
 
-先に当たりやすいのは、メモリよりも設定の上限です。sashiki の `max_branches` はこの環境では 20 なので、それ以上並べるなら設定を上げます。DB を使わない作業なら `WT_DB=0` で作れば、DB の分の資源は要りません。
+先に上限に達しやすいのは、メモリよりも設定の上限です。sashiki の `max_branches` はこの環境では 20 なので、それ以上並べるなら設定を上げます。DB を使わない作業なら `WT_DB=0` で作れば、DB の分の資源は要りません。
 
 また、dev サーバーは常に動かしておく必要はありません。エージェントが動作を確かめるときだけ `npm run dev` で起動し、終わったら止めれば、同時に動くのは確認中の数本だけになります。
 
@@ -911,7 +911,7 @@ macOS 26.5.1 です。node_modules は単一アプリが 125MB、モノレポの
 
 ---
 
-## macOS で踏んだその他の落とし穴
+## macOS で起きたその他の問題
 
 ### `pgrep` に `-E` が無い
 
@@ -931,7 +931,7 @@ bash 3.2 は、変数名の直後に全角文字があると、そのバイト�
 
 ### `sashiki env` のホスト名が解決できない
 
-`sashiki env` は `DB_HOST=sashiki.local` を返しますが、この名前は解決できませんでした。手元ではプロキシが `127.0.0.1` で待ち受けているので、`127.0.0.1` で接続しています。
+`sashiki env` は `DB_HOST=sashiki.local` を返しますが、この名前は解決できませんでした。手元ではプロキシが `127.0.0.1` で listen しているので、`127.0.0.1` で接続しています。
 
 ---
 
@@ -958,7 +958,7 @@ flowchart TB
 
 - エージェントを並行で走らせる単位は git worktree。worktree は `.git` を共有したまま作業ディレクトリだけを増やすが、ソースコード以外(node_modules、`.env`、URL、Cookie、DB)は自分で分ける
 - node_modules は CoW(clonefile)で複製すれば、時間もディスクもほぼかからない。書き込んだブロックだけが分かれるので、worktree 同士は独立している。pnpm のモノレポでもそのまま使える
-- Cookie はポートを区別しないので、portless でサブドメインを分ける。エージェントごとに固定の URL ができる。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API を引く
+- Cookie はポートを区別しないので、portless でサブドメインを分ける。エージェントごとに固定の URL ができる。モノレポではアプリ名を明示し、`portless get` で同じ worktree の API の URL を取得する
 - DB は sashiki で分けられる。1 つ約 100MB 強のディスクと約 130MB のメモリを使う
 - 上限は主にメモリと sashiki の `max_branches` で決まる。dev サーバーを確かめるときだけ起動すれば、本数はさらに増やせる
 - portless は 0.15.7 以降を使う。古い版は macOS で使用中のポートを渡し、並行するエージェント同士が互いの DB につながりうる。新しい版でも同時起動では衝突しうるので、bind に失敗した dev サーバーが動き続けないようにする
