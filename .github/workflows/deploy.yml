@@ -25,7 +25,7 @@ jobs:
 
       - run: npm ci
 
-      - name: 記事タイトル検査(新規記事は20字以内)
+      - name: 記事タイトル検査(全記事、全角換算で40字以内)
         run: node scripts/check-title-length.mjs
 
       - name: 用語検査(push で追加・変更した行に、使わない言い換えが無いか)
