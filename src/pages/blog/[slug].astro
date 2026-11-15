@@ -369,6 +369,16 @@ const publishedAt = getPublishedAt(post);
         margin: 0;
       }
 
+      /* 本文中の画像(写真など)。元の実寸で置かれると本文幅を超えて
+         横スクロールが出るので、列幅に収める */
+      .prose :global(img) {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        margin: 1.5rem auto;
+        border-radius: 6px;
+      }
+
       .back-link {
         display: block;
         max-width: 960px;
