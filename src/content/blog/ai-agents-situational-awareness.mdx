@@ -9,9 +9,9 @@ description: "複数のAIエージェントを並列に動かす仕事はRTSの�
 
 AIエージェントを複数動かしながら仕事をしていると、ほとんど RTS（リアルタイムストラテジー）をプレイしているような感覚になる。
 
-<img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/39/0_A.D._Alpha_26_Screenshot_2022.10.04_-_12.00.28.34,_Han-Stadt.png/1200px-0_A.D._Alpha_26_Screenshot_2022.10.04_-_12.00.28.34,_Han-Stadt.png" alt="オープンソース RTS「0 A.D.」(Alpha 26、2022 年)の画面" loading="lazy" data-alts="https://upload.wikimedia.org/wikipedia/commons/thumb/6/65/Alpha_26_Screenshot_2022.10.04_-_12.00.28.34,_Han-Stadt.png/1200px-Alpha_26_Screenshot_2022.10.04_-_12.00.28.34,_Han-Stadt.png|https://upload.wikimedia.org/wikipedia/commons/d/db/0_A.D._Alpha_26,_The_Han_002.jpg" onerror="var a=this.dataset.alts.split('|');var i=+(this.dataset.i||0);if(i&lt;a.length){this.dataset.i=i+1;this.src=a[i]}else{this.style.display='none'}" />
+![ワシントン航空路管制センターの管制官たち](https://upload.wikimedia.org/wikipedia/commons/thumb/8/8c/Air_traffic_controllers_at_the_Washington_ARTCC.jpg/1200px-Air_traffic_controllers_at_the_Washington_ARTCC.jpg)
 
-オープンソースの RTS「0 A.D.」(Alpha 26、2022 年)の画面。画像: 0 A.D. / Wildfire Games(アートワークは CC BY-SA 3.0)、[Wikimedia Commons の 0 A.D. スクリーンショット](https://commons.wikimedia.org/wiki/Category:Screenshots_of_0_A.D.)より。
+ワシントン航空路管制センター(ARTCC)の管制官。レーダー画面には多数の機影が映り、管制官は必要な機にだけ指示を出す。写真: FAA([Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Air_traffic_controllers_at_the_Washington_ARTCC.jpg))、パブリックドメイン。
 
 従来のソフトウェア開発では、まとまった時間を確保して一つの課題に集中することが重要視されてきた。
 
@@ -49,6 +49,10 @@ flowchart LR
 結果だけ分かればいいわけではない。何を調べ、何を発見し、なぜその設計に至ったのか。可能な限りエージェントと理解を同期したい。
 
 つまり、問題はタスクの管理だけではなく、**複数の主体が並行して活動する中で、どう状況認識を維持するか** にある。
+
+![NASA ジョンソン宇宙センターの ISS 飛行管制室](https://upload.wikimedia.org/wikipedia/commons/thumb/f/fd/STS-128_MCC_space_station_flight_control_room.jpg/1200px-STS-128_MCC_space_station_flight_control_room.jpg)
+
+NASA ジョンソン宇宙センターの ISS 飛行管制室(2009 年、STS-128 のドッキング時)。担当者ごとに別の系統をコンソールで見張り、フライトディレクターが全体を見る。写真: NASA / James Blair([Wikimedia Commons](https://commons.wikimedia.org/wiki/File:STS-128_MCC_space_station_flight_control_room.jpg))、パブリックドメイン。
 
 ## 戦闘情報センターは何を解決しようとしたのか
 
