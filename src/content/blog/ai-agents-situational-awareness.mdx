@@ -333,6 +333,24 @@ AI エージェントのインターフェースを考えるとき、万人に�
 
 常に全体を俯瞰したい人もいれば、必要なときだけ詳細を読みたい人もいる。途中の判断に参加することで理解を維持する人もいれば、まとまった成果を読み解くことが得意な人もいる。
 
+実際、いま使われているエージェントのインターフェースも、どの読み方を前提にするかで形が分かれている。
+
+![Aider のターミナル画面。指示、説明、差分、適用、コミットが一本の流れで表示される](/img/ai-agents-situational-awareness/aider-terminal.png)
+
+**逐次ログ型**。Aider のターミナル画面。指示、説明、差分、適用、コミットが一本の流れで表示され、途中で口を挟める。過程を読みながら理解を維持する人向け。画像: [Aider](https://github.com/Aider-AI/aider)(Apache License 2.0)のリポジトリより。
+
+![Vibe Kanban のカンバン画面。タスクごとにエージェントが動き、選んだタスクの経過が右に表示される](/img/ai-agents-situational-awareness/vibe-kanban-overview.png)
+
+**俯瞰型**。Vibe Kanban のカンバン。タスクごとにエージェントが動いていて、状態だけを一覧し、気になる 1 つを開くと右に経過が出る。RTS のミニマップと同じ構造で、全体を見たい人向け。画像: [Vibe Kanban](https://github.com/BloopAI/vibe-kanban)(Apache License 2.0)のリポジトリより。
+
+![Vibe Kanban の作業画面。エージェントの要約と差分が並び、PR を開くボタンがある](/img/ai-agents-situational-awareness/vibe-kanban-workspace.png)
+
+**要約と差分で読み解く型**。同じ Vibe Kanban の作業画面。エージェントが書いた「何を見つけ、何を直したか」の要約と、実際の差分が並び、そのまま PR を開ける。完了後にまとまった成果を読み解く人向けで、Fire and Forget の後にここで理解を同期する。画像: [Vibe Kanban](https://github.com/BloopAI/vibe-kanban)(Apache License 2.0)のリポジトリより。
+
+![マルチエージェントの決定コンソール。4 つのエージェントの進行と、合成された結論と確信度が表示される](/img/ai-agents-situational-awareness/cline-multi-agent-console.png)
+
+**並行ストリーム監視型**。Cline のリポジトリにある例「Multi-Agent Decision Console」。4 つのエージェントの進行を並べ、下に合成された結論と確信度を出す。CIC に一番近い形だが、本文で述べたとおり、集めて合成しただけでは、各エージェントが何を見つけたのかを人間が理解したことにはならない。画像: [Cline](https://github.com/cline/cline)(Apache License 2.0)のリポジトリより。
+
 自分自身、できる限りエージェントと理解を同期していたいが、すべての情報を常時把握することが現実的だとも思わない。
 
 重要なのは、情報をいくら表示するかではなく、**何を見ているのか、何を見ていないのかを理解できること**。そして、必要なときには別の観点や元の情報に戻れることだ。
