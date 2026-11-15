@@ -74,6 +74,246 @@ canonical の訳が難しいのは、**行為者の視点がすでに組み込�
 - 法律の正本、宗教の正典、主体が書かれた受身（「公式ドキュメントでは〜が推奨されている」）など、正しい用法は同じ文の中の文脈を見て除外する
 - 言い換えの候補として「〜を正とする」「根拠は限られている」「証跡」などを示す
 
+次の 4 行を通すと、1 行目と 3 行目だけが warn になる。2 行目の「判決正本」は法律の文脈として、4 行目は「この仕様では」と視点の主がすでに書かれているとして除外される。
+
+```text
+設定値の正本は config.yaml です。
+判決正本を受け取った。
+エビデンスがない。
+この仕様では〜が推奨されている。
+```
+
+```text
+sample.md:1:5 warn [canonical-shohon] 「正本」 「正本」は書類の効力の語（原本／副本の対比）で、canonical の「誰かが基準と決めた」含みが落ちる。
+    → 「〜を正とする」「基準版」「公認版」。決めた主体を「うちでは」「この仕様では」のように視点として添える。
+sample.md:3:1 warn [evidence-binary] 「エビデンスがない」 「エビデンスがある／ない」は有無の二択になる。英語の evidence は程度を持ち、何を裏付けるかとセットで使う。
+    → 対象と程度を書く。例: 「〜を支持する根拠は限られている」「小規模な試験で効果が示唆されている」。
+
+2 warn, 0 info
+```
+
+全文は次のとおり。ルールは `Rule` の並びにまとめてあり、除外の判定は同じ文の中だけを見る。
+
+````python
+#!/usr/bin/env python3
+"""ja_actor_lint — 翻訳調で「行為者」や「程度」が消えた日本語を指摘する Lint
+
+方針:
+  - canonical / evidence などを直訳したとき、元の語が持っていた
+    「誰かが基準と決めた」「何をどの程度裏付けるか」が落ちる箇所を探す。
+  - 言い換えを強制せず、文脈で正しい用法（法律の正本、宗教の正典など）は除外する。
+
+使い方:
+  python3 ja_actor_lint.py file1.md file2.txt
+  cat out.md | python3 ja_actor_lint.py
+  python3 ja_actor_lint.py --format json file.md
+  python3 ja_actor_lint.py --min-severity warn file.md   # info を出さない
+
+終了コード: warn 以上が 1 件でもあれば 1、なければ 0
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+
+SEVERITY_ORDER = {"info": 0, "warn": 1}
+
+
+@dataclass
+class Rule:
+    id: str
+    pattern: str
+    severity: str
+    message: str
+    suggest: str
+    # マッチの前後 window 文字にこれがあれば除外（正しい用法の文脈）
+    exempt_around: str | None = None
+    # マッチの直前 window 文字にこれがあれば除外（視点・主体が既に書かれている）
+    exempt_before: str | None = None
+    window: int = 30
+    regex: re.Pattern = field(init=False)
+
+    def __post_init__(self):
+        self.regex = re.compile(self.pattern)
+
+
+RULES: list[Rule] = [
+    # ---- canonical 系 -------------------------------------------------
+    Rule(
+        id="canonical-shohon",
+        pattern=r"正本",
+        severity="warn",
+        message="「正本」は書類の効力の語（原本／副本の対比）で、canonical の"
+                "「誰かが基準と決めた」含みが落ちる。",
+        suggest="「〜を正とする」「基準版」「公認版」。決めた主体を「うちでは」"
+                "「この仕様では」のように視点として添える。",
+        exempt_around=r"判決|謄本|抄本|副本|裁判|書記官|戸籍|登記|公正証書|執行|送達|"
+                      r"契約書|浄瑠璃|歌舞伎|義太夫|丸本",
+    ),
+    Rule(
+        id="canonical-seiten",
+        pattern=r"正典",
+        severity="warn",
+        message="宗教以外の文脈の「正典」は canon の直訳。誰が公認したのかが見えない。",
+        suggest="作品なら「公式設定」「公式が認めた〜」、技術文書なら「〜を正とする」。",
+        exempt_around=r"聖書|経典|聖典|教会|仏典|旧約|新約|外典|偽典|クルアーン|コーラン|"
+                      r"宗教|教父|公会議|ユダヤ|キリスト",
+    ),
+    Rule(
+        id="ssot-literal",
+        pattern=r"(シングル・?)?ソース・?オブ・?トゥルース|信頼できる唯一の情報源|唯一の真実の情報源",
+        severity="warn",
+        message="single source of truth の直訳。名詞にすると「決めた」行為が消える。",
+        suggest="「〜を正とする」「〜の値を基準にする」。例: 「設定値は config.yaml を正とする」。",
+    ),
+    Rule(
+        id="canonical-katakana",
+        pattern=r"カノニカル(?!URL|\s*URL|タグ|・?タグ)",
+        severity="info",
+        message="SEO 用語以外の「カノニカル」は読み手を選ぶ。",
+        suggest="「〜を正とする」「基準となる〜」。",
+    ),
+    # ---- evidence 系 --------------------------------------------------
+    Rule(
+        id="evidence-binary",
+        pattern=r"エビデンス(が|は|も)(ある|ない|無い|有る|あり|なく|なし|存在|乏し|十分|不十分|示され)",
+        severity="warn",
+        message="「エビデンスがある／ない」は有無の二択になる。英語の evidence は程度を持ち、"
+                "何を裏付けるかとセットで使う。",
+        suggest="対象と程度を書く。例: 「〜を支持する根拠は限られている」"
+                "「小規模な試験で効果が示唆されている」。",
+    ),
+    Rule(
+        id="evidence-record",
+        pattern=r"エビデンス(を|として|の)(残|取|取得|保存|提出|添付|保管|確保)",
+        severity="warn",
+        message="業務の「エビデンス」は実際には記録物を指している。",
+        suggest="具体物で書く: 「証跡」「実行ログ」「画面のスクリーンショット」「承認メール」。",
+    ),
+    Rule(
+        id="evidence-generic",
+        pattern=r"エビデンス(?!(が|は|も)(ある|ない|無い|有る|あり|なく|なし|存在|乏し|十分|不十分|示され)"
+                r"|(を|として|の)(残|取|取得|保存|提出|添付|保管|確保))",
+        severity="info",
+        message="「エビデンス」が何の主張を、どの程度裏付けるのかが書かれているか確認。",
+        suggest="「根拠」「裏付け」「データ」で足りるならそちらを使う。",
+        exempt_around=r"EBM|根拠に基づく医療|エビデンスレベル|エビデンス・?ベースト",
+    ),
+    # ---- fact 系 ------------------------------------------------------
+    Rule(
+        id="fact-base",
+        pattern=r"ファクト(ベース|ドリブン)",
+        severity="warn",
+        message="「ファクトベース」は意味より態度（感情論を封じる）が強く出やすい。",
+        suggest="「事実に基づいて」「データに基づいて」。何の事実かを具体的に書く。",
+    ),
+    Rule(
+        id="fact-katakana",
+        pattern=r"ファクト(?!チェック|ベース|ドリブン|シート|ブック)",
+        severity="info",
+        message="「事実」で言えるところをカタカナにすると押しが強くなる。",
+        suggest="「事実」。",
+    ),
+    # ---- 行為者の消えた受身 ---------------------------------------------
+    Rule(
+        id="agentless-passive",
+        pattern=r"(とされ|と言われ|といわれ|が求められ|が期待され|が推奨され|が望まれ)"
+                r"(て(い|お)?(る|ます)|る|ます)",
+        severity="info",
+        message="誰がそう決めた／求めているのかが見えない。",
+        suggest="視点の主を添える: 「この仕様では〜とする」「チームとしては〜を求めたい」"
+                "「公式ドキュメントでは〜を推奨している」。",
+        exempt_before=r"では|によ(って|り|れば)|において|の中で|として|から(は|も)",
+        window=25,
+    ),
+]
+
+
+def mask_code(text: str) -> str:
+    """Markdown のコードブロックとインラインコードを空白に置き換える（位置は保つ）。"""
+    def blank(m: re.Match) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = re.sub(r"```.*?```", blank, text, flags=re.S)
+    text = re.sub(r"`[^`\n]+`", blank, text)
+    return text
+
+
+def line_col(text: str, offset: int) -> tuple[int, int]:
+    line = text.count("\n", 0, offset) + 1
+    col = offset - (text.rfind("\n", 0, offset) + 1) + 1
+    return line, col
+
+
+def lint_text(text: str, rules: list[Rule] = RULES) -> list[dict]:
+    masked = mask_code(text)
+    results = []
+    for rule in rules:
+        for m in rule.regex.finditer(masked):
+            s, e = m.span()
+            # 文脈は同じ文の中だけを見る（前後の文の語に引きずられないように）
+            sent_start = max(masked.rfind(c, 0, s) for c in "。！？\n") + 1
+            ends = [i for i in (masked.find(c, e) for c in "。！？\n") if i != -1]
+            sent_end = min(ends) if ends else len(masked)
+            lo = max(sent_start, s - rule.window)
+            hi = min(sent_end, e + rule.window)
+            around = masked[lo:hi]
+            before = masked[lo:s]
+            if rule.exempt_around and re.search(rule.exempt_around, around):
+                continue
+            if rule.exempt_before and re.search(rule.exempt_before, before):
+                continue
+            line, col = line_col(text, s)
+            results.append({
+                "line": line,
+                "col": col,
+                "severity": rule.severity,
+                "rule": rule.id,
+                "match": m.group(0),
+                "message": rule.message,
+                "suggest": rule.suggest,
+            })
+    results.sort(key=lambda r: (r["line"], r["col"]))
+    return results
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("files", nargs="*", help="対象ファイル（省略時は標準入力）")
+    ap.add_argument("--format", choices=["text", "json"], default="text")
+    ap.add_argument("--min-severity", choices=list(SEVERITY_ORDER), default="info")
+    args = ap.parse_args(argv)
+
+    sources = [(f, open(f, encoding="utf-8").read()) for f in args.files] or [("<stdin>", sys.stdin.read())]
+    floor = SEVERITY_ORDER[args.min_severity]
+
+    all_results = []
+    for name, text in sources:
+        for r in lint_text(text):
+            if SEVERITY_ORDER[r["severity"]] >= floor:
+                all_results.append({"file": name, **r})
+
+    if args.format == "json":
+        print(json.dumps(all_results, ensure_ascii=False, indent=2))
+    else:
+        for r in all_results:
+            print(f'{r["file"]}:{r["line"]}:{r["col"]} {r["severity"]:<4} '
+                  f'[{r["rule"]}] 「{r["match"]}」 {r["message"]}\n'
+                  f'    → {r["suggest"]}')
+        n_warn = sum(r["severity"] == "warn" for r in all_results)
+        n_info = sum(r["severity"] == "info" for r in all_results)
+        print(f"\n{n_warn} warn, {n_info} info", file=sys.stderr)
+
+    return 1 if any(r["severity"] == "warn" for r in all_results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+````
+
 ## 8. 残っている課題
 
 - 正規表現では、名詞化によって行為者が消えるパターンを一般的には捉えられない。形態素解析か LLM による判定が必要になる
