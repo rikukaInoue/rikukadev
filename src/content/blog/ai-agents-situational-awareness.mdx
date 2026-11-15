@@ -9,6 +9,10 @@ description: "複数のAIエージェントを並列に動かす仕事はRTSの�
 
 AIエージェントを複数動かしながら仕事をしていると、ほとんど RTS（リアルタイムストラテジー）をプレイしているような感覚になる。
 
+![オープンソース RTS「0 A.D.」のプレイ画面](https://upload.wikimedia.org/wikipedia/commons/d/db/0_A.D._Alpha_26,_The_Han_002.jpg)
+
+オープンソースの RTS「0 A.D.」の画面。画像: Wildfire Games, [0 A.D. Alpha 26, The Han 002](https://commons.wikimedia.org/wiki/File:0_A.D._Alpha_26,_The_Han_002.jpg), CC BY-SA 3.0, via Wikimedia Commons。
+
 従来のソフトウェア開発では、まとまった時間を確保して一つの課題に集中することが重要視されてきた。
 
 しかし、複数の AI エージェントを並列に動かす場合、求められる振る舞いが変わる。
@@ -54,7 +58,15 @@ flowchart LR
 
 しかし、**情報を取得できることと、その情報を使って適切に行動できることは別だった**。
 
+![SG レーダーのコンソール(1945 年)。中央に PPI スコープ](https://upload.wikimedia.org/wikipedia/commons/f/ff/SG_Radar_Console_1945.jpg)
+
+SG レーダーのコンソール(1945 年)。中央の円い画面が PPI スコープで、ここに映る光点がすべての出発点になる。写真: 米海軍([Wikimedia Commons](https://commons.wikimedia.org/wiki/File:SG_Radar_Console_1945.jpg))、パブリックドメイン。
+
 当初の Radar Plot では、レーダーの観測結果を艦橋に報告したり、目標の位置を記録したりしていた。しかし、複数の情報源を突き合わせ、敵味方の動きを把握し、艦全体の行動につなげる仕組みは十分ではなかった。
+
+<img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8c/Lt._Cdr._A.F._Fleming,_fighter_director,_in_plot_room_of_USS_Lexington_(CV-16)_during_a_strike_in_the_Gilbert_%26_Marshall_Islands._-_NARA_-_520799.jpg/1200px-Lt._Cdr._A.F._Fleming,_fighter_director,_in_plot_room_of_USS_Lexington_(CV-16)_during_a_strike_in_the_Gilbert_%26_Marshall_Islands._-_NARA_-_520799.jpg" alt="空母レキシントンのプロットルームで作業する戦闘機管制士官(1943 年 11 月)" loading="lazy" onerror="if(!this.dataset.r){this.dataset.r=1;this.src='https://upload.wikimedia.org/wikipedia/commons/thumb/1/16/Lt._Cdr._A.F._Fleming,_fighter_director,_in_plot_room_of_USS_Lexington_(CV-16)_during_a_strike_in_the_Gilbert_%26_Marshall_Islands_-_NARA_-_520799.jpg/1200px-Lt._Cdr._A.F._Fleming,_fighter_director,_in_plot_room_of_USS_Lexington_(CV-16)_during_a_strike_in_the_Gilbert_%26_Marshall_Islands_-_NARA_-_520799.jpg'}else{this.style.display='none'}" />
+
+1943 年 11 月、ギルバート・マーシャル諸島への攻撃中に、空母レキシントンのプロットルームで作業する戦闘機管制士官 A.F. Fleming 少佐。写真: 米海軍、撮影 Edward Steichen、米国立公文書館 80-G-431069([Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Lt._Cdr._A.F._Fleming,_fighter_director,_in_plot_room_of_USS_Lexington_(CV-16)_during_a_strike_in_the_Gilbert_%26_Marshall_Islands._-_NARA_-_520799.jpg))、パブリックドメイン。
 
 1942 年のガダルカナル島周辺での戦闘は、こうした問題を浮き彫りにした。
 
@@ -89,6 +101,10 @@ flowchart LR
 センサーから情報が得られていても、組織として状況を理解し、判断に使えなければ意味がない。
 
 そのために、装置だけでなく、**情報を評価する人員、配置、通信経路、指揮との役割分担まで設計する必要があった**。
+
+![軽巡洋艦パサデナの CIC(1944 年 11 月)](https://upload.wikimedia.org/wikipedia/commons/0/03/Combat_Information_Center_aboard_USS_Pasadena_(CL-65),_November_1944.jpg)
+
+軽巡洋艦パサデナの CIC(1944 年 11 月 21 日)。中央奥に航空機の状況板が見える。写真: 米海軍([Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Combat_Information_Center_aboard_USS_Pasadena_(CL-65),_November_1944.jpg))、パブリックドメイン。
 
 実際、1945 年の米海軍資料には、CIC が把握していた情報が砲術部門に十分伝わらない問題も記録されている。
 
