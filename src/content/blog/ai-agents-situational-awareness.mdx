@@ -351,6 +351,18 @@ AI エージェントのインターフェースを考えるとき、万人に�
 
 **統括エージェント型**。Orca では統括役のエージェントが worker(ここでは Codex と Grok)に仕事を振り、結果を受け取って「両方終わった。PR を開くか」と要約する。左には複数マシンにまたがる worktree と、そこで動くエージェントの一覧。CIC の評価官の役をエージェントに任せた形で、人間は要約だけを読むことになる。本文で述べたとおり、ここで何が見つかり何が捨てられたかは、要約の外側にある。画像: [Orca](https://github.com/stablyai/orca)(MIT License)のリポジトリより。
 
+![Symphony が制御盤にする Linear のボード。Backlog、Todo、In Progress、Human Review の列に課題が並ぶ](/img/ai-agents-situational-awareness/symphony-linear-board.jpg)
+
+**工場型(ボード駆動)**。OpenAI の Symphony は、Linear のボードそのものを制御盤にする。Todo に入った課題をエージェントが拾って In Progress に進め、Human Review の列に来たものを人間が初めて見る。駒を動かすのは人ではなくエージェントで、人は列の名前と枚数だけを見る。英空軍の地図台と同じ構造だが、駒を進める側が変わった。画像: [Symphony](https://github.com/openai/symphony)(Apache License 2.0)のリポジトリより。画面は Linear。
+
+![Symphony の状態表示。稼働中のエージェント数、スループット、課題ごとの段階とトークンと最新イベント](/img/ai-agents-situational-awareness/symphony-status.png)
+
+同じ Symphony の状態表示。50 枠のうち 19 のエージェントが動いていて、課題ごとに段階、経過時間、トークン、最新のイベントが 1 行ずつ流れる。CIC の総合プロットに相当するが、ここに出るのは「何をしているか」であって、「何を見つけたか」ではない。画像: 同上。
+
+![Open-Inspect の Automations 一覧。時刻やイベントで起動するエージェントの実行と、成功と失敗の履歴が並ぶ](/img/ai-agents-situational-awareness/open-inspect-automations.webp)
+
+**工場型(自動実行)**。Open-Inspect の Automations。「毎朝のバグ探し」「PR が開いたら深いレビュー」「Sentry のエラーで起動」のように、時刻やイベントでエージェントが自動で走り、成功と失敗の履歴が並ぶ。人間が見るのは左の「要注意」の一覧だけになる。Fire and Forget を仕組みにした形で、本文の Assess の話がそのまま当てはまる。実行が成功したことと、狙った効果が出たことは別である。画像: [Open-Inspect](https://github.com/open-inspect/background-agents)(MIT License)のリポジトリより。
+
 ![Vibe Kanban の作業画面。エージェントの要約と差分が並び、PR を開くボタンがある](/img/ai-agents-situational-awareness/vibe-kanban-workspace.png)
 
 **要約と差分で読み解く型**。Vibe Kanban の作業画面。エージェントが書いた「何を見つけ、何を直したか」の要約と、実際の差分が並び、そのまま PR を開ける。完了後にまとまった成果を読み解く人向けで、Fire and Forget の後にここで理解を同期する。画像: [Vibe Kanban](https://github.com/BloopAI/vibe-kanban)(Apache License 2.0)のリポジトリより。
